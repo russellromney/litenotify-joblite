@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+.python-version-local
+
+# Rust
+target/
+
+# SQLite test databases / WAL / shared-memory
+*.db
+*.db-shm
+*.db-wal
+
+# Maturin / build
+*.so
+*.pyd
+*.dylib
+dist/
+build/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Test output debris
+test_out.txt
+test_out2.txt
+
+# Local scratchpads (project memory lives in ROADMAP.md / CHANGELOG.md)
+PLAN.md
