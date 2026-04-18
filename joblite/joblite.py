@@ -148,7 +148,7 @@ class Queue:
                 """,
                 params,
             )
-            tx.honk(self._channel(), "new")
+            tx.notify(self._channel(), "new")
             return
 
         with self.db.transaction() as own_tx:
@@ -159,7 +159,7 @@ class Queue:
                 """,
                 params,
             )
-            own_tx.honk(self._channel(), "new")
+            own_tx.notify(self._channel(), "new")
 
     def claim_one(self, worker_id: str) -> Optional[Job]:
         jobs = self.claim_batch(worker_id, 1)
@@ -267,7 +267,7 @@ class Queue:
                 [int(delay_s), error, int(job_id), worker_id],
             )
             if rows:
-                tx.honk(self._channel(), "retry")
+                tx.notify(self._channel(), "retry")
         return len(rows) > 0
 
     def fail(self, job_id: int, worker_id: str, error: str) -> bool:
@@ -403,7 +403,7 @@ class Stream:
                 """,
                 params,
             )
-            tx.honk(self._channel(), "new")
+            tx.notify(self._channel(), "new")
             return
         with self.db.transaction() as own_tx:
             own_tx.execute(
@@ -413,7 +413,7 @@ class Stream:
                 """,
                 params,
             )
-            own_tx.honk(self._channel(), "new")
+            own_tx.notify(self._channel(), "new")
 
     def _read_since(self, offset: int, limit: int = 1000) -> list:
         rows = self.db.query(
@@ -475,8 +475,8 @@ class _StreamIter:
         self._buffer: deque = deque()
         # Subscribe to the notify channel BEFORE the first read so that events
         # published between "read empty" and "start listening" can't slip
-        # through. The listener buffers all honks from this point forward; we
-        # drain the queue every time we re-read and catch up.
+        # through. The listener buffers all notifications from this point
+        # forward; we drain the queue every time we re-read and catch up.
         self._listener = stream.db.listen(stream._channel())
 
     def __aiter__(self):

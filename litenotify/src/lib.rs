@@ -1,4 +1,6 @@
-use honker::{Notification, Notifier};
+mod notifier;
+
+use notifier::{Notification, Notifier};
 use parking_lot::{Condvar, Mutex};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
@@ -399,7 +401,12 @@ impl Transaction {
         run_query(py, conn, &sql, params.as_ref())
     }
 
-    fn honk(&self, py: Python<'_>, channel: String, payload: Bound<'_, PyAny>) -> PyResult<()> {
+    fn notify(
+        &self,
+        py: Python<'_>,
+        channel: String,
+        payload: Bound<'_, PyAny>,
+    ) -> PyResult<()> {
         let state = self.inner.lock();
         let conn = state
             .conn
@@ -407,7 +414,7 @@ impl Transaction {
             .ok_or_else(|| PyRuntimeError::new_err("Transaction not started"))?;
         let payload_str = serialize_payload(py, &payload)?;
         conn.query_row(
-            "SELECT honk(?1, ?2)",
+            "SELECT notify(?1, ?2)",
             rusqlite::params![channel, payload_str],
             |_| Ok(()),
         )
@@ -466,7 +473,7 @@ impl Listener {
     /// loop.call_soon_threadsafe(queue.put_nowait, ...). Works on any
     /// asyncio loop (TestClient portal, anyio, Jupyter, asyncio.run).
     ///
-    /// No channel filter here — honker's per-channel registry means we only
+    /// No channel filter here — the notifier's per-channel registry means we only
     /// receive notifications for our own channel.
     fn ensure_started(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let mut state = self.inner.lock();

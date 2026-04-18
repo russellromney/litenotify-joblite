@@ -27,11 +27,11 @@ async def main():
 
     with db.transaction() as tx:
         tx.execute("INSERT INTO orders (id, total) VALUES (1, 99.99)")
-        tx.honk("orders", '{"id": 1}')
+        tx.notify("orders", '{"id": 1}')
 
     with db.transaction() as tx:
         tx.execute("INSERT INTO orders (id, total) VALUES (2, 14.50)")
-        tx.honk("orders", '{"id": 2}')
+        tx.notify("orders", '{"id": 2}')
 
     try:
         await asyncio.wait_for(task, timeout=1.0)

@@ -1,5 +1,23 @@
 # CHANGELOG
 
+## Unreleased — rename: fold `honker` into `litenotify`, `honk()` -> `notify()`
+
+Architectural cleanup. No functional changes; all 12 Rust + 109 Python
+tests still pass with the new names.
+
+- Deleted the `honker/` crate. Its contents now live in
+  `litenotify/src/notifier.rs` as a private module inside the
+  `litenotify` crate. One crate, one cdylib.
+- SQL scalar function `honk(channel, payload)` -> `notify(channel, payload)`,
+  parallel to `pg_notify`.
+- Rust `Transaction::honk()` and Python `tx.honk()` -> `notify()`.
+- All `tx.honk(...)` call sites in `joblite`, tests, bench, and docs
+  updated.
+- Workspace `Cargo.toml` now has a single member (`litenotify`).
+
+Breaking change for any external caller of `tx.honk(...)`. There aren't
+any.
+
 ## Unreleased — perf pass 3: try_acquire + deque + lazy JSON + Arc<Notification>
 
 Four targeted changes, each validated by bench. Ordered by impact.
@@ -20,7 +38,7 @@ Four targeted changes, each validated by bench. Ordered by impact.
   `@property` decodes on first access via a sentinel-guarded cache.
   Handlers that only read `job.id` / `job.worker_id` skip N JSON parses
   per batch.
-- **`Arc<Notification>` in honker's broadcast channel.** The commit hook's
+- **`Arc<Notification>` in notifier's broadcast channel.** The commit hook's
   fan-out loop cloned a `Notification { channel: String, payload: String }`
   per subscriber. Swapped to `broadcast::Sender<Arc<Notification>>` so
   subscriber sends are ref-count bumps, not `String` reallocations. No
@@ -139,14 +157,14 @@ Closes the four test gaps from the previous hardening pass. Test suite:
 ### What got proven
 
 - **SIGKILL mid-transaction crash recovery.** A subprocess opens the DB,
-  starts a `BEGIN IMMEDIATE` transaction (enqueue OR honk inside), is
+  starts a `BEGIN IMMEDIATE` transaction (enqueue OR notify inside), is
   `os.kill(pid, SIGKILL)`-ed before COMMIT. Afterwards the file passes
   `PRAGMA integrity_check == 'ok'`, the in-flight write did not land
   (zero rows), a fresh writer can acquire the write lock immediately
   (no stale reserved lock from WAL recovery), and a full enqueue +
-  claim + ack round-trip still works. For the honk-bearing case, a
+  claim + ack round-trip still works. For the notify-bearing case, a
   pre-attached listener sees zero leaked notifications from the killed
-  tx, and a subsequent committed honk flows normally.
+  tx, and a subsequent committed notify flows normally.
 - **Django management-command concurrency.** Two `python manage.py
   joblite_worker` subprocesses against the same `.db` split 200 jobs
   with zero overlap and both workers participate — proving the
@@ -181,8 +199,8 @@ Closes the four test gaps from the previous hardening pass. Test suite:
 ### Tests (23 new)
 
 - `test_crash_recovery.py` (4): SIGKILL-mid-enqueue leaves DB clean,
-  SIGKILL doesn't leave a stale write lock, SIGKILL-mid-honk produces
-  no phantom notification (fresh listener), SIGKILL-mid-honk produces
+  SIGKILL doesn't leave a stale write lock, SIGKILL-mid-notify produces
+  no phantom notification (fresh listener), SIGKILL-mid-notify produces
   no leak into a pre-attached listener.
 - `test_joblite_django.py` (+11):
   - Two-workers management-command concurrency (200 jobs, zero overlap).
@@ -232,7 +250,7 @@ bugs. Test suite: 12 Rust + 86 Python (~7 s parallel).
   ids strictly increasing across the seam.
 - **Stream failure modes.** `publish(datetime)`, `Decimal`, `set`, or a
   custom class all raise `TypeError` at publish time — no silent swallow,
-  no stale honk left in the transaction buffer. A failed publish followed
+  no stale notify left in the transaction buffer. A failed publish followed
   by a valid one still works.
 
 ### Tests (12 new)
@@ -240,24 +258,24 @@ bugs. Test suite: 12 Rust + 86 Python (~7 s parallel).
   across processes, live-enqueuer while two workers drain.
 - `test_outbox.py` (2): stuck-handler reclaim, heartbeat prevents reclaim.
 - `test_resource_bounds.py` (3): listener churn, bounded concurrent
-  listeners, sustained honk RSS bound.
+  listeners, sustained notify RSS bound.
 - `test_joblite_fastapi.py` (2): real mid-stream reconnect with actual
   Last-Event-ID, reconnect without header replays from start.
 - `test_stream.py` (2): non-JSON payload raises, failed publish doesn't
   poison subsequent valid publishes.
 
-## Unreleased — honker per-channel registry refactor
+## Unreleased — notifier per-channel registry refactor
 
 Fixes two real production issues (thread leak, cross-channel starvation)
 with a minimal architecture change. Test suite: 12 Rust + 74 Python
 (~7 s parallel).
 
 ### What changed
-- **honker::Notifier** now keeps a `HashMap<channel, Vec<Subscriber>>` with
+- **notifier::Notifier** now keeps a `HashMap<channel, Vec<Subscriber>>` with
   its own per-subscriber `broadcast::channel(1024)` instead of a single
   shared global channel. `subscribe(channel)` returns a `Subscription`
   with `{id, channel, rx}`; the commit hook fans out only to subscribers
-  of the channel the message was honked on.
+  of the channel the message was notifyed on.
 - **New `Notifier::unsubscribe(id)`** removes a subscriber by id and drops
   its broadcast::Sender, which causes any `blocking_recv()` waiting on
   that receiver to return `Closed`. Idempotent.
@@ -286,7 +304,7 @@ with a minimal architecture change. Test suite: 12 Rust + 74 Python
 ### Tests (5 new)
 - Rust: channel routing does not cross between subscribers; cross-channel
   isolation under 5k "hot" msgs + 1 "cold" msg; unsubscribe frees the slot
-  and closes the receiver; unsubscribe of unknown id is a no-op; honk with
+  and closes the receiver; unsubscribe of unknown id is a no-op; notify with
   no subscribers is dropped silently.
 - Python: cross-channel starvation immunity (3000 "hot" + 1 "cold" still
   delivers); churning 50 short-lived listeners doesn't wedge the notifier.
@@ -340,7 +358,7 @@ Stream + outbox. Test suite: 9 Rust + 51 Python (~2.5 s parallel).
 
 ### Additions
 - **joblite.stream**: durable pub/sub. `db.stream(name).publish(payload, tx=?)`
-  inserts into `_joblite_stream` with an auto-incrementing offset and honks
+  inserts into `_joblite_stream` with an auto-incrementing offset and notifications
   `joblite:stream:{name}`. `subscribe(from_offset=?, consumer=?)` yields
   `Event` objects: replays rows with `offset > from_offset` in batches,
   transitions to live NOTIFY delivery when caught up. Named consumers can
@@ -364,7 +382,7 @@ Stream + outbox. Test suite: 9 Rust + 51 Python (~2.5 s parallel).
 
 ## Unreleased — Day 1 stabilization
 
-Fixes and tests that close out the Day 1 scope (honker, litenotify, joblite,
+Fixes and tests that close out the Day 1 scope (notifier, litenotify, joblite,
 joblite-fastapi). Test suite: 9 Rust + 37 Python (~2 s end to end, parallel).
 
 ### Fixes
@@ -378,9 +396,9 @@ joblite-fastapi). Test suite: 9 Rust + 37 Python (~2 s end to end, parallel).
 - **litenotify**: reader/writer pool split. A single dedicated writer
   serializes via `BEGIN IMMEDIATE`; a bounded reader pool
   (`max_readers`, default 8) handles `db.query()` concurrently under WAL.
-- **litenotify**: `tx.honk(channel, payload)` now accepts `dict`/`list`/`str`
+- **litenotify**: `tx.notify(channel, payload)` now accepts `dict`/`list`/`str`
   and `json.dumps`-encodes non-string payloads to match the plan's API.
-- **honker**: documented inline that `commit_hook` does NOT fire for
+- **notifier**: documented inline that `commit_hook` does NOT fire for
   `BEGIN DEFERRED` transactions with no writes (SQLite fast-paths them).
   Library contract requires `BEGIN IMMEDIATE`; regression test locks it in.
 - **litenotify Listener bridge**: replaced `pyo3_async_runtimes::future_into_py`
@@ -405,20 +423,20 @@ joblite-fastapi). Test suite: 9 Rust + 37 Python (~2 s end to end, parallel).
 
 ### Tests
 
-**Rust (honker)** — 9 tests:
+**Rust (notifier)** — 9 tests:
 - rollback drops pending notifications
 - commit fans out one copy per subscriber
 - multiple subscribers each receive every notification
-- multiple honks in one tx deliver in order
+- multiple notifications in one tx deliver in order
 - savepoint partial rollback behavior is documented
 - full rollback drops everything, even after savepoints
 - unicode + 1 MB payload round-trip
 - subscribe-before-attach is safe
-- `BEGIN DEFERRED` read-only transaction loses honks (locked-in contract)
+- `BEGIN DEFERRED` read-only transaction loses notifications (locked-in contract)
 
 **Python litenotify** — 16 tests covering param type fidelity, numeric
 comparisons, unsupported types, listener channel isolation, multi-listener
-fanout, rollback-drops-honk, dict/list payloads, connection pool release on
+fanout, rollback-drops-notification, dict/list payloads, connection pool release on
 success/rollback/body-exception/commit-error, slow listener not blocking the
 commit hook, `BEGIN IMMEDIATE` under concurrent writers (3 threads × 20
 writes), readers concurrent with a held writer, reader pool for `db.query()`,

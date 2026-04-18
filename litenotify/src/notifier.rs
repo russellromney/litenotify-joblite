@@ -1,20 +1,20 @@
-//! Commit-hook driven NOTIFY/LISTEN for SQLite.
+//! Commit-hook driven NOTIFY/LISTEN for SQLite (core primitive).
 //!
-//! `Notifier` maintains a per-channel subscriber registry. Each `subscribe`
-//! hands back a `Subscription` carrying a unique id and a tokio broadcast
-//! `Receiver`. When a connection calls the registered `honk()` scalar
-//! function inside a transaction, the notification is buffered until
-//! commit; on commit the hook groups pending notifications by channel and
-//! fans out to exactly the subscribers of that channel. On rollback the
-//! buffer is dropped.
+//! `Notifier` maintains a per-channel subscriber registry. Each
+//! `subscribe(channel)` hands back a `Subscription` carrying a unique id
+//! and a tokio broadcast `Receiver<Arc<Notification>>`. When a connection
+//! calls the registered `notify(channel, payload)` scalar function inside
+//! a transaction, the notification is buffered until commit; on commit the
+//! hook groups pending notifications by channel and fans out to exactly
+//! the subscribers of that channel. On rollback the buffer is dropped.
 //!
-//! The `unsubscribe` method removes a subscriber by id; this is what lets
-//! the language bindings implement proper Drop-based cleanup so bridge
-//! threads waiting on a receiver can exit when the subscription goes away.
+//! `unsubscribe(id)` removes a subscriber so language bindings can
+//! implement Drop-based cleanup — the bridge thread's `blocking_recv`
+//! returns `Closed` once the last `Sender` is dropped.
 //!
 //! IMPORTANT: SQLite's `commit_hook` does NOT fire for `BEGIN DEFERRED`
 //! transactions with no writes. Callers must use `BEGIN IMMEDIATE` (or
-//! perform at least one write) for `honk()` notifications to be emitted.
+//! perform at least one write) for `notify()` notifications to be emitted.
 
 use parking_lot::Mutex;
 use rusqlite::Connection;
@@ -40,9 +40,9 @@ pub struct Notification {
 ///
 /// The channel carries `Arc<Notification>` rather than `Notification` so
 /// the fan-out loop in the commit hook only does a ref-count bump per
-/// subscriber, not a `String` realloc for `channel` + `payload`. For a honk
-/// with N subscribers this turns the fan-out from O(N * payload_len) into
-/// O(N atomic increments).
+/// subscriber, not a `String` realloc for `channel` + `payload`. For a
+/// notification with N subscribers this turns the fan-out from
+/// O(N * payload_len) into O(N atomic increments).
 pub struct Subscription {
     pub id: u64,
     pub channel: String,
@@ -120,21 +120,21 @@ impl Notifier {
         }
     }
 
-    /// Attach the `honk(channel, payload)` scalar function plus commit and
-    /// rollback hooks to `conn`.
+    /// Attach the `notify(channel, payload)` scalar function plus commit
+    /// and rollback hooks to `conn`.
     pub fn attach(&self, conn: &Connection) -> Result<(), Error> {
         let pending: Arc<Mutex<Vec<Notification>>> =
             Arc::new(Mutex::new(Vec::new()));
 
-        let pending_honk = Arc::clone(&pending);
+        let pending_notify = Arc::clone(&pending);
         conn.create_scalar_function(
-            "honk",
+            "notify",
             2,
             rusqlite::functions::FunctionFlags::SQLITE_UTF8,
             move |ctx| {
                 let channel: String = ctx.get(0)?;
                 let payload: String = ctx.get(1)?;
-                pending_honk.lock().push(Notification { channel, payload });
+                pending_notify.lock().push(Notification { channel, payload });
                 Ok(true)
             },
         )?;
@@ -194,12 +194,12 @@ mod tests {
     }
 
     #[test]
-    fn test_honk_rollback_produces_no_notification() {
+    fn test_notify_rollback_produces_no_notification() {
         let (conn, notifier) = setup();
         let mut sub = notifier.subscribe("test");
 
         begin(&conn);
-        conn.query_row("SELECT honk('test', 'data')", [], |_| Ok(()))
+        conn.query_row("SELECT notify('test', 'data')", [], |_| Ok(()))
             .unwrap();
         rollback(&conn);
 
@@ -207,13 +207,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_honk_commit_produces_exactly_one_notification_per_subscriber() {
+    async fn test_notify_commit_produces_exactly_one_notification_per_subscriber() {
         let (conn, notifier) = setup();
         let mut sub1 = notifier.subscribe("test");
         let mut sub2 = notifier.subscribe("test");
 
         begin(&conn);
-        conn.query_row("SELECT honk('test', 'data')", [], |_| Ok(()))
+        conn.query_row("SELECT notify('test', 'data')", [], |_| Ok(()))
             .unwrap();
         commit(&conn);
 
@@ -229,22 +229,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_cross_channel_isolation() {
-        // Listener on "cold" must not see messages on "hot", and must not
-        // get Lagged because "hot" spammed — they have independent ring
-        // buffers.
         let (conn, notifier) = setup();
         let mut cold = notifier.subscribe("cold");
 
         begin(&conn);
         for i in 0..5000 {
             conn.query_row(
-                "SELECT honk('hot', ?1)",
+                "SELECT notify('hot', ?1)",
                 [format!("p{}", i)],
                 |_| Ok(()),
             )
             .unwrap();
         }
-        conn.query_row("SELECT honk('cold', 'only')", [], |_| Ok(()))
+        conn.query_row("SELECT notify('cold', 'only')", [], |_| Ok(()))
             .unwrap();
         commit(&conn);
 
@@ -261,9 +258,9 @@ mod tests {
         let mut b = notifier.subscribe("b");
 
         begin(&conn);
-        conn.query_row("SELECT honk('a', '1')", [], |_| Ok(())).unwrap();
-        conn.query_row("SELECT honk('b', '2')", [], |_| Ok(())).unwrap();
-        conn.query_row("SELECT honk('a', '3')", [], |_| Ok(())).unwrap();
+        conn.query_row("SELECT notify('a', '1')", [], |_| Ok(())).unwrap();
+        conn.query_row("SELECT notify('b', '2')", [], |_| Ok(())).unwrap();
+        conn.query_row("SELECT notify('a', '3')", [], |_| Ok(())).unwrap();
         commit(&conn);
 
         let n1 = a.rx.recv().await.unwrap();
@@ -283,22 +280,15 @@ mod tests {
         let sub = notifier.subscribe("x");
         let id = sub.id;
         let mut rx = sub.rx;
-        // Unsubscribe. The broadcast::Sender in the registry is dropped,
-        // which means any subsequent recv on this receiver returns Closed
-        // once the channel has no senders left.
         notifier.unsubscribe(id);
 
-        // With sender dropped, recv() should resolve to Err(Closed).
         let err = rx.recv().await.unwrap_err();
         matches!(err, tokio::sync::broadcast::error::RecvError::Closed);
 
-        // Further honks on this channel no longer route to anyone.
         begin(&conn);
-        conn.query_row("SELECT honk('x', 'nope')", [], |_| Ok(()))
+        conn.query_row("SELECT notify('x', 'nope')", [], |_| Ok(()))
             .unwrap();
         commit(&conn);
-        // Channel entry removed; no subscribers; nothing to assert beyond
-        // "didn't panic".
     }
 
     #[test]
@@ -308,13 +298,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multiple_honks_in_one_tx_are_delivered_in_order() {
+    async fn test_multiple_notifies_in_one_tx_are_delivered_in_order() {
         let (conn, notifier) = setup();
         let mut sub = notifier.subscribe("ch");
 
         begin(&conn);
         for i in 0..5 {
-            conn.query_row("SELECT honk('ch', ?1)", [format!("p{}", i)], |_| Ok(()))
+            conn.query_row("SELECT notify('ch', ?1)", [format!("p{}", i)], |_| Ok(()))
                 .unwrap();
         }
         commit(&conn);
@@ -333,9 +323,9 @@ mod tests {
         let mut sub_b = notifier.subscribe("b");
 
         begin(&conn);
-        conn.query_row("SELECT honk('a', '1')", [], |_| Ok(())).unwrap();
+        conn.query_row("SELECT notify('a', '1')", [], |_| Ok(())).unwrap();
         conn.execute_batch("SAVEPOINT sp1;").unwrap();
-        conn.query_row("SELECT honk('b', '2')", [], |_| Ok(())).unwrap();
+        conn.query_row("SELECT notify('b', '2')", [], |_| Ok(())).unwrap();
         conn.execute_batch("RELEASE sp1;").unwrap();
         rollback(&conn);
 
@@ -351,9 +341,9 @@ mod tests {
         let big = "a".repeat(1_000_000);
         let unicode = "héllo 🦆 мир";
         begin(&conn);
-        conn.query_row("SELECT honk('ch', ?1)", [unicode], |_| Ok(()))
+        conn.query_row("SELECT notify('ch', ?1)", [unicode], |_| Ok(()))
             .unwrap();
-        conn.query_row("SELECT honk('ch', ?1)", [big.clone()], |_| Ok(()))
+        conn.query_row("SELECT notify('ch', ?1)", [big.clone()], |_| Ok(()))
             .unwrap();
         commit(&conn);
 
@@ -372,7 +362,7 @@ mod tests {
         notifier.attach(&conn).unwrap();
 
         begin(&conn);
-        conn.query_row("SELECT honk('x', 'y')", [], |_| Ok(()))
+        conn.query_row("SELECT notify('x', 'y')", [], |_| Ok(()))
             .unwrap();
         commit(&conn);
 
@@ -382,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deferred_readonly_transaction_does_not_deliver_honk() {
+    fn test_deferred_readonly_transaction_does_not_deliver_notify() {
         // Documented contract: SQLite skips commit_hook for read-only
         // DEFERRED transactions. Python/TS bindings always use
         // BEGIN IMMEDIATE, which is why this works in practice there.
@@ -390,7 +380,7 @@ mod tests {
         let mut sub = notifier.subscribe("ch");
 
         conn.execute_batch("BEGIN DEFERRED;").unwrap();
-        conn.query_row("SELECT honk('ch', 'lost')", [], |_| Ok(()))
+        conn.query_row("SELECT notify('ch', 'lost')", [], |_| Ok(()))
             .unwrap();
         conn.execute_batch("COMMIT;").unwrap();
 
@@ -398,10 +388,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_no_subscribers_honk_is_dropped_silently() {
+    async fn test_no_subscribers_notify_is_dropped_silently() {
         let (conn, _notifier) = setup();
         begin(&conn);
-        conn.query_row("SELECT honk('orphan', 'lost')", [], |_| Ok(()))
+        conn.query_row("SELECT notify('orphan', 'lost')", [], |_| Ok(()))
             .unwrap();
         commit(&conn); // no panic; no receiver registered; hook just no-ops
     }

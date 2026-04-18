@@ -81,13 +81,13 @@ async def test_listen_emits_only_matching_channel(db_path):
     await asyncio.sleep(0.05)
 
     with db.transaction() as tx:
-        tx.honk("unrelated", "skip")
+        tx.notify("unrelated", "skip")
     with db.transaction() as tx:
-        tx.honk("orders", "one")
+        tx.notify("orders", "one")
     with db.transaction() as tx:
-        tx.honk("other", "skip")
+        tx.notify("other", "skip")
     with db.transaction() as tx:
-        tx.honk("orders", "two")
+        tx.notify("orders", "two")
 
     await asyncio.wait_for(task, timeout=2.0)
     assert got == ["one", "two"]
@@ -110,7 +110,7 @@ async def test_multiple_listeners_same_channel_all_receive(db_path):
 
     for i in range(3):
         with db.transaction() as tx:
-            tx.honk("ch", f"m{i}")
+            tx.notify("ch", f"m{i}")
 
     r1 = await asyncio.wait_for(t1, timeout=2.0)
     r2 = await asyncio.wait_for(t2, timeout=2.0)
@@ -136,10 +136,10 @@ async def test_rollback_drops_notification(db_path):
     with pytest.raises(RuntimeError):
         with db.transaction() as tx:
             tx.execute("CREATE TABLE x (id INTEGER)")
-            tx.honk("ch", "dropped")
+            tx.notify("ch", "dropped")
             raise RuntimeError("boom")
     with db.transaction() as tx:
-        tx.honk("ch", "delivered")
+        tx.notify("ch", "delivered")
 
     await asyncio.wait_for(task, timeout=2.0)
     assert got == ["delivered"]
@@ -160,9 +160,9 @@ async def test_dict_and_list_payloads_json_serialized(db_path):
     await asyncio.sleep(0.05)
 
     with db.transaction() as tx:
-        tx.honk("ch", {"id": 42, "name": "alice"})
+        tx.notify("ch", {"id": 42, "name": "alice"})
     with db.transaction() as tx:
-        tx.honk("ch", [1, 2, 3])
+        tx.notify("ch", [1, 2, 3])
 
     await asyncio.wait_for(task, timeout=2.0)
     import json
@@ -237,7 +237,7 @@ async def test_slow_listener_does_not_block_commit_hook(db_path):
     # we'd see this take far longer than expected.
     for i in range(50):
         with db.transaction() as tx:
-            tx.honk("ch", f"m{i}")
+            tx.notify("ch", f"m{i}")
         finished_commits.append(i)
     elapsed = loop.time() - start
 
@@ -342,8 +342,8 @@ async def test_cross_channel_starvation_immune(db_path):
     # Emit 3000 messages on "hot" and exactly one on "cold".
     with db.transaction() as tx:
         for i in range(3000):
-            tx.honk("hot", f"p{i}")
-        tx.honk("cold", "only")
+            tx.notify("hot", f"p{i}")
+        tx.notify("cold", "only")
 
     await asyncio.wait_for(task, timeout=3.0)
     assert got == ["only"]
@@ -368,7 +368,7 @@ async def test_listener_drop_allows_clean_reuse(db_path):
         task = asyncio.create_task(once())
         await asyncio.sleep(0.01)
         with db.transaction() as tx:
-            tx.honk(f"ch-{i}", "ok")
+            tx.notify(f"ch-{i}", "ok")
         await asyncio.wait_for(task, timeout=2.0)
         assert got == ["ok"]
         # Listener python object goes out of scope here; Drop impl

@@ -51,7 +51,7 @@ def uvicorn_server(tmp_path_factory):
         @app.post('/honk')
         async def honk(body: dict):
             with db.transaction() as tx:
-                tx.honk(body['channel'], body.get('payload', ''))
+                tx.notify(body['channel'], body.get('payload', ''))
             return {{'ok': True}}
 
         @app.post('/publish/{{stream}}')

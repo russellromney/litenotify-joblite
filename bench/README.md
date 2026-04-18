@@ -56,7 +56,7 @@ inserts amortize into one transaction.
 | 3 | Writer mutex `try_acquire` fast-path skips `py.detach` on uncontended tx | enqueue +15%, batch=128 +10% |
 | 4 | `collections.deque` for iterator buffers (`list.pop(0)` was O(n)) | replay 400k → 1M (2.5x); batch=128 +30% |
 | 5 | Lazy `json.loads` on `Job.payload` / `Event.payload` | small win, scales with miss rate |
-| 6 | `Arc<Notification>` in honker broadcast so fan-out is ref-count bumps, not `String` clones | measurable at multi-subscriber |
+| 6 | `Arc<Notification>` in notifier broadcast so fan-out is ref-count bumps, not `String` clones | measurable at multi-subscriber |
 
 ## Comparing to Redis
 

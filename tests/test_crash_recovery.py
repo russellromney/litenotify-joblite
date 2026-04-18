@@ -227,7 +227,7 @@ def test_sigkill_mid_honk_tx_delivers_no_notification(tmp_path):
 
         db = litenotify.open({db_path!r})
         with db.transaction() as tx:
-            tx.honk({channel!r}, {{"killed": True}})
+            tx.notify({channel!r}, {{"killed": True}})
             print("READY", flush=True)
             time.sleep(60)
         """
@@ -260,7 +260,7 @@ def test_sigkill_mid_honk_tx_delivers_no_notification(tmp_path):
 
         # A committed honk should flow end to end.
         with db.transaction() as tx:
-            tx.honk(channel, {"alive": True})
+            tx.notify(channel, {"alive": True})
         got = await asyncio.wait_for(listener.__anext__(), timeout=2.0)
         return got
 
@@ -296,7 +296,7 @@ def test_sigkill_while_listener_preattached_sees_no_leak(tmp_path):
 
         db = litenotify.open({db_path!r})
         with db.transaction() as tx:
-            tx.honk({channel!r}, {{"killed": True}})
+            tx.notify({channel!r}, {{"killed": True}})
             print("READY", flush=True)
             time.sleep(60)
         """
@@ -319,7 +319,7 @@ def test_sigkill_while_listener_preattached_sees_no_leak(tmp_path):
         except asyncio.TimeoutError:
             pass
         with db.transaction() as tx:
-            tx.honk(channel, {"alive": True})
+            tx.notify(channel, {"alive": True})
         got = await asyncio.wait_for(listener.__anext__(), timeout=2.0)
         return got
 

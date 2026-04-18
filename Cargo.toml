@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "honker",
     "litenotify"
 ]
 resolver = "2"

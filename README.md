@@ -10,8 +10,7 @@ If you run Postgres, keep Postgres. This explores what one SQLite file can do wh
 
 | Package | What it is |
 |---------|-----------|
-| `honker` | Rust crate. SQLite commit-hook NOTIFY/LISTEN with per-channel subscriber registry. |
-| `litenotify` | PyO3 binding. `Database` / `Transaction` / `Listener`. One writer, bounded reader pool. |
+| `litenotify` | Rust lib + PyO3 binding. Commit-hook NOTIFY/LISTEN, per-channel subscriber registry, `Database` / `Transaction` / `Listener`. One writer, bounded reader pool. |
 | `joblite` | Python. `Queue` (at-least-once, visibility timeout), `Stream` (durable pub/sub, Last-Event-ID), `Outbox` (transactional side effects). |
 | `joblite_fastapi` | `JobliteApp(app, db)`: worker pool + SSE endpoints + `authorize` hook. |
 | `joblite_django` | `@task`, async SSE views, `python manage.py joblite_worker`. |
@@ -24,7 +23,7 @@ Apple Silicon M-series, WAL + `synchronous=NORMAL`, release build, April 2026. M
 
 | Operation | Throughput / latency | Notes |
 |-----------|----------------------|-------|
-| `enqueue` (1 job / tx) | ~6,000 /s | `BEGIN IMMEDIATE` + INSERT (5 cols + index) + `honk` + COMMIT. WAL + `synchronous=NORMAL` (no per-commit fsync); bottleneck is PyO3+mutex+GIL per tx. |
+| `enqueue` (1 job / tx) | ~6,000 /s | `BEGIN IMMEDIATE` + INSERT (5 cols + index) + `notify` + COMMIT. WAL + `synchronous=NORMAL` (no per-commit fsync); bottleneck is PyO3+mutex+GIL per tx. |
 | `enqueue` (100 jobs / tx) | ~110,000 /s | Batched into one `COMMIT`. |
 | `claim + ack` (1 job) | ~3,700 /s | Two write transactions per job. |
 | `claim_batch + ack_batch` (32) | ~60,000 /s | One tx claims 32 jobs, one tx acks them. |
@@ -77,10 +76,10 @@ async for notif in db.listen("orders"):
 # elsewhere:
 with db.transaction() as tx:
     tx.execute("INSERT INTO orders ...")
-    tx.honk("orders", {"order_id": 99})
+    tx.notify("orders", {"order_id": 99})
 ```
 
-`honk()` buffers inside the transaction. Rollback drops it.
+`notify()` buffers inside the transaction. Rollback drops it.
 
 ### FastAPI
 
@@ -129,10 +128,10 @@ Two or more worker processes split work with zero overlap. Proven by `test_jobli
 |------------|-------------|
 | WAL: one writer at a time | Single dedicated writer connection; readers pool separately. |
 | `BEGIN IMMEDIATE` is the claim primitive | Every job claim is one atomic `UPDATE ... RETURNING` inside a `BEGIN IMMEDIATE`. |
-| `commit_hook` fires after `COMMIT` | `honk()` buffers inside the tx; rollback drops the buffer; commit fans out per channel. Transactional pub/sub. |
+| `commit_hook` fires after `COMMIT` | `notify()` buffers inside the tx; rollback drops the buffer; commit fans out per channel. Transactional pub/sub. |
 | Commit hooks run in the writing process | The notifier is per-process. Cross-process workers fall back to polling (`idle_poll_s`, default 5s). |
 
-### honker
+### Notifier registry
 
 Each channel has its own `Vec<Subscriber>` with a per-subscriber `tokio::broadcast` ring. A flood on `"hot"` can't starve a listener on `"cold"`. `unsubscribe(id)` drops the sender and closes the receiver; Python `Listener.__del__` calls it, so SSE-heavy services don't leak threads.
 
@@ -161,7 +160,7 @@ One `Writer` slot (mutex + condvar), always released around `db.transaction()` e
 ## Tests and bench
 
 ```bash
-cargo test -p honker                        # 12 tests
+cargo test -p litenotify                    # 12 tests
 pytest tests/                               # 109 tests, ~8 to 13s parallel
 python bench/joblite_bench.py --n 5000
 python bench/stream_bench.py --n 5000

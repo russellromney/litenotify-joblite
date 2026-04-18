@@ -42,7 +42,7 @@ async def test_listener_churn_does_not_leak_threads(db_path):
         task = asyncio.create_task(once())
         await asyncio.sleep(0.002)
         with db.transaction() as tx:
-            tx.honk(channel, "ok")
+            tx.notify(channel, "ok")
         await asyncio.wait_for(task, timeout=2.0)
 
         peak = max(peak, _active_thread_count())
@@ -143,7 +143,7 @@ async def test_sustained_honk_throughput_does_not_leak_memory(db_path):
     for batch_start in range(0, n_events, batch):
         with db.transaction() as tx:
             for i in range(batch_start, batch_start + batch):
-                tx.honk("sustained", f"p{i}")
+                tx.notify("sustained", f"p{i}")
         # Yield to the loop so the consumer can make progress.
         await asyncio.sleep(0)
     await asyncio.wait_for(task, timeout=15.0)
