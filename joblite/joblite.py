@@ -1,0 +1,563 @@
+import asyncio
+import json
+import time
+import traceback
+from typing import Any, AsyncIterator, Callable, Optional
+
+import litenotify
+
+
+class Job:
+    __slots__ = (
+        "queue",
+        "id",
+        "queue_name",
+        "payload",
+        "state",
+        "priority",
+        "run_at",
+        "worker_id",
+        "claim_expires_at",
+        "attempts",
+        "max_attempts",
+        "last_error",
+        "created_at",
+    )
+
+    def __init__(self, queue: "Queue", row: dict):
+        self.queue = queue
+        self.id = row["id"]
+        self.queue_name = row["queue"]
+        self.payload = json.loads(row["payload"]) if row["payload"] else None
+        self.state = row["state"]
+        self.priority = row["priority"]
+        self.run_at = row["run_at"]
+        self.worker_id = row["worker_id"]
+        self.claim_expires_at = row["claim_expires_at"]
+        self.attempts = row["attempts"]
+        self.max_attempts = row["max_attempts"]
+        self.last_error = row["last_error"]
+        self.created_at = row["created_at"]
+
+    def ack(self) -> bool:
+        return self.queue.ack(self.id, self.worker_id)
+
+    def retry(self, delay_s: int = 60, error: str = "") -> bool:
+        return self.queue.retry(self.id, self.worker_id, delay_s, error)
+
+    def fail(self, error: str = "") -> bool:
+        return self.queue.fail(self.id, self.worker_id, error)
+
+    def heartbeat(self, extend_s: Optional[int] = None) -> bool:
+        return self.queue.heartbeat(self.id, self.worker_id, extend_s)
+
+
+class Queue:
+    def __init__(
+        self,
+        db,
+        name: str,
+        visibility_timeout_s: int = 300,
+        max_attempts: int = 3,
+    ):
+        self.db = db
+        self.name = name
+        self.visibility_timeout_s = int(visibility_timeout_s)
+        self.max_attempts = int(max_attempts)
+        self._init_schema()
+
+    def _init_schema(self):
+        with self.db.transaction() as tx:
+            tx.execute(
+                """
+                CREATE TABLE IF NOT EXISTS _joblite_jobs (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  queue TEXT NOT NULL,
+                  payload TEXT NOT NULL,
+                  state TEXT NOT NULL DEFAULT 'pending',
+                  priority INTEGER NOT NULL DEFAULT 0,
+                  run_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                  worker_id TEXT,
+                  claim_expires_at INTEGER,
+                  attempts INTEGER NOT NULL DEFAULT 0,
+                  max_attempts INTEGER NOT NULL DEFAULT 3,
+                  last_error TEXT,
+                  created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                )
+                """
+            )
+            tx.execute(
+                """
+                CREATE INDEX IF NOT EXISTS _joblite_jobs_claim
+                  ON _joblite_jobs(queue, state, priority DESC, run_at, id)
+                """
+            )
+
+    def _channel(self) -> str:
+        return f"joblite:{self.name}"
+
+    def enqueue(
+        self,
+        payload: Any,
+        tx=None,
+        run_at: Optional[int] = None,
+        priority: int = 0,
+    ) -> None:
+        run_at_val = int(run_at) if run_at is not None else int(time.time())
+        payload_str = json.dumps(payload)
+        params = [self.name, payload_str, run_at_val, int(priority), self.max_attempts]
+
+        if tx is not None:
+            tx.execute(
+                """
+                INSERT INTO _joblite_jobs (queue, payload, run_at, priority, max_attempts)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                params,
+            )
+            tx.honk(self._channel(), "new")
+            return
+
+        with self.db.transaction() as own_tx:
+            own_tx.execute(
+                """
+                INSERT INTO _joblite_jobs (queue, payload, run_at, priority, max_attempts)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                params,
+            )
+            own_tx.honk(self._channel(), "new")
+
+    def claim_one(self, worker_id: str) -> Optional[Job]:
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                """
+                UPDATE _joblite_jobs
+                SET state='processing',
+                    worker_id=?,
+                    claim_expires_at=unixepoch() + ?,
+                    attempts=attempts+1
+                WHERE id = (
+                  SELECT id FROM _joblite_jobs
+                  WHERE queue=?
+                    AND ((state='pending' AND run_at <= unixepoch())
+                      OR (state='processing' AND claim_expires_at < unixepoch()))
+                  ORDER BY priority DESC, run_at ASC, id ASC
+                  LIMIT 1
+                )
+                RETURNING *
+                """,
+                [worker_id, self.visibility_timeout_s, self.name],
+            )
+        if rows:
+            return Job(self, rows[0])
+        return None
+
+    def claim(self, worker_id: str, idle_poll_s: float = 5.0) -> AsyncIterator[Job]:
+        return _WorkerQueueIter(self, worker_id, idle_poll_s)
+
+    def ack(self, job_id: int, worker_id: str) -> bool:
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                """
+                UPDATE _joblite_jobs
+                SET state='done'
+                WHERE id=? AND worker_id=? AND claim_expires_at >= unixepoch()
+                RETURNING id
+                """,
+                [int(job_id), worker_id],
+            )
+        return len(rows) > 0
+
+    def retry(self, job_id: int, worker_id: str, delay_s: int, error: str) -> bool:
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                """
+                UPDATE _joblite_jobs
+                SET state=CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'pending' END,
+                    run_at=unixepoch() + ?,
+                    last_error=?,
+                    worker_id=NULL,
+                    claim_expires_at=NULL
+                WHERE id=? AND worker_id=? AND claim_expires_at >= unixepoch()
+                RETURNING id
+                """,
+                [int(delay_s), error, int(job_id), worker_id],
+            )
+            if rows:
+                tx.honk(self._channel(), "retry")
+        return len(rows) > 0
+
+    def fail(self, job_id: int, worker_id: str, error: str) -> bool:
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                """
+                UPDATE _joblite_jobs
+                SET state='dead',
+                    last_error=?,
+                    worker_id=NULL,
+                    claim_expires_at=NULL
+                WHERE id=? AND worker_id=? AND claim_expires_at >= unixepoch()
+                RETURNING id
+                """,
+                [error, int(job_id), worker_id],
+            )
+        return len(rows) > 0
+
+    def heartbeat(
+        self, job_id: int, worker_id: str, extend_s: Optional[int] = None
+    ) -> bool:
+        extend = int(extend_s) if extend_s is not None else self.visibility_timeout_s
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                """
+                UPDATE _joblite_jobs
+                SET claim_expires_at=unixepoch() + ?
+                WHERE id=? AND worker_id=? AND state='processing'
+                RETURNING id
+                """,
+                [extend, int(job_id), worker_id],
+            )
+        return len(rows) > 0
+
+
+class Retryable(Exception):
+    """Raise from a task handler to request a scheduled retry with a specific
+    delay. Any other exception is also retried, but with a generic backoff.
+    Lives in joblite core so framework plugins (fastapi, django, ...) can all
+    reuse the same signal without depending on each other."""
+
+    def __init__(self, message: str = "", delay_s: int = 60):
+        super().__init__(message)
+        self.delay_s = int(delay_s)
+
+
+class Event:
+    __slots__ = ("offset", "topic", "key", "payload", "created_at")
+
+    def __init__(self, row: dict):
+        self.offset = row["offset"]
+        self.topic = row["topic"]
+        self.key = row["key"]
+        self.payload = json.loads(row["payload"]) if row["payload"] else None
+        self.created_at = row["created_at"]
+
+    def __repr__(self):
+        return (
+            f"Event(offset={self.offset}, topic={self.topic!r}, "
+            f"key={self.key!r}, payload={self.payload!r})"
+        )
+
+
+class Stream:
+    """Durable pub/sub. Events are rows; consumers track offsets.
+
+    Publish inside a transaction to couple the event atomically to your
+    business write. Subscribe with a `from_offset` to catch up after a
+    disconnect; the iterator replays rows with offset > from_offset, then
+    transitions to live NOTIFY delivery.
+    """
+
+    def __init__(self, db, name: str):
+        self.db = db
+        self.name = name
+        self._init_schema()
+
+    def _init_schema(self):
+        with self.db.transaction() as tx:
+            tx.execute(
+                """
+                CREATE TABLE IF NOT EXISTS _joblite_stream (
+                  offset INTEGER PRIMARY KEY AUTOINCREMENT,
+                  topic TEXT NOT NULL,
+                  key TEXT,
+                  payload TEXT NOT NULL,
+                  created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                )
+                """
+            )
+            tx.execute(
+                """
+                CREATE INDEX IF NOT EXISTS _joblite_stream_topic
+                  ON _joblite_stream(topic, offset)
+                """
+            )
+            tx.execute(
+                """
+                CREATE TABLE IF NOT EXISTS _joblite_stream_consumers (
+                  name TEXT NOT NULL,
+                  topic TEXT NOT NULL,
+                  offset INTEGER NOT NULL DEFAULT 0,
+                  PRIMARY KEY (name, topic)
+                )
+                """
+            )
+
+    def _channel(self) -> str:
+        return f"joblite:stream:{self.name}"
+
+    def publish(
+        self, payload: Any, key: Optional[str] = None, tx=None
+    ) -> None:
+        payload_str = json.dumps(payload)
+        params = [self.name, key, payload_str]
+        if tx is not None:
+            tx.execute(
+                """
+                INSERT INTO _joblite_stream (topic, key, payload)
+                VALUES (?, ?, ?)
+                """,
+                params,
+            )
+            tx.honk(self._channel(), "new")
+            return
+        with self.db.transaction() as own_tx:
+            own_tx.execute(
+                """
+                INSERT INTO _joblite_stream (topic, key, payload)
+                VALUES (?, ?, ?)
+                """,
+                params,
+            )
+            own_tx.honk(self._channel(), "new")
+
+    def _read_since(self, offset: int, limit: int = 1000) -> list:
+        rows = self.db.query(
+            """
+            SELECT offset, topic, key, payload, created_at
+            FROM _joblite_stream
+            WHERE topic=? AND offset > ?
+            ORDER BY offset ASC
+            LIMIT ?
+            """,
+            [self.name, int(offset), int(limit)],
+        )
+        return rows
+
+    def save_offset(self, consumer: str, offset: int) -> None:
+        with self.db.transaction() as tx:
+            tx.execute(
+                """
+                INSERT INTO _joblite_stream_consumers (name, topic, offset)
+                VALUES (?, ?, ?)
+                ON CONFLICT(name, topic) DO UPDATE SET offset=excluded.offset
+                WHERE excluded.offset > _joblite_stream_consumers.offset
+                """,
+                [consumer, self.name, int(offset)],
+            )
+
+    def get_offset(self, consumer: str) -> int:
+        rows = self.db.query(
+            """
+            SELECT offset FROM _joblite_stream_consumers
+            WHERE name=? AND topic=?
+            """,
+            [consumer, self.name],
+        )
+        return rows[0]["offset"] if rows else 0
+
+    def subscribe(
+        self,
+        consumer: Optional[str] = None,
+        from_offset: Optional[int] = None,
+    ) -> AsyncIterator[Event]:
+        """Yield events with offset > from_offset, then live events as they
+        arrive. If `consumer` is given and `from_offset` is None, the last
+        saved offset for that consumer is used.
+        """
+        if from_offset is None and consumer is not None:
+            from_offset = self.get_offset(consumer)
+        if from_offset is None:
+            from_offset = 0
+        return _StreamIter(self, int(from_offset))
+
+
+class _StreamIter:
+    def __init__(self, stream: Stream, from_offset: int):
+        self.stream = stream
+        self.offset = from_offset
+        self._buffer: list = []
+        # Subscribe to the notify channel BEFORE the first read so that events
+        # published between "read empty" and "start listening" can't slip
+        # through. The listener buffers all honks from this point forward; we
+        # drain the queue every time we re-read and catch up.
+        self._listener = stream.db.listen(stream._channel())
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        while True:
+            if self._buffer:
+                row = self._buffer.pop(0)
+                self.offset = row["offset"]
+                return Event(row)
+
+            rows = self.stream._read_since(self.offset)
+            if rows:
+                self._buffer = rows
+                continue
+
+            try:
+                await asyncio.wait_for(
+                    self._listener.__anext__(), timeout=15.0
+                )
+            except asyncio.TimeoutError:
+                pass
+            except StopAsyncIteration:
+                raise StopAsyncIteration
+
+
+class Outbox:
+    """Transactional side-effect delivery built on joblite.queue.
+
+    `delivery(payload)` is a user-supplied callable (sync or async). On
+    failure, the outbox retries with exponential backoff up to max_attempts
+    and then marks the job dead. Callers enqueue side effects in the same
+    transaction as the business write; a background worker drives delivery.
+    """
+
+    def __init__(
+        self,
+        db,
+        name: str,
+        delivery: Callable,
+        max_attempts: int = 5,
+        base_backoff_s: int = 5,
+        visibility_timeout_s: int = 60,
+    ):
+        if not callable(delivery):
+            raise TypeError("delivery must be callable")
+        self.db = db
+        self.name = name
+        self.delivery = delivery
+        self.max_attempts = int(max_attempts)
+        self.base_backoff_s = int(base_backoff_s)
+        self._queue = db.queue(
+            f"_outbox:{name}",
+            visibility_timeout_s=visibility_timeout_s,
+            max_attempts=self.max_attempts,
+        )
+
+    @property
+    def queue(self) -> Queue:
+        return self._queue
+
+    def enqueue(self, payload: Any, tx=None, priority: int = 0) -> None:
+        self._queue.enqueue(payload, tx=tx, priority=priority)
+
+    async def run_worker(self, worker_id: str):
+        """Drive delivery forever. Cancel the task to stop."""
+        async for job in self._queue.claim(worker_id):
+            try:
+                if asyncio.iscoroutinefunction(self.delivery):
+                    await self.delivery(job.payload)
+                else:
+                    self.delivery(job.payload)
+                job.ack()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                delay = self.base_backoff_s * (2 ** (job.attempts - 1))
+                job.retry(
+                    delay_s=delay,
+                    error=f"{e}\n{traceback.format_exc()}",
+                )
+
+
+class Database:
+    """Wrapper over the litenotify Database that adds queue/stream/outbox."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._queues: dict = {}
+        self._streams: dict = {}
+        self._outboxes: dict = {}
+
+    def transaction(self):
+        return self._inner.transaction()
+
+    def listen(self, channel: str):
+        return self._inner.listen(channel)
+
+    def query(self, sql: str, params=None):
+        return self._inner.query(sql, params)
+
+    def queue(
+        self,
+        name: str,
+        visibility_timeout_s: int = 300,
+        max_attempts: int = 3,
+    ) -> Queue:
+        existing = self._queues.get(name)
+        if existing is not None:
+            return existing
+        q = Queue(
+            self,
+            name,
+            visibility_timeout_s=visibility_timeout_s,
+            max_attempts=max_attempts,
+        )
+        self._queues[name] = q
+        return q
+
+    def stream(self, name: str) -> Stream:
+        existing = self._streams.get(name)
+        if existing is not None:
+            return existing
+        s = Stream(self, name)
+        self._streams[name] = s
+        return s
+
+    def outbox(
+        self,
+        name: str,
+        delivery: Callable,
+        max_attempts: int = 5,
+        base_backoff_s: int = 5,
+        visibility_timeout_s: int = 60,
+    ) -> Outbox:
+        existing = self._outboxes.get(name)
+        if existing is not None:
+            return existing
+        o = Outbox(
+            self,
+            name,
+            delivery=delivery,
+            max_attempts=max_attempts,
+            base_backoff_s=base_backoff_s,
+            visibility_timeout_s=visibility_timeout_s,
+        )
+        self._outboxes[name] = o
+        return o
+
+
+def open(path: str, max_readers: int = 8) -> Database:
+    return Database(litenotify.open(path, max_readers=max_readers))
+
+
+class _WorkerQueueIter:
+    def __init__(self, queue: Queue, worker_id: str, idle_poll_s: float):
+        self.queue = queue
+        self.worker_id = worker_id
+        self.idle_poll_s = idle_poll_s
+        self._listener = None
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        while True:
+            job = self.queue.claim_one(self.worker_id)
+            if job is not None:
+                return job
+            if self._listener is None:
+                self._listener = self.queue.db.listen(self.queue._channel())
+            try:
+                await asyncio.wait_for(
+                    self._listener.__anext__(), timeout=self.idle_poll_s
+                )
+            except asyncio.TimeoutError:
+                pass
+            except StopAsyncIteration:
+                raise StopAsyncIteration
