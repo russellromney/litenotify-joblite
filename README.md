@@ -24,14 +24,18 @@ Apple Silicon M-series, WAL + `synchronous=NORMAL`, release build, April 2026. M
 
 | Operation | Throughput / latency | Notes |
 |-----------|----------------------|-------|
-| `enqueue` (1 job / tx) | ~4,500 /s | `BEGIN IMMEDIATE` + INSERT (5 cols + index) + `honk` + COMMIT. Fsync-bound. |
-| `enqueue` (100 jobs / tx) | ~94,000 /s | Batched into one `COMMIT`. What you want for bulk loads. |
-| `claim + ack` | ~1,000 /s | Two write transactions per job. `claim_batch(n)` on ROADMAP should 10x this. |
-| `publish` (stream) | ~5,700 /s | Wider per-row cost than queue enqueue. |
+| `enqueue` (1 job / tx) | ~5,000 /s | `BEGIN IMMEDIATE` + INSERT (5 cols + index) + `honk` + COMMIT. WAL + `synchronous=NORMAL` (no per-commit fsync); bottleneck is PyO3+mutex+GIL per tx. |
+| `enqueue` (100 jobs / tx) | ~94,000 /s | Batched into one `COMMIT`. |
+| `claim + ack` (1 job) | ~3,100 /s | Two write transactions per job. |
+| `claim_batch + ack_batch` (32) | ~48,000 /s | One tx claims 32 jobs, one tx acks them. |
+| `claim_batch + ack_batch` (128) | ~61,000 /s | Same, larger batch. |
+| `publish` (1 event / tx) | ~5,700 /s | Wider per-row cost than queue enqueue. |
 | replay | ~400,000 /s | Reader-pool `SELECT`, no write lock. |
 | live stream e2e | **p50 = 0.24ms**, p99 = 8ms | Publish to consumer wake. |
 
-For context, raw Python `sqlite3` single-tx on the same file is ~47k/s (WAL+fsync ceiling). Our single-tx is ~4x slower than that because of PyO3 crossings, a writer mutex, and GIL detach/reacquire. For workloads that enqueue more than a few jobs per request, batching inside one `tx=db.transaction()` closes the gap entirely.
+For context, raw Python `sqlite3` single-tx on the same file is ~47k/s (WAL ceiling on this machine). Our single-tx is ~4x slower than that because of PyO3 crossings, a writer mutex, and GIL detach/reacquire. Batching amortizes these costs and closes the gap.
+
+`async for job in queue.claim(worker_id)` uses `claim_batch(batch_size=32)` internally, so the async iterator gets the 48k/s number without any user code changes.
 
 Redis `LPUSH`/`BRPOP` clears ~100k/s but lives in a separate process and doesn't commit atomically with your writes. `pg_notify` is fast but requires Postgres. joblite trades peak single-tx throughput for transactional coupling and one-file deployment.
 
@@ -151,8 +155,8 @@ One `Writer` slot (mutex + condvar), always released around `db.transaction()` e
 
 ### Known perf work
 
-- **Batched `claim` transaction (`Queue.claim_batch(n)`).** Today `claim+ack` is two write transactions per job. Collapsing N claims into one should push throughput into the tens of thousands.
-- **Shave PyO3 / mutex / GIL overhead off single-tx.** We're at ~12k/s for raw `litenotify.tx.execute(INSERT)` vs. ~47k/s for raw Python `sqlite3` on the same file. The gap is per-tx fixed cost (writer mutex acquire, GIL detach/reacquire, three PyO3 boundary crossings). Work in progress: statement cache is already on, next is `try_acquire` fast-path when no contention.
+- **Shave PyO3 / mutex / GIL overhead off single-tx.** We're at ~12k/s for raw `litenotify.tx.execute(INSERT)` vs. ~47k/s for raw Python `sqlite3` on the same file. The gap is per-tx fixed cost (writer mutex acquire, GIL detach/reacquire, PyO3 boundary crossings). Statement cache is already on; next is `try_acquire` fast-path when no contention.
+- **Published bench for SSE + Django workers.** The numbers above are local single-connection; real deployments add network, OS scheduling, and cross-process polling.
 
 ## Tests and bench
 

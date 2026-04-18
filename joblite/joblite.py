@@ -86,12 +86,28 @@ class Queue:
                 )
                 """
             )
+            # Partial index keyed on (queue, priority DESC, run_at, id) with
+            # a WHERE clause filtering to only claimable jobs. Critical that
+            # `state` is NOT in the key: changing state on claim (pending ->
+            # processing) would otherwise force the row to reshuffle in the
+            # B-tree, which measured at ~9x slowdown per UPDATE. The state
+            # filter is in the partial-index WHERE clause; the planner still
+            # matches it against the query predicate. When state transitions
+            # to 'done' / 'dead' the row drops out of the index entirely
+            # (cheap single-key delete, no B-tree rewrite).
+            #
+            # `_v2` suffix so CREATE IF NOT EXISTS stays idempotent even
+            # when the old full-key index is being dropped alongside.
             tx.execute(
                 """
-                CREATE INDEX IF NOT EXISTS _joblite_jobs_claim
-                  ON _joblite_jobs(queue, state, priority DESC, run_at, id)
+                CREATE INDEX IF NOT EXISTS _joblite_jobs_claim_v2
+                  ON _joblite_jobs(queue, priority DESC, run_at, id)
+                  WHERE state IN ('pending', 'processing')
                 """
             )
+            # Drop the old full-key index from any DB initialized before
+            # this change. Cheap no-op on fresh DBs.
+            tx.execute("DROP INDEX IF EXISTS _joblite_jobs_claim")
 
     def _channel(self) -> str:
         return f"joblite:{self.name}"
@@ -129,6 +145,26 @@ class Queue:
             own_tx.honk(self._channel(), "new")
 
     def claim_one(self, worker_id: str) -> Optional[Job]:
+        jobs = self.claim_batch(worker_id, 1)
+        return jobs[0] if jobs else None
+
+    def claim_batch(self, worker_id: str, n: int) -> list:
+        """Atomically claim up to `n` jobs in a single transaction.
+
+        The SQL text is constant across batch sizes (LIMIT is parameterized)
+        so the statement cache keeps one prepared plan for every call.
+        One BEGIN IMMEDIATE + one UPDATE ... RETURNING *, independent of n.
+
+        The `state IN ('pending', 'processing')` predicate is logically a
+        no-op (the OR clause below covers it) but SQLite's planner cannot
+        otherwise prove the query implies the partial index's WHERE and
+        falls back to a full table scan. With the explicit IN the planner
+        picks the partial index and the claim goes from table scan to
+        an index lookup.
+        """
+        n = int(n)
+        if n <= 0:
+            return []
         with self.db.transaction() as tx:
             rows = tx.query(
                 """
@@ -137,24 +173,53 @@ class Queue:
                     worker_id=?,
                     claim_expires_at=unixepoch() + ?,
                     attempts=attempts+1
-                WHERE id = (
+                WHERE id IN (
                   SELECT id FROM _joblite_jobs
                   WHERE queue=?
+                    AND state IN ('pending', 'processing')
                     AND ((state='pending' AND run_at <= unixepoch())
                       OR (state='processing' AND claim_expires_at < unixepoch()))
                   ORDER BY priority DESC, run_at ASC, id ASC
-                  LIMIT 1
+                  LIMIT ?
                 )
                 RETURNING *
                 """,
-                [worker_id, self.visibility_timeout_s, self.name],
+                [worker_id, self.visibility_timeout_s, self.name, n],
             )
-        if rows:
-            return Job(self, rows[0])
-        return None
+        return [Job(self, row) for row in rows]
 
-    def claim(self, worker_id: str, idle_poll_s: float = 5.0) -> AsyncIterator[Job]:
-        return _WorkerQueueIter(self, worker_id, idle_poll_s)
+    def ack_batch(self, job_ids, worker_id: str) -> int:
+        """Ack multiple jobs in a single transaction. Returns the count of
+        jobs whose claim was still valid (i.e. the at-least-once contract
+        is preserved for each).
+
+        Uses `json_each(?)` over a JSON array of ids so the SQL text stays
+        constant across batch sizes and hits the statement cache.
+        """
+        ids = [int(i) for i in job_ids]
+        if not ids:
+            return 0
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                """
+                UPDATE _joblite_jobs
+                SET state='done'
+                WHERE id IN (SELECT value FROM json_each(?))
+                  AND worker_id = ?
+                  AND claim_expires_at >= unixepoch()
+                RETURNING id
+                """,
+                [json.dumps(ids), worker_id],
+            )
+        return len(rows)
+
+    def claim(
+        self,
+        worker_id: str,
+        idle_poll_s: float = 5.0,
+        batch_size: int = 32,
+    ) -> AsyncIterator[Job]:
+        return _WorkerQueueIter(self, worker_id, idle_poll_s, batch_size)
 
     def ack(self, job_id: int, worker_id: str) -> bool:
         with self.db.transaction() as tx:
@@ -537,20 +602,38 @@ def open(path: str, max_readers: int = 8) -> Database:
 
 
 class _WorkerQueueIter:
-    def __init__(self, queue: Queue, worker_id: str, idle_poll_s: float):
+    """Async iterator that yields jobs one at a time but claims them in
+    batches of `batch_size`. One write transaction per batch amortizes the
+    per-tx overhead (prepare, mutex, GIL detach, fsync-on-checkpoint, etc.)
+    across many jobs. Default batch_size=32 turns ~1k/s single-claim into
+    ~claim_batch_throughput / 1 per-job.
+    """
+
+    def __init__(
+        self,
+        queue: Queue,
+        worker_id: str,
+        idle_poll_s: float,
+        batch_size: int = 32,
+    ):
         self.queue = queue
         self.worker_id = worker_id
         self.idle_poll_s = idle_poll_s
+        self.batch_size = max(1, int(batch_size))
         self._listener = None
+        self._buffer: list = []
 
     def __aiter__(self):
         return self
 
     async def __anext__(self):
         while True:
-            job = self.queue.claim_one(self.worker_id)
-            if job is not None:
-                return job
+            if self._buffer:
+                return self._buffer.pop(0)
+            batch = self.queue.claim_batch(self.worker_id, self.batch_size)
+            if batch:
+                self._buffer = batch
+                continue
             if self._listener is None:
                 self._listener = self.queue.db.listen(self.queue._channel())
             try:

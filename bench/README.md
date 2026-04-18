@@ -12,61 +12,75 @@ Median of 3 runs. WAL + `synchronous=NORMAL`, default `busy_timeout=5000`.
 ### `joblite.queue`
 
 ```
-enqueue (1 job / tx):        4,500 ops/s   (~230us/job)
-enqueue (100 jobs / tx):    94,000 ops/s   (~11us/job)
-claim + ack:                 1,000 ops/s   (~1ms, two write tx per job)
-end-to-end (e2e):              820 ops/s   (pathological, see below)
+enqueue (1 job / tx):                 5,000 ops/s   (~200us/job)
+enqueue (100 jobs / tx):             94,000 ops/s   (~11us/job)
+claim + ack (1 job / 2 tx):           3,100 ops/s   (~320us/job)
+claim_batch + ack_batch (batch=8):   18,500 ops/s
+claim_batch + ack_batch (batch=32):  48,500 ops/s
+claim_batch + ack_batch (batch=128): 61,000 ops/s
+end-to-end (async iter, batch=32):    3,050 ops/s   p50~850ms in drain pattern
 ```
 
-e2e here enqueues all N up front, then drains. Jobs at the end of the
-batch wait in line, so p50 approaches the drain time. For realistic
-interleaved workloads, per-job latency tracks `~1 / throughput s`.
+The async iterator (`async for job in queue.claim(worker_id)`) uses
+`claim_batch(batch_size=32)` internally; you get the 48k number
+without touching application code.
 
 ### `joblite.stream`
 
 ```
-publish (1 / tx):           5,700 events/s
-replay (reader pool):     400,000 events/s
-live e2e:                  p50 = 0.24ms    p99 = 8ms    (1000 events)
+publish (1 / tx):                     5,700 events/s
+replay (reader pool):               400,000 events/s
+live e2e:                            p50 = 0.24ms   p99 = 8ms   (1000 events)
 ```
 
 Live e2e is commit-hook → tokio broadcast → `call_soon_threadsafe` →
 consumer. Sub-millisecond typical.
 
-> A prior revision of the harness reported p50 around 50ms because the
-> publisher looped without yielding, starving the consumer coroutine.
-> Fixed; numbers above are with `await asyncio.sleep(0)` between
-> publishes. `stream_bench.py` still enforces this.
-
 ## Ceilings and gaps
 
-| Path | 1 tx/row | 100 rows/tx |
-|------|----------|-------------|
-| raw Python `sqlite3` | ~47k/s | ~640k/s |
-| litenotify tx + execute | ~12k/s | (similar to raw — fsync-bound) |
-| joblite queue enqueue | ~4.5k/s | ~94k/s |
+Raw Python `sqlite3` single-tx on the same WAL+`synchronous=NORMAL` file
+measures ~47k ops/s. That's the platform ceiling. The gap to our 5k/s
+enqueue is per-tx fixed cost:
 
-**Read the gap.** The single-writer path has three cost centers:
+- Writer-mutex acquire + release
+- `py.detach` (GIL release + reacquire)
+- Three PyO3 boundary crossings per tx (enter, execute, exit)
+- rusqlite `prepare_cached` lookup × 3 (BEGIN, body, COMMIT)
 
-1. **fsync on COMMIT.** Even `synchronous=NORMAL` syncs the WAL on commit.
-   At ~47k/s raw sqlite3 we're at ~21us/op, most of which is the syscall
-   plus SQLite internals. Not much room without relaxing durability.
-2. **PyO3 / mutex / GIL per tx.** litenotify sits ~4x below raw sqlite3
-   for single-tx. That's PyO3 boundary crossings, writer-mutex
-   acquire+release (uncontended but not free), `py.detach` GIL
-   release+reacquire. Fixable — [see ROADMAP](../ROADMAP.md).
-3. **joblite schema overhead.** 5 columns + one B-tree index +
-   `json.dumps` + a `tx.honk()` call per enqueue, on top of the
-   litenotify path. ~2x gap vs. plain litenotify for the same
-   single-tx pattern.
+Batch into one `COMMIT` and these amortize away. 94k/s for batched
+enqueue is **faster than** raw Python `sqlite3` single-tx because SQLite
+fsyncs less often when a tx covers more rows (WAL frame gets fewer
+checkpoints per row written).
 
-Batch into one `COMMIT` and all three collapse. 94k/s for 100-row
-batches is 20x the single-tx number.
+## The partial-index fix
+
+Before 2026-04-18 the claim index was keyed on
+`(queue, state, priority DESC, run_at, id)`, meaning every state
+transition (pending → processing → done) reshuffled the row in the
+B-tree. Combined with an `OR`-based WHERE that the planner couldn't
+match against the index, the claim query was doing a full table scan.
+Measured cost: ~1k/s claim+ack even on a 5k-row queue.
+
+Fix: partial index on `(queue, priority DESC, run_at, id)
+WHERE state IN ('pending', 'processing')`, plus an explicit
+`state IN ('pending', 'processing')` in the claim SELECT so the planner
+matches it. Result:
+
+```
+claim + ack:  ~1k/s  -> ~3.1k/s    (3x, single tx per op)
+end-to-end:   ~820/s -> ~3.05k/s   (3.7x, async iter)
+```
+
+Check the plan yourself with `EXPLAIN QUERY PLAN`:
+
+```
+SEARCH _joblite_jobs USING INDEX _joblite_jobs_claim_v2 (queue=?)
+```
 
 ## Comparing to Redis
 
-`redis-cli LPUSH` + `BRPOP` on localhost clears ~100k ops/s. It lives
-in a separate process and does not commit atomically with application
-writes. joblite trades peak single-tx throughput for that coupling.
-For most apps, 4.5k/s per-request enqueue is well above actual job
-volume. For bulk loaders, use batching.
+`redis-cli LPUSH` + `BRPOP` on localhost clears ~100k ops/s in a
+separate process, without atomic coupling to your application writes.
+`claim_batch + ack_batch` at 61k/s is in the same order of magnitude
+and keeps the tx coupling. For bulk loaders or workers that naturally
+batch, use the batch API.

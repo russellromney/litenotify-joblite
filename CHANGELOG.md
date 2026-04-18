@@ -1,5 +1,61 @@
 # CHANGELOG
 
+## Unreleased — perf pass 2: the real claim bottleneck
+
+Previous "perf pass 1" claim was `synchronous=NORMAL` puts us on a fsync
+ceiling. Verified with a proper probe (`OFF` vs `NORMAL` vs `FULL`
+comparison on the same path): `NORMAL` in WAL does **not** fsync per
+commit. The actual claim+ack bottleneck was a query-plan / index-schema
+issue hiding behind the misread.
+
+### Root causes
+
+1. **The claim index had `state` as a key column.** Every transition
+   `pending -> processing -> done` forced the row to reshuffle in the
+   B-tree. Pure CPU cost, nothing to do with disk.
+2. **The OR-based WHERE clause couldn't match the partial predicate.**
+   Even after rewriting the index as `WHERE state IN ('pending',
+   'processing')`, the planner couldn't prove that `(state='pending'
+   OR state='processing')` implies the partial index's WHERE, so it
+   fell back to a **full table scan** on every claim. `EXPLAIN QUERY
+   PLAN` showed `SCAN _joblite_jobs` + `USE TEMP B-TREE FOR ORDER BY`.
+
+### Fix
+
+- Drop `state` from the index key; keep only `(queue, priority DESC,
+  run_at, id)`.
+- Make the index **partial**: `WHERE state IN ('pending', 'processing')`.
+  Rows drop out of the index entirely on `ack()` / `fail()`, which is a
+  cheap single-key delete rather than a B-tree rewrite.
+- Add an explicit `state IN ('pending', 'processing')` to the claim
+  inner SELECT so the planner matches the partial index. Logically a
+  no-op given the OR clause; necessary for planner inference. Plan now
+  reads `SEARCH _joblite_jobs USING INDEX _joblite_jobs_claim_v2 (queue=?)`.
+- Index renamed `_joblite_jobs_claim_v2`; old `_joblite_jobs_claim`
+  dropped idempotently on `Queue._init_schema` for existing DBs.
+
+### New batch APIs
+
+- `Queue.claim_batch(worker_id, n) -> list[Job]`: atomic UPDATE of N
+  rows in one tx, one RETURNING *.
+- `Queue.ack_batch(ids, worker_id) -> int`: one UPDATE via `json_each`
+  over a JSON array of ids, so SQL text is constant across batch sizes
+  (prepare_cached hit).
+- `Queue.claim(worker_id, batch_size=32)` async iterator now claims in
+  batches internally and yields one job at a time. Existing call sites
+  (`async for job in q.claim("w1")`) get the batched speed for free.
+
+### Numbers, median of 3, release build, Apple Silicon M-series
+
+| Operation | Before | After |
+|-----------|--------|-------|
+| claim + ack (1 job) | ~1,000 /s | ~3,100 /s |
+| claim_batch + ack_batch (32) | n/a | ~48,500 /s |
+| claim_batch + ack_batch (128) | n/a | ~61,000 /s |
+| end-to-end (async iter) | ~820 /s | ~3,050 /s |
+
+All 12 Rust + 109 Python tests still pass with the new schema.
+
 ## Unreleased — perf pass 1
 
 Commit-hook path is healthy. Per-tx Python path has a 4x gap to raw
