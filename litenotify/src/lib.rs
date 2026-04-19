@@ -140,7 +140,6 @@ fn serialize_payload(py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<Str
 struct Database {
     writer: Arc<Writer>,
     readers: Arc<Readers>,
-    path: String,
     wal_path: std::path::PathBuf,
     /// Lazy-initialized shared WAL watcher. One stat-poll thread per
     /// Database regardless of how many listeners subscribe. Previously
@@ -160,8 +159,7 @@ impl Database {
         let wal_path: std::path::PathBuf = format!("{}-wal", path).into();
         Ok(Self {
             writer: Arc::new(Writer::new(writer_conn)),
-            readers: Arc::new(Readers::new(path.clone(), max_readers)),
-            path,
+            readers: Arc::new(Readers::new(path, max_readers)),
             wal_path,
             shared_watcher: Mutex::new(None),
         })

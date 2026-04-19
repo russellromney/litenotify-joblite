@@ -113,7 +113,6 @@ fn sql_params_from_json(arr: Option<Vec<JsonValue>>) -> Vec<SqlValue> {
 pub struct Database {
     writer: Arc<Writer>,
     readers: Arc<Readers>,
-    path: String,
     wal_path: PathBuf,
     /// Lazy-initialized shared WAL watcher — one stat-poll thread per
     /// Database regardless of how many `walEvents()` subscribers. See
@@ -400,8 +399,7 @@ pub fn open(path: String, max_readers: Option<u32>) -> Result<Database> {
     let wal_path: PathBuf = format!("{}-wal", path).into();
     Ok(Database {
         writer: Arc::new(Writer::new(writer_conn)),
-        readers: Arc::new(Readers::new(path.clone(), max_readers)),
-        path,
+        readers: Arc::new(Readers::new(path, max_readers)),
         wal_path,
         shared_watcher: Arc::new(Mutex::new(None)),
     })

@@ -8,6 +8,7 @@ lifespan hooks like FastAPI, so we can't tear down / re-register cleanly.
 import asyncio
 import os
 import tempfile
+import threading
 
 import pytest
 
@@ -148,7 +149,7 @@ def test_sse_generator_close_tears_down_bridge(app_db):
     `close()` — we want to pin that exact behavior.
     """
     import time
-    from joblite_flask import _async_to_sync_gen, JobliteFlask
+    from joblite_flask import _async_to_sync_gen
     import weakref
 
     active: weakref.WeakSet = weakref.WeakSet()
@@ -187,10 +188,6 @@ def test_sse_generator_close_tears_down_bridge(app_db):
             break
         time.sleep(0.02)
     assert len(active) == 0, "bridge not torn down after generator close()"
-
-
-# threading import needs to be at module top for the test above.
-import threading  # noqa: E402
 
 
 def test_sse_many_disconnects_do_not_leak(app_db):

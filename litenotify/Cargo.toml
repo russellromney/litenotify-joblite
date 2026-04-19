@@ -12,7 +12,3 @@ litenotify-core = { path = "../litenotify-core" }
 parking_lot = "0.12.5"
 pyo3 = { version = "0.28.3", features = ["extension-module"] }
 rusqlite = { version = "0.39.0", features = ["functions", "hooks"] }
-tokio = { version = "1.52.1", features = ["sync"] }
-
-[dev-dependencies]
-tokio = { version = "1.52.1", features = ["sync", "macros", "rt-multi-thread", "time"] }
