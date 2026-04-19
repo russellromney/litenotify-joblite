@@ -23,11 +23,12 @@ Apple Silicon M-series, WAL + `synchronous=NORMAL`, release build, April 2026. M
 
 | Operation | Throughput / latency | Notes |
 |-----------|----------------------|-------|
-| `enqueue` (1 job / tx) | ~6,000 /s | `BEGIN IMMEDIATE` + INSERT (5 cols + index) + `notify` + COMMIT. WAL + `synchronous=NORMAL` (no per-commit fsync); bottleneck is PyO3+mutex+GIL per tx. |
+| `enqueue` (1 job / tx) | ~8,000 /s | `BEGIN IMMEDIATE` + INSERT (5 cols + index) + `notify` + COMMIT. WAL + `synchronous=NORMAL` (no per-commit fsync); bottleneck is PyO3+mutex+GIL per tx. |
 | `enqueue` (100 jobs / tx) | ~110,000 /s | Batched into one `COMMIT`. |
-| `claim + ack` (1 job) | ~3,700 /s | Two write transactions per job. |
-| `claim_batch + ack_batch` (32) | ~60,000 /s | One tx claims 32 jobs, one tx acks them. |
-| `claim_batch + ack_batch` (128) | ~80,000 /s | Same, larger batch. |
+| `claim + ack` (1 job direct) | ~4,500 /s | Two write transactions per job. |
+| **async iter worker loop** | **~6,500 /s** | Pipelined: one tx acks previous + claims next. p50 ~370ms per job in drain pattern. |
+| `claim_batch + ack_batch` (32) | ~75,000 /s | One tx claims 32, one tx acks them. |
+| `claim_batch + ack_batch` (128) | ~110,000 /s | Same, larger batch. |
 | `publish` (1 event / tx) | ~5,800 /s | Wider per-row cost than queue enqueue. |
 | replay | **~1,000,000 /s** | Reader-pool `SELECT`, no write lock. |
 | live stream e2e | **p50 = 0.23ms**, p99 = 7ms | Publish to consumer wake. |

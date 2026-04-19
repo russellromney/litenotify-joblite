@@ -1,5 +1,46 @@
 # CHANGELOG
 
+## Unreleased — perf pass 4: pipeline ack+claim, narrow RETURNING, PRAGMA tuning
+
+Three targeted changes. Biggest win by far is the ack+claim pipeline.
+
+### Changes
+
+- **Pipelined ack-of-previous with claim-of-next.** The async iterator
+  `queue.claim(...)` now runs both operations in one transaction via
+  a new `Queue.ack_and_claim_batch(ack_ids, worker, n)` method.
+  `Job.ack()` on iterator-owned jobs appends to a pending-ack list;
+  the next batch's claim flushes them in the same tx. Halves the
+  write-tx count for the common `async for job: handle; job.ack()`
+  pattern. Jobs from direct `claim_one()` / `claim_batch()` still go
+  through the old per-tx ack for accurate bool return.
+- **Narrow RETURNING on claim.** `claim_batch` now returns
+  `id, queue, payload, worker_id, attempts, claim_expires_at` instead
+  of `*`. `Job` tolerates a missing row field by defaulting sensibly
+  (state='processing', priority=0, etc). Saves ~20% per claim on
+  the 11-col RETURNING.
+- **PRAGMA tuning.** Added `cache_size=-32000` (32MB page cache, up
+  from 2MB default), `temp_store=MEMORY` (temp B-trees for ORDER BY /
+  DISTINCT stay in RAM), `wal_autocheckpoint=10000` (fsync every
+  10k WAL pages rather than 1k). Cheaper, larger, less frequent
+  disk flush.
+
+### Numbers (median of 3, M-series, release)
+
+| Operation | Before | After |
+|-----------|--------|-------|
+| enqueue (1/tx) | ~6,000 /s | ~8,000 /s |
+| claim + ack (direct) | ~3,700 /s | ~4,500 /s |
+| **async iter end-to-end** | **~3,500 /s** | **~6,500 /s** |
+| claim_batch+ack_batch (32) | ~60k/s | ~75k/s |
+| claim_batch+ack_batch (128) | ~80k/s | ~110k/s |
+| async iter p50 latency | ~720ms | ~370ms |
+
+Test suite unchanged: 12 Rust + 109 Python all pass. `Job.ack()` on
+iterator-owned jobs returns `True` optimistically (safe within the
+millisecond pipeline window); direct callers still get the accurate
+`False` return on claim-expired races.
+
 ## Unreleased — rename: fold `honker` into `litenotify`, `honk()` -> `notify()`
 
 Architectural cleanup. No functional changes; all 12 Rust + 109 Python

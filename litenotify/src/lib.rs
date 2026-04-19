@@ -17,8 +17,33 @@ fn open_conn(path: &str, attach: Option<&Notifier>) -> PyResult<Connection> {
             | OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    // PRAGMA tuning notes:
+    //   journal_mode=WAL        -> concurrent readers with a single writer
+    //   synchronous=NORMAL      -> fsync WAL at checkpoint only (not per
+    //                              commit); safe against app crashes, not
+    //                              OS crashes / power loss
+    //   busy_timeout=5000       -> wait up to 5s for the writer to
+    //                              release the lock before returning
+    //                              SQLITE_BUSY
+    //   foreign_keys=ON         -> enforce FK constraints (off by default
+    //                              in SQLite, a real footgun)
+    //   cache_size=-32000       -> 32MB page cache (default was 2MB).
+    //                              Pending/processing tables stay hot.
+    //   temp_store=MEMORY       -> temporary B-trees for ORDER BY /
+    //                              DISTINCT live in RAM, not the temp dir
+    //   wal_autocheckpoint=10000 -> checkpoint (and fsync) every 10k WAL
+    //                              pages rather than 1k. Reduces fsync
+    //                              frequency 10x. Tradeoff: WAL grows
+    //                              larger between checkpoints; crash
+    //                              recovery has more to replay.
     conn.execute_batch(
-        "PRAGMA journal_mode = WAL;\n         PRAGMA synchronous = NORMAL;\n         PRAGMA busy_timeout = 5000;\n         PRAGMA foreign_keys = ON;",
+        "PRAGMA journal_mode = WAL;\n         \
+         PRAGMA synchronous = NORMAL;\n         \
+         PRAGMA busy_timeout = 5000;\n         \
+         PRAGMA foreign_keys = ON;\n         \
+         PRAGMA cache_size = -32000;\n         \
+         PRAGMA temp_store = MEMORY;\n         \
+         PRAGMA wal_autocheckpoint = 10000;",
     )
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     if let Some(n) = attach {
