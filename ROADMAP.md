@@ -9,7 +9,8 @@
   pub/sub with per-consumer offsets), `joblite.Outbox`.
 - `joblite.Database.prune_notifications(older_than_s, max_keep)` —
   user-invoked; no magic background timer.
-- Framework plugins: `joblite_fastapi`, `joblite_django`, `joblite_flask`.
+- Framework plugins for FastAPI / Django / Flask (since cut — see
+  "Framework plugins (cut for now)" below).
 - SQLite loadable extension (`liblitenotify_ext.dylib`/`.so`) with
   `jl_bootstrap()`, `jl_claim_batch()`, `jl_ack_batch()` SQL
   functions for callers that don't go through the Python API.
@@ -68,8 +69,7 @@ into its own GitHub repo and re-added as a git submodule.
 To do (requires authenticated repo creation on GitHub):
 
 - [ ] For each of `packages/litenotify`, `packages/litenotify-node`,
-  `packages/joblite`, `packages/joblite_fastapi`,
-  `packages/joblite_django`, `packages/joblite_flask`:
+  `packages/joblite`:
   1. Create a new GitHub repo under `russellromney/<package-name>`.
   2. `git subtree split --prefix=packages/<name> -b split-<name>`
      to produce a branch containing only that subtree's history.
@@ -123,7 +123,7 @@ how often the feature actually matters in real workloads.
   **out of scope for v1** — they add real complexity for limited
   real-world use. ~1 day.
 
-### Bindings + framework plugins
+### Bindings
 
 - [ ] **Refactor `litenotify` loadable extension toward a pure
   `sqlite-loadable-rs` build exposing `litenotify_get_fd()`** — a
@@ -134,14 +134,17 @@ how often the feature actually matters in real workloads.
 - [ ] **`joblite-node`**: TypeScript port of `joblite.Queue` /
   `Stream` / `Outbox` built on `@litenotify/node`. Symmetrizes the
   cross-language story.
-- [ ] **`joblite-express`**: Express middleware wrapping
-  `@litenotify/node` + a TypeScript `Queue`. SSE endpoint, worker
-  pool, `authorize` hook.
 - [ ] **Go and Ruby bindings**. Go via cgo over a C ABI that
   `litenotify-core` would export; Ruby via magnus.
-- [ ] **Rails plugin** once the Ruby binding lands. Same shape as
-  FastAPI/Django/Flask: SSE endpoints, `authorize` hook, task
-  decorator.
+
+### Framework plugins (cut for now)
+
+FastAPI / Django / Flask plugins were dropped: the core API is small
+enough that wiring joblite into a web framework is ~20 lines, which
+we can show as a cookbook example in the README rather than ship as
+three maintained packages. If a real user asks for a packaged
+version, bring them back as their own repositories. Likewise for
+Express, Rails, and any future framework.
 
 ## 1.0 release prep (separate milestone)
 
@@ -181,5 +184,5 @@ how often the feature actually matters in real workloads.
 
 - Publish benchmark baselines for reference hardware beyond the
   M-series + release build numbers in bench/README.
-- A small `docs/` site with runnable snippets per binding and
-  framework plugin.
+- A small `docs/` site with runnable snippets per binding plus
+  wire-it-in recipes for FastAPI / Django / Flask / Express / Rails.

@@ -42,20 +42,20 @@ Today:
 - Work queues with retries, priority, delayed jobs, and a dead-letter table
 - Any send can be atomic with your business write (commit together or roll back together)
 - Single-digit millisecond cross-process reaction time, no polling
+- Handler timeouts, declarative retries with exponential backoff
+- Delayed jobs, task expiration, named locks, rate-limiting
+- Durable streams with per-consumer offsets and configurable flush interval
 - SQLite loadable extension so any SQLite client can read the same tables
 - Python and Node.js bindings
-- Plugins for FastAPI, Django, and Flask
 
 Planned:
 
 - Crontab / periodic tasks
-- Handler timeouts
-- Declarative retries with backoff
-- Task expiration
-- Task locking, rate-limiting
 - Task result storage
 - Go and Ruby bindings
-- Plugins for Express and Rails
+- Framework plugins (FastAPI, Django, Flask, Express, Rails) — cut
+  for now; the core API is small enough that wiring joblite into
+  your web framework is ~20 lines. See `examples/` once it lands.
 
 Deliberately out of scope: task pipelines/chains/groups/chords, multi-writer replication, workflow orchestration with DAGs.
 
@@ -149,7 +149,7 @@ The extension shares `_joblite_live`, `_joblite_dead`, and `_litenotify_notifica
 
 ## Design
 
-This repo includes the `litenotify` SQLite loadable extension, `joblite` language bindings for Python, Node, Go, Rust (library), and Ruby, and `joblite` framework plugins for FastAPI, Django, Flask, Rails, Express, and ... .
+This repo includes the `litenotify` SQLite loadable extension and `joblite` language bindings for Python and Node today, with Go/Rust/Ruby planned. Framework-integration plugins (FastAPI/Django/Flask) were cut for now — the core API is small enough that wiring joblite into your web framework is ~20 lines per framework, and we prefer to keep that surface as cookbook examples rather than maintained packages until a real user needs something different.
 
 For most applications, [SQLite alone is sufficient](https://www.epicweb.dev/why-you-should-probably-be-using-sqlite). There are already great libraries that leverage SQLite for durable messaging. [Huey](https://github.com/coleifer/huey) is one; [`diskcache`](https://github.com/grantjenks/python-diskcache) is another. This project is inspired by them and seeks to do something similar across languages and frameworks by moving package logic into a SQLite extension.
 
@@ -233,19 +233,33 @@ The caller chooses retention per primitive. `db.prune_notifications(older_than_s
 - **Worker crash mid-job**: the claim expires after `visibility_timeout_s` (default 300 s). Another worker reclaims; `attempts` increments. After `max_attempts` (default 3), the row moves to `_joblite_dead`.
 - **Listener offline during prune**: pruned events are lost. For durable replay, use `db.stream()`, which tracks per-consumer offsets.
 
-## Framework plugins
+## Wiring into your web framework
 
-| | Workers | User |
-|---|---|---|
-| `joblite_fastapi.JobliteApp` | in-process (FastAPI lifespan) | `user_dependency=Depends(…)` |
-| `joblite_django` | CLI: `manage.py joblite_worker` | `request.user` / `set_user_factory(fn)` |
-| `joblite_flask.JobliteFlask` | CLI: `flask joblite_worker` | `user_factory=fn(req)` |
+No framework plugins today. The core API is small enough that a
+minimal FastAPI / Django / Flask integration is ~20 lines:
 
-Each exposes `GET /joblite/subscribe/<channel>` + `GET /joblite/stream/<name>` (SSE), a `@task(...)` decorator, and an `authorize(user, target)` hook (sync or async). If `authorize` raises, the handler returns HTTP 500 without opening the SSE stream.
+```python
+# FastAPI: enqueue in a request, run workers via lifespan.
+@app.on_event("startup")
+async def _start_workers():
+    async def worker_loop():
+        async for job in db.queue("emails").claim("worker"):
+            await joblite._worker.run_task(
+                job, send_email, timeout=30, retries=3, backoff=2.0
+            )
+    app.state._worker = asyncio.create_task(worker_loop())
 
-FastAPI runs workers in-process because it has a single-process async runtime and lifespan hooks. Django and Flask are WSGI-first — Gunicorn forks the app across N workers, so a worker pool in each fork would over-subscribe the database. Workers run out-of-process via the CLI instead.
+@app.post("/orders")
+async def create_order(order: dict):
+    with db.transaction() as tx:
+        tx.execute("INSERT INTO orders (user_id) VALUES (?)", [order["user_id"]])
+        db.queue("emails").enqueue({"to": order["email"]}, tx=tx)
+    return {"ok": True}
+```
 
-Usage: each plugin's directory.
+SSE endpoints are ~30 lines of `async def stream(...): yield f"data: ...\n\n"` over `db.listen(channel)` or `db.stream(name).subscribe(...)`. Django/Flask workers live in a dedicated CLI process (same pattern as Celery/RQ) because those frameworks fork per-request and you don't want a worker pool in each fork.
+
+If demand for a packaged version grows we'll bring plugins back as their own repos. Until then: copy the 20 lines into your app.
 
 ## Performance
 
@@ -262,9 +276,6 @@ packages/
   litenotify/                 # PyO3 Python binding
   litenotify-node/            # napi-rs Node.js binding
   joblite/                    # Python higher-level Queue/Stream/Outbox
-  joblite_fastapi/            # FastAPI plugin
-  joblite_django/             # Django plugin
-  joblite_flask/              # Flask plugin
 tests/                        # integration tests (cross-package)
 bench/                        # benches
 ```

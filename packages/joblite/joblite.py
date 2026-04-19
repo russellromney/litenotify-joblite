@@ -527,13 +527,6 @@ class Queue:
         return len(rows) > 0
 
 
-def build_worker_id(framework: str, instance_id: str, queue: str, index: int) -> str:
-    """Framework-agnostic worker id format. Previously duplicated
-    verbatim across the FastAPI/Django/Flask plugins.
-    """
-    return f"{framework}-{instance_id}-{queue}-{index}"
-
-
 class Retryable(Exception):
     """Raise from a task handler to request a scheduled retry with a specific
     delay. Any other exception is also retried, but with a generic backoff.

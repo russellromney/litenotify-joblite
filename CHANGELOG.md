@@ -1,5 +1,31 @@
 # CHANGELOG
 
+## Unreleased — cut framework plugins
+
+Dropped `packages/joblite_fastapi`, `packages/joblite_django`, and
+`packages/joblite_flask` (and their three test files) from the repo.
+
+Each was ~300 lines of framework-idiomatic glue wrapping the core
+joblite primitives. Useful enough, but every new feature (Batch 1
+timeout/retries/delay, Batch 2 expires/lock/rate-limit, upcoming
+crontab/results) meant three parallel plugin diffs and three test
+sets. For a pre-1.0 library with no real users asking for them, the
+maintenance cost outweighed the benefit.
+
+What users can still do:
+  - Enqueue in any web handler:
+      `with db.transaction() as tx: queue.enqueue(..., tx=tx)`
+  - Drive a worker loop with the exposed helper:
+      `async for job in queue.claim(worker): await joblite._worker.run_task(job, handler, timeout=..., retries=..., ...)`
+  - Write their own SSE view in ~30 lines of
+      `yield f"data: {json.dumps(payload)}\n\n".encode()` over
+      `db.listen(channel)` or `db.stream(name).subscribe(...)`.
+
+If demand for a packaged version arrives, the plugins will be
+re-created as their own GitHub repos (not inline in this monorepo).
+
+Also removed `joblite.build_worker_id` — only the plugins used it.
+
 ## Unreleased — API simplifications: `claim()` + `subscribe()`
 
 Two sharp edges filed down based on user review.

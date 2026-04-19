@@ -9,7 +9,6 @@ from joblite.joblite import (
     Queue,
     Retryable,
     Stream,
-    build_worker_id,
     open,
 )
 
@@ -24,6 +23,5 @@ __all__ = [
     "Queue",
     "Retryable",
     "Stream",
-    "build_worker_id",
     "open",
 ]
