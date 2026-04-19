@@ -29,7 +29,8 @@ async def _run_authorize(authorize, user, target: str) -> bool:
 async def subscribe_sse(request, channel: str):
     """Async SSE view bridging db.listen(channel) over a raw NOTIFY channel."""
     authorize = joblite_django.get_authorize()
-    if not await _run_authorize(authorize, request.user, channel):
+    user = joblite_django.get_user_factory()(request)
+    if not await _run_authorize(authorize, user, channel):
         return HttpResponseForbidden("forbidden")
 
     db = joblite_django.db()
@@ -58,7 +59,8 @@ async def subscribe_sse(request, channel: str):
 async def stream_sse(request, name: str):
     """Async SSE view for a durable stream with Last-Event-ID replay."""
     authorize = joblite_django.get_authorize()
-    if not await _run_authorize(authorize, request.user, name):
+    user = joblite_django.get_user_factory()(request)
+    if not await _run_authorize(authorize, user, name):
         return HttpResponseForbidden("forbidden")
 
     try:

@@ -1,9 +1,10 @@
 """Resource bounds: make sure bridge threads and memory don't balloon.
 
-These guard the refactor that put per-listener Drop cleanup in honker. If
-those handlers ever regress, thread count will grow linearly with the
-number of listeners we've ever created. These tests fail loudly when that
-happens.
+Guard against subscriber leaks in the shared WAL watcher: every
+`db.wal_events()` unsubscribes via `Drop` on the underlying binding,
+and the bridge thread exits when its channel disconnects. If those
+teardown paths regress, thread count grows linearly with the number
+of listeners ever created. These tests fail loudly when that happens.
 """
 
 import asyncio
@@ -95,10 +96,12 @@ async def test_many_simultaneous_listeners_bounded_thread_count(db_path):
 
     with_100 = _active_thread_count()
     assert with_100 >= baseline, "no threads spawned?"
-    # Bridge threads plus one-per-listener-worker accounts for ~100 threads.
-    # Allow slack; reject >300 (which would indicate each listener spawned
-    # multiple threads).
-    assert with_100 <= baseline + 300, (
+    # With the shared WAL watcher (one stat-poll thread per Database),
+    # 100 listeners = 1 stat thread + N bridge threads (one per
+    # listener that drove __anext__). Allow slack for pytest-xdist
+    # workers and asyncio internals; reject anything suggesting
+    # per-listener stat threads are back.
+    assert with_100 <= baseline + 150, (
         f"too many threads for 100 listeners: {with_100} vs baseline {baseline}"
     )
 

@@ -11,6 +11,9 @@ export declare class Database {
   /**
    * Filesystem watcher on the .db-wal file. `await ev.next()` resolves
    * on every commit to the database (any process, any writer).
+   *
+   * N subscribers share a single background poll thread via the
+   * core SharedWalWatcher.
    */
   walEvents(): WalEvents
   /**
@@ -24,11 +27,13 @@ export declare class Transaction {
   execute(sql: string, params?: Array<JsonValue> | undefined | null): number
   query(sql: string, params?: Array<JsonValue> | undefined | null): Array<Record<string, any>>
   /**
-   * Publish a cross-process notification. `payload` should be a
-   * JSON string (caller JSON-encodes); this keeps the wire shape
-   * explicit and matches the Python side.
+   * Publish a cross-process notification. `payload` is any
+   * JSON-serializable value; it's `JSON.stringify`'d on the way in
+   * and `JSON.parse`'d by consumers on the way out. Matches the
+   * Python binding's unconditional `json.dumps` contract so payloads
+   * round-trip identically across bindings.
    */
-  notify(channel: string, payload: string): number
+  notify(channel: string, payload: JsonValue): number
   commit(): void
   rollback(): void
 }
@@ -36,7 +41,7 @@ export declare class Transaction {
 export declare class WalEvents {
   /** Await the next WAL change. Resolves on every DB commit. */
   next(): Promise<void>
-  /** Stop the background stat-poll thread. */
+  /** Stop this subscription eagerly. Idempotent. */
   close(): void
 }
 

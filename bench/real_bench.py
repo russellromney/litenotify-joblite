@@ -330,8 +330,8 @@ def main():
         type=float,
         default=0.1,
         help="Worker poll interval when the queue is empty. Default 0.1s "
-        "(10 checks/sec). Lower = tighter latency under cross-process workloads "
-        "(which is ALL multi-process deployments — NOTIFY doesn't cross processes)."
+        "(10 checks/sec). Paranoia fallback only — the WAL watcher wakes "
+        "workers on every commit from any process, so idle-poll rarely fires."
     )
     ap.add_argument("--queue", default="bench")
     ap.add_argument(

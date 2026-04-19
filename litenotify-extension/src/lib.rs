@@ -117,32 +117,17 @@ fn install_functions(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 fn bootstrap_schema(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS _joblite_live (
-           id INTEGER PRIMARY KEY AUTOINCREMENT,
-           queue TEXT NOT NULL,
-           payload TEXT NOT NULL,
-           state TEXT NOT NULL DEFAULT 'pending',
-           priority INTEGER NOT NULL DEFAULT 0,
-           run_at INTEGER NOT NULL DEFAULT (unixepoch()),
-           worker_id TEXT,
-           claim_expires_at INTEGER,
-           attempts INTEGER NOT NULL DEFAULT 0,
-           max_attempts INTEGER NOT NULL DEFAULT 3,
-           created_at INTEGER NOT NULL DEFAULT (unixepoch())
-         );
-         CREATE INDEX IF NOT EXISTS _joblite_live_claim
-           ON _joblite_live(queue, priority DESC, run_at, id)
-           WHERE state IN ('pending', 'processing');
-         CREATE TABLE IF NOT EXISTS _joblite_dead (
-           id INTEGER PRIMARY KEY,
-           queue TEXT NOT NULL,
-           payload TEXT NOT NULL,
-           attempts INTEGER NOT NULL,
-           last_error TEXT,
-           died_at INTEGER NOT NULL DEFAULT (unixepoch())
-         );",
-    )
+    // Delegate to the shared core so the extension and the Python
+    // binding can't drift on column counts. Pre-core, the extension
+    // had a 6-column `_joblite_dead` and Python had a 10-column one —
+    // silent divergence until a `.fail()` from Python tripped on the
+    // missing `priority` column.
+    litenotify_core::bootstrap_joblite_schema(conn).map_err(|e| {
+        rusqlite::Error::UserFunctionError(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            e.to_string(),
+        )))
+    })
 }
 
 /// Returns JSON text: `[{"id":1,"queue":"...","payload":"...","worker_id":"...","attempts":N,"claim_expires_at":T}, ...]`
@@ -213,10 +198,13 @@ fn claim_batch(
 }
 
 fn ack_batch(conn: &Connection, ids_json: &str, worker_id: &str) -> rusqlite::Result<i64> {
-    // One statement. SQLite parses the JSON array via json_each.
+    // Ack = DELETE. No `state='done'` row ever exists — matches the
+    // Python `Queue.ack` path. Industry default (Sidekiq, Dramatiq,
+    // graphile-worker, pgmq): delete on ack, keep audit separate.
+    // Previous UPDATE-SET-state='done' left rows in _joblite_live
+    // forever, unbounded growth + inspection-view divergence vs Python.
     let mut stmt = conn.prepare_cached(
-        "UPDATE _joblite_live
-         SET state = 'done'
+        "DELETE FROM _joblite_live
          WHERE id IN (SELECT value FROM json_each(?1))
            AND worker_id = ?2
            AND claim_expires_at >= unixepoch()

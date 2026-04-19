@@ -13,13 +13,13 @@ and verifies:
     still flows.
 
 Notes:
-  * litenotify's commit-hook runs in-process — each process has its own
-    Notifier, so cross-process NOTIFY is not a feature of the library.
-    That means the "pre-subscribed listener" for the honk case is placed
-    in the test process (which is what a second-process listener would
-    see anyway: nothing from a different process). The real invariant
-    under test is: an SIGKILLed honk-bearing tx leaves no stale state —
-    not in the DB file, not in any in-process buffer we can reopen.
+  * Notify delivery is cross-process via a shared `.db-wal`-watching
+    poll thread and the `_litenotify_notifications` table. Subscribers
+    start from `MAX(id)` at attach time, so a listener opened AFTER
+    the SIGKILL-rolled-back tx correctly sees nothing from the killed
+    transaction — the rolled-back INSERT never left WAL. A fresh
+    notify after kill flows normally. The invariant under test is:
+    an SIGKILLed notify-bearing tx leaves no stale state anywhere.
   * Each test uses its own tmp_path DB, so everything parallelizes under
     pytest -n auto.
 """

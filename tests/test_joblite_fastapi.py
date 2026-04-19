@@ -249,7 +249,7 @@ async def test_sse_delivers_honk_as_event(uvicorn_server):
                 ) as ac2:
                     await ac2.post(
                         "/honk",
-                        json={"channel": channel, "payload": '{"id": 42}'},
+                        json={"channel": channel, "payload": {"id": 42}},
                     )
 
             fire_task = asyncio.create_task(fire())

@@ -23,7 +23,7 @@ Minimal surface:
     python manage.py joblite_worker
 """
 
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import joblite
 
@@ -32,6 +32,24 @@ default_app_config = "joblite_django.apps.JobliteConfig"
 _db: Optional[joblite.Database] = None
 _tasks: Dict[str, dict] = {}
 _authorize: Optional[Callable] = None
+_user_factory: Optional[Callable] = None
+
+
+def _default_user_factory(request) -> Any:
+    """Default: pull `request.user` if the auth middleware has set it.
+    Raises a clear error when it hasn't, with a pointer at the usual
+    Django setup — previously the view crashed with a confusing
+    AttributeError on `request.user` when the middleware was missing.
+    """
+    try:
+        return request.user
+    except AttributeError:
+        raise RuntimeError(
+            "joblite_django: request.user is not available. Install "
+            "`django.contrib.auth.middleware.AuthenticationMiddleware` "
+            "in MIDDLEWARE, or call `set_user_factory(...)` with a "
+            "callable that derives the user from the request."
+        )
 
 
 def db() -> joblite.Database:
@@ -51,8 +69,10 @@ def db() -> joblite.Database:
 
 def reset_for_tests() -> None:
     """Test hook: drop the memoized db so a new one is opened next call."""
-    global _db
+    global _db, _user_factory, _authorize
     _db = None
+    _user_factory = None
+    _authorize = None
     _tasks.clear()
 
 
@@ -96,11 +116,30 @@ def get_authorize() -> Optional[Callable]:
     return _authorize
 
 
+def set_user_factory(fn: Optional[Callable]) -> None:
+    """Install a `user_factory(request) -> user` callable that the
+    SSE views pass to `authorize(...)`. If unset, we fall back to
+    `request.user` (which requires Django's auth middleware).
+    """
+    global _user_factory
+    _user_factory = fn
+
+
+def get_user_factory() -> Callable:
+    """Return the installed factory, or the default
+    `request.user`-reading one. Callers should invoke it to resolve
+    the user for the current request.
+    """
+    return _user_factory or _default_user_factory
+
+
 __all__ = [
     "db",
     "task",
     "registered_tasks",
     "set_authorize",
     "get_authorize",
+    "set_user_factory",
+    "get_user_factory",
     "reset_for_tests",
 ]

@@ -69,7 +69,9 @@ class JobliteApp:
     async def _start_workers(self):
         for queue_name, info in self.tasks.items():
             for i in range(info["concurrency"]):
-                worker_id = f"fastapi-{self._instance_id}-{queue_name}-{i}"
+                worker_id = joblite.build_worker_id(
+                    "fastapi", self._instance_id, queue_name, i
+                )
                 t = asyncio.create_task(
                     self._worker_loop(info["queue"], info["func"], worker_id)
                 )

@@ -8,7 +8,7 @@
 //! WAL-file watcher thread — lives in [`litenotify_core`] and is
 //! shared with the other bindings (cdylib extension, napi-rs Node).
 
-use litenotify_core::{Readers, WalWatcher, Writer, open_conn};
+use litenotify_core::{Readers, SharedWalWatcher, Writer, open_conn};
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
@@ -121,12 +121,11 @@ fn run_cached_noparams(conn: &Connection, sql: &str) -> rusqlite::Result<()> {
 }
 
 fn serialize_payload(py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<String> {
-    if payload.is_none() {
-        return Ok("null".to_string());
-    }
-    if let Ok(s) = payload.extract::<String>() {
-        return Ok(s);
-    }
+    // Unconditional json.dumps — matches Queue.enqueue and Stream.publish.
+    // Previously strings stored raw and everything else json-encoded,
+    // which round-tripped inconsistently: tx.notify("ch", "42") → int 42,
+    // tx.notify("ch", "null") → None, tx.notify("ch", '"x"') → "x". Pre-1.0
+    // normalization so all three primitives share one wire format.
     let json = py.import("json")?;
     let dumps = json.getattr("dumps")?;
     let result = dumps.call1((payload,))?;
@@ -142,6 +141,12 @@ struct Database {
     writer: Arc<Writer>,
     readers: Arc<Readers>,
     path: String,
+    wal_path: std::path::PathBuf,
+    /// Lazy-initialized shared WAL watcher. One stat-poll thread per
+    /// Database regardless of how many listeners subscribe. Previously
+    /// every `wal_events()` spawned its own thread — 100 listeners
+    /// meant 100 stat threads hammering the same file.
+    shared_watcher: Mutex<Option<Arc<SharedWalWatcher>>>,
 }
 
 #[pymethods]
@@ -152,10 +157,13 @@ impl Database {
         // Writer conn registers the notify() SQL function + ensures
         // _litenotify_notifications exists. Readers just SELECT.
         let writer_conn = open_conn(&path, true).map_err(core_err)?;
+        let wal_path: std::path::PathBuf = format!("{}-wal", path).into();
         Ok(Self {
             writer: Arc::new(Writer::new(writer_conn)),
             readers: Arc::new(Readers::new(path.clone(), max_readers)),
             path,
+            wal_path,
+            shared_watcher: Mutex::new(None),
         })
     }
 
@@ -169,22 +177,27 @@ impl Database {
     /// Watcher on this database's `.db-wal` file. Returns an async
     /// iterator that yields `None` every time the WAL changes — i.e.
     /// every time any process committed a transaction to this file.
+    ///
+    /// N calls share a single background poll thread via the core
+    /// [`SharedWalWatcher`]. Each subscriber gets its own bounded
+    /// channel so a slow consumer can't block other listeners.
     fn wal_events(&self) -> PyResult<WalEvents> {
-        let wal_path: std::path::PathBuf = format!("{}-wal", self.path).into();
-        let (tx, rx) = tokio::sync::mpsc::channel::<()>(1024);
-        // Core spawns the stat-poll thread; we give it a callback that
-        // pushes onto our tokio channel. Dropping the returned
-        // WalWatcher stops the thread.
-        let watcher = WalWatcher::spawn(wal_path.clone(), move || {
-            // Best-effort: if the channel is full the caller hasn't
-            // caught up yet — drop; the next poll will still see the
-            // committed rows.
-            let _ = tx.try_send(());
-        });
+        let shared = {
+            let mut guard = self.shared_watcher.lock();
+            if let Some(existing) = guard.as_ref() {
+                existing.clone()
+            } else {
+                let w = Arc::new(SharedWalWatcher::new(self.wal_path.clone()));
+                *guard = Some(w.clone());
+                w
+            }
+        };
+        let (sub_id, rx) = shared.subscribe();
         Ok(WalEvents {
-            wal_path,
+            wal_path: self.wal_path.clone(),
+            shared,
+            sub_id,
             inner: Arc::new(Mutex::new(WalWatchState {
-                _watcher: Some(watcher),
                 rx: Some(rx),
                 queue: None,
             })),
@@ -338,35 +351,46 @@ impl Transaction {
         py: Python<'_>,
         channel: String,
         payload: Bound<'_, PyAny>,
-    ) -> PyResult<()> {
+    ) -> PyResult<i64> {
         let state = self.inner.lock();
         let conn = state
             .conn
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Transaction not started"))?;
         let payload_str = serialize_payload(py, &payload)?;
-        conn.query_row(
-            "SELECT notify(?1, ?2)",
-            rusqlite::params![channel, payload_str],
-            |_| Ok(()),
-        )
-        .map_err(core_err)?;
-        Ok(())
+        let id: i64 = conn
+            .query_row(
+                "SELECT notify(?1, ?2)",
+                rusqlite::params![channel, payload_str],
+                |r| r.get(0),
+            )
+            .map_err(core_err)?;
+        Ok(id)
+    }
+
+    /// Install the canonical joblite queue schema. Idempotent; the
+    /// DDL lives in `litenotify-core` so the Python binding and the
+    /// SQLite extension can't drift on column counts.
+    fn bootstrap_joblite_schema(&self) -> PyResult<()> {
+        let state = self.inner.lock();
+        let conn = state
+            .conn
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Transaction not started"))?;
+        litenotify_core::bootstrap_joblite_schema(conn).map_err(core_err)
     }
 }
 
 // ---------------------------------------------------------------------
-// WalEvents (async iterator over the core WAL watcher)
+// WalEvents (async iterator over a SharedWalWatcher subscription)
 // ---------------------------------------------------------------------
 
 struct WalWatchState {
-    /// Hold the core WalWatcher alive for the lifetime of the Python
-    /// WalEvents object. Dropping it stops the background stat-poll
-    /// thread.
-    _watcher: Option<WalWatcher>,
-    /// Tokio channel driven by the core watcher's callback. Drained
-    /// by the bridge thread below into a Python asyncio Queue.
-    rx: Option<tokio::sync::mpsc::Receiver<()>>,
+    /// Per-subscriber receiver from the shared watcher. Moved into
+    /// the bridge thread on first `__aiter__`; on subsequent
+    /// `__aiter__` calls the queue has been created and we return
+    /// it directly.
+    rx: Option<std::sync::mpsc::Receiver<()>>,
     /// Python asyncio Queue, populated lazily on first __aiter__.
     queue: Option<Py<PyAny>>,
 }
@@ -374,7 +398,22 @@ struct WalWatchState {
 #[pyclass]
 struct WalEvents {
     wal_path: std::path::PathBuf,
+    /// Keep the shared watcher alive as long as this subscription
+    /// exists. `Drop` calls `shared.unsubscribe(sub_id)` so the bridge
+    /// thread's `rx.recv()` sees a disconnect and exits.
+    shared: Arc<SharedWalWatcher>,
+    sub_id: u64,
     inner: Arc<Mutex<WalWatchState>>,
+}
+
+impl Drop for WalEvents {
+    fn drop(&mut self) {
+        // Remove our sender from the shared watcher so the bridge
+        // thread's rx.recv() returns Err and the thread exits. Without
+        // this, the bridge thread + its Python-object references would
+        // leak until the last Arc<SharedWalWatcher> is dropped.
+        self.shared.unsubscribe(self.sub_id);
+    }
 }
 
 impl WalEvents {
@@ -391,12 +430,17 @@ impl WalEvents {
         let queue_py_for_thread = queue_py.clone_ref(py);
         let loop_py: Py<PyAny> = loop_obj.unbind();
 
-        let mut rx = state.rx.take().expect("wal rx already taken");
+        let rx = state.rx.take().expect("wal rx already taken");
 
         std::thread::Builder::new()
             .name("litenotify-wal-bridge".into())
             .spawn(move || {
-                while rx.blocking_recv().is_some() {
+                // Blocks on the subscriber channel. Exits when the
+                // shared watcher's sender list prunes this subscriber
+                // (happens when the Arc<SharedWalWatcher> inside
+                // WalEvents is dropped, severing our end of the
+                // channel — recv() then returns Err).
+                while rx.recv().is_ok() {
                     Python::attach(|py| {
                         let put = match queue_py_for_thread.getattr(py, "put_nowait") {
                             Ok(v) => v,

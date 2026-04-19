@@ -135,6 +135,103 @@ def test_authorize_async_and_raising(app_db):
         assert r.status_code == 500
 
 
+def test_sse_generator_close_tears_down_bridge(app_db):
+    """WSGI's only disconnect signal is `GeneratorExit` raised when the
+    server calls `.close()` on the response iterator. The plugin's
+    `_async_to_sync_gen` must catch that, signal the bridge thread to
+    stop, and join it — otherwise a dropped SSE client leaks a thread
+    per disconnect.
+
+    Test strategy: drive `_async_to_sync_gen` directly as a unit. Real
+    HTTP plumbing (Werkzeug test client, asyncio loops, real sockets)
+    would obscure whether teardown happened on the generator's
+    `close()` — we want to pin that exact behavior.
+    """
+    import time
+    from joblite_flask import _async_to_sync_gen, JobliteFlask
+    import weakref
+
+    active: weakref.WeakSet = weakref.WeakSet()
+
+    import asyncio
+    drive_started = threading.Event()
+
+    def make_agen():
+        async def gen():
+            drive_started.set()
+            try:
+                # Yield forever (keepalive every 50 ms).
+                while True:
+                    await asyncio.sleep(0.05)
+                    yield b": keepalive\n\n"
+            except asyncio.CancelledError:
+                return
+
+        return gen()
+
+    outer = _async_to_sync_gen(make_agen, active)
+    # Drive the outer generator to the point the bridge is created.
+    it = iter(outer)
+    chunk = next(it)
+    assert chunk.startswith(b":") or chunk.startswith(b"data:")
+    assert drive_started.is_set()
+    assert len(active) == 1
+
+    # Simulate WSGI's disconnect: close the outer generator. The
+    # finally block must tear down the bridge thread.
+    outer.close()
+
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        if len(active) == 0:
+            break
+        time.sleep(0.02)
+    assert len(active) == 0, "bridge not torn down after generator close()"
+
+
+# threading import needs to be at module top for the test above.
+import threading  # noqa: E402
+
+
+def test_sse_many_disconnects_do_not_leak(app_db):
+    """100 connect+disconnect cycles must not grow the active-stream
+    set past baseline. Every dropped client was leaving two zombie
+    threads (bridge + inner listener) before the disconnect fix.
+    """
+    import asyncio
+    import time
+    import weakref
+
+    from joblite_flask import _async_to_sync_gen
+
+    active: weakref.WeakSet = weakref.WeakSet()
+
+    def make_agen_factory():
+        async def gen():
+            try:
+                while True:
+                    await asyncio.sleep(0.01)
+                    yield b": keepalive\n\n"
+            except asyncio.CancelledError:
+                return
+        return gen
+
+    for _ in range(100):
+        outer = _async_to_sync_gen(make_agen_factory(), active)
+        it = iter(outer)
+        next(it)
+        outer.close()
+
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        if len(active) == 0:
+            break
+        time.sleep(0.05)
+    assert len(active) == 0, (
+        f"leaked {len(active)} bridges after 100 disconnect cycles"
+    )
+
+
 def test_cli_worker_drains_jobs(app_db):
     """Invoke the `flask joblite_worker` CLI command in-process and
     verify it processes a seeded job before being cancelled."""

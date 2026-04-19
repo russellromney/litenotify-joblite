@@ -147,6 +147,73 @@ def test_set_and_get_authorize(django_db_path):
     assert joblite_django.get_authorize() is None
 
 
+async def test_user_factory_override(django_db_path):
+    """`set_user_factory(fn)` replaces the default `request.user`
+    reader. Lets apps without auth middleware plug in a custom user
+    derivation (e.g. parse a header, look up a session cookie).
+    """
+    from django.test import RequestFactory
+    import joblite_django
+    from joblite_django.views import subscribe_sse
+
+    called_with = []
+
+    def my_factory(request):
+        called_with.append(request)
+        return "user-from-header"
+
+    def my_authorize(user, channel):
+        assert user == "user-from-header"
+        return True
+
+    joblite_django.set_user_factory(my_factory)
+    joblite_django.set_authorize(my_authorize)
+    try:
+        req = RequestFactory().get("/joblite/subscribe/ok")
+        # Don't set req.user — the factory should bypass it.
+        resp = await subscribe_sse(req, "ok")
+        assert resp.status_code == 200
+        assert len(called_with) == 1
+    finally:
+        joblite_django.set_user_factory(None)
+        joblite_django.set_authorize(None)
+
+
+async def test_default_user_factory_errors_without_middleware(django_db_path):
+    """Without auth middleware, `request.user` doesn't exist. The
+    default factory must raise a clear RuntimeError pointing at the
+    fix, not a cryptic AttributeError from deep inside the view.
+    """
+    from django.test import RequestFactory
+    import joblite_django
+    from joblite_django.views import subscribe_sse
+
+    class _NoUserRequest:
+        """RequestFactory adds .user automatically via middleware chain;
+        build a bare request-ish object that doesn't have `.user` to
+        mimic a misconfigured deployment."""
+        def __init__(self, real):
+            self._real = real
+            # Only copy attrs the view touches. .user is intentionally
+            # absent.
+            for attr in ("headers", "META", "GET", "POST", "method"):
+                if hasattr(real, attr):
+                    setattr(self, attr, getattr(real, attr))
+
+    joblite_django.set_user_factory(None)  # ensure default
+    try:
+        real = RequestFactory().get("/joblite/subscribe/ok")
+        stub = _NoUserRequest(real)
+        try:
+            await subscribe_sse(stub, "ok")
+        except RuntimeError as e:
+            assert "AuthenticationMiddleware" in str(e)
+        else:
+            raise AssertionError("default factory should have raised")
+    finally:
+        joblite_django.set_user_factory(None)
+
+
 async def test_stream_sse_view_returns_streaming_response(django_db_path):
     """View-level unit test: call the async view directly, read a few bytes."""
     from django.http import StreamingHttpResponse

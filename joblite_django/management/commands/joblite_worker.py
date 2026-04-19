@@ -7,6 +7,7 @@ import uuid
 
 from django.core.management.base import BaseCommand
 
+import joblite
 import joblite_django
 from joblite import Retryable
 
@@ -46,7 +47,9 @@ class Command(BaseCommand):
                 max_attempts=info["max_attempts"],
             )
             for i in range(info["concurrency"]):
-                worker_id = f"django-{instance_id}-{q_name}-{i}"
+                worker_id = joblite.build_worker_id(
+                    "django", instance_id, q_name, i
+                )
                 workers.append(
                     asyncio.create_task(
                         _worker_loop(queue, info["func"], worker_id)

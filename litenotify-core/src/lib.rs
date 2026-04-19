@@ -35,9 +35,11 @@
 use parking_lot::{Condvar, Mutex};
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OpenFlags};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::Duration;
 
 #[derive(thiserror::Error, Debug)]
@@ -130,6 +132,64 @@ pub fn attach_notify(conn: &Connection) -> Result<(), Error> {
         },
     )?;
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// joblite queue schema
+// ---------------------------------------------------------------------
+
+/// Canonical DDL for the joblite queue schema. Shared source of truth
+/// so the Python binding's `Queue._init_schema`, the SQLite loadable
+/// extension's `jl_bootstrap()`, and any future binding can't drift.
+///
+/// Schema:
+///
+///   * `_joblite_live`  — pending + processing jobs. Partial index
+///     `_joblite_live_claim` restricts to those two states so dead-row
+///     history never slows down the claim hot path.
+///   * `_joblite_dead`  — terminal rows (retry-exhausted or explicitly
+///     failed). Never scanned by the claim path; retention policy is
+///     the user's problem.
+///
+/// Idempotent (`CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT
+/// EXISTS`). Views and schema-version cleanup live in the language
+/// binding, not here — they're caller-specific.
+pub const BOOTSTRAP_JOBLITE_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS _joblite_live (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      queue TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'pending',
+      priority INTEGER NOT NULL DEFAULT 0,
+      run_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      worker_id TEXT,
+      claim_expires_at INTEGER,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 3,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+    CREATE INDEX IF NOT EXISTS _joblite_live_claim
+      ON _joblite_live(queue, priority DESC, run_at, id)
+      WHERE state IN ('pending', 'processing');
+    CREATE TABLE IF NOT EXISTS _joblite_dead (
+      id INTEGER PRIMARY KEY,
+      queue TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      priority INTEGER NOT NULL DEFAULT 0,
+      run_at INTEGER NOT NULL DEFAULT 0,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      max_attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      died_at INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+";
+
+/// Install the joblite queue schema on `conn`. Idempotent. See
+/// [`BOOTSTRAP_JOBLITE_SQL`] for the DDL and rationale.
+pub fn bootstrap_joblite_schema(conn: &Connection) -> Result<(), Error> {
+    conn.execute_batch(BOOTSTRAP_JOBLITE_SQL)?;
     Ok(())
 }
 
@@ -336,6 +396,83 @@ impl Drop for WalWatcher {
 }
 
 // ---------------------------------------------------------------------
+// Shared WAL watcher (one thread per Database, N subscribers)
+// ---------------------------------------------------------------------
+
+/// Shared WAL-file watcher: one stat-poll thread per `.db-wal` path,
+/// N subscribers. Each [`subscribe`](Self::subscribe) returns a fresh
+/// `Receiver<()>` that sees a tick on every observed change.
+///
+/// Previously every call to `db.wal_events()` spawned its own
+/// stat-poll thread, so N listeners in one process meant N threads
+/// hammering `stat(2)` on the same file at 1 ms cadence. A web process
+/// with 100 active SSE subscribers was doing ~200k stat syscalls/sec
+/// against one file. Now a single shared thread services all
+/// subscribers — 1 ms cadence, same kernel cost regardless of N.
+///
+/// Subscriber channels are bounded; on overflow, additional ticks for
+/// that subscriber are dropped. Wakes are idempotent signals — the
+/// consumer re-reads state from SQLite on each wake — so dropping
+/// during backpressure is safe. A disconnected subscriber (receiver
+/// dropped) gets pruned on the next wake via `TrySendError::Disconnected`.
+pub struct SharedWalWatcher {
+    /// Hold the underlying poll thread alive. Dropping this stops it.
+    _watcher: WalWatcher,
+    /// Shared with the watcher closure so it can fan out to every
+    /// subscriber and prune disconnected ones opportunistically.
+    senders: Arc<Mutex<HashMap<u64, SyncSender<()>>>>,
+    next_id: AtomicU64,
+}
+
+impl SharedWalWatcher {
+    /// Spawn the shared poll thread for `wal_path`.
+    pub fn new(wal_path: PathBuf) -> Self {
+        let senders: Arc<Mutex<HashMap<u64, SyncSender<()>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let senders_t = senders.clone();
+        let watcher = WalWatcher::spawn(wal_path, move || {
+            let mut list = senders_t.lock();
+            list.retain(|_id, s| match s.try_send(()) {
+                Ok(()) | Err(TrySendError::Full(_)) => true,
+                Err(TrySendError::Disconnected(_)) => false,
+            });
+        });
+        Self {
+            _watcher: watcher,
+            senders,
+            next_id: AtomicU64::new(0),
+        }
+    }
+
+    /// Subscribe. Returns a subscriber id and a [`Receiver<()>`] that
+    /// sees one tick per observed `.db-wal` change. Callers MUST
+    /// [`unsubscribe`](Self::unsubscribe) the returned id when done —
+    /// otherwise the sender stays in the map and a bridge thread
+    /// blocking on `recv()` will never see a disconnect.
+    ///
+    /// Channel buffer is 1024; backpressure drops additional ticks
+    /// for the slow subscriber without blocking the watcher.
+    pub fn subscribe(&self) -> (u64, std::sync::mpsc::Receiver<()>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1024);
+        self.senders.lock().insert(id, tx);
+        (id, rx)
+    }
+
+    /// Remove a subscriber. The corresponding receiver sees
+    /// `Err(RecvError)` on its next blocking `recv()`, letting a
+    /// bridge thread exit cleanly.
+    pub fn unsubscribe(&self, id: u64) {
+        self.senders.lock().remove(&id);
+    }
+
+    /// Current subscriber count. Test/introspection helper.
+    pub fn subscriber_count(&self) -> usize {
+        self.senders.lock().len()
+    }
+}
+
+// ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
 
@@ -400,5 +537,124 @@ mod tests {
         let (size, mt) = stat_pair(std::path::Path::new("/nonexistent/path/nope"));
         assert_eq!(size, 0);
         assert_eq!(mt, 0);
+    }
+
+    #[test]
+    fn shared_wal_watcher_fans_out_to_many_subscribers() {
+        let tmp = std::env::temp_dir().join(format!(
+            "litenotify-shared-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::write(&tmp, b"").unwrap();
+
+        let shared = SharedWalWatcher::new(tmp.clone());
+        let subs: Vec<(u64, std::sync::mpsc::Receiver<()>)> =
+            (0..50).map(|_| shared.subscribe()).collect();
+
+        for i in 0..5 {
+            std::thread::sleep(Duration::from_millis(5));
+            std::fs::write(&tmp, format!("{}", i).as_bytes()).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        for (i, (_id, rx)) in subs.iter().enumerate() {
+            let mut got_any = false;
+            while rx.try_recv().is_ok() {
+                got_any = true;
+            }
+            assert!(got_any, "subscriber {} saw no ticks", i);
+        }
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn shared_wal_watcher_explicit_unsubscribe_disconnects_receiver() {
+        let tmp = std::env::temp_dir().join(format!(
+            "litenotify-unsub-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::write(&tmp, b"").unwrap();
+
+        let shared = SharedWalWatcher::new(tmp.clone());
+        let (id, rx) = shared.subscribe();
+        assert_eq!(shared.subscriber_count(), 1);
+
+        shared.unsubscribe(id);
+        assert_eq!(shared.subscriber_count(), 0);
+
+        // Receiver now sees Err on blocking recv — the contract that
+        // lets a bridge thread exit cleanly when its WalEvents drops.
+        assert!(rx.recv().is_err());
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn shared_wal_watcher_prunes_subscribers_when_receiver_dropped() {
+        let tmp = std::env::temp_dir().join(format!(
+            "litenotify-prune-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::write(&tmp, b"").unwrap();
+
+        let shared = SharedWalWatcher::new(tmp.clone());
+        {
+            let _subs: Vec<_> = (0..10).map(|_| shared.subscribe()).collect();
+            assert_eq!(shared.subscriber_count(), 10);
+        }
+        std::fs::write(&tmp, b"wake").unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(shared.subscriber_count(), 0);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn bootstrap_joblite_schema_creates_tables_and_index() {
+        let conn = mem();
+        bootstrap_joblite_schema(&conn).unwrap();
+
+        // Idempotent.
+        bootstrap_joblite_schema(&conn).unwrap();
+
+        // _joblite_live has the 11 columns we expect (Python binding
+        // and the extension have historically disagreed on _joblite_dead
+        // column count; this pins both).
+        let live_cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('_joblite_live')")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(live_cols.len(), 11);
+
+        let dead_cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('_joblite_dead')")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(dead_cols.len(), 10);
+        assert!(dead_cols.contains(&"priority".to_string()));
+        assert!(dead_cols.contains(&"run_at".to_string()));
+        assert!(dead_cols.contains(&"max_attempts".to_string()));
+        assert!(dead_cols.contains(&"created_at".to_string()));
+
+        // Partial index present.
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='index' AND name='_joblite_live_claim'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1);
     }
 }

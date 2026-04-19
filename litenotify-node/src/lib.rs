@@ -27,7 +27,7 @@
 //! file watcher all come from the shared `litenotify-core` rlib so the
 //! PyO3, SQLite-extension, and Node bindings can't drift apart.
 
-use litenotify_core::{Readers, WalWatcher, Writer, open_conn};
+use litenotify_core::{Readers, SharedWalWatcher, Writer, open_conn};
 use napi::Result;
 use napi_derive::napi;
 use parking_lot::Mutex;
@@ -114,6 +114,11 @@ pub struct Database {
     writer: Arc<Writer>,
     readers: Arc<Readers>,
     path: String,
+    wal_path: PathBuf,
+    /// Lazy-initialized shared WAL watcher — one stat-poll thread per
+    /// Database regardless of how many `walEvents()` subscribers. See
+    /// litenotify-core::SharedWalWatcher.
+    shared_watcher: Arc<Mutex<Option<Arc<SharedWalWatcher>>>>,
 }
 
 #[napi]
@@ -122,7 +127,12 @@ impl Database {
     /// Dropping without either rolls back.
     #[napi]
     pub fn transaction(&self) -> Result<Transaction> {
-        let conn = self.writer.acquire();
+        // Fast path: uncontended slot, no condvar wait. Matches the
+        // PyO3 binding's optimization (CHANGELOG: ~5 μs/tx saved).
+        let conn = self
+            .writer
+            .try_acquire()
+            .unwrap_or_else(|| self.writer.acquire());
         match conn.execute_batch("BEGIN IMMEDIATE") {
             Ok(()) => Ok(Transaction {
                 inner: Arc::new(Mutex::new(TxState {
@@ -155,15 +165,25 @@ impl Database {
 
     /// Filesystem watcher on the .db-wal file. `await ev.next()` resolves
     /// on every commit to the database (any process, any writer).
+    ///
+    /// N subscribers share a single background poll thread via the
+    /// core SharedWalWatcher.
     #[napi]
     pub fn wal_events(&self) -> Result<WalEvents> {
-        let wal_path: PathBuf = format!("{}-wal", self.path).into();
-        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1024);
-        let watcher = WalWatcher::spawn(wal_path, move || {
-            let _ = tx.try_send(());
-        });
+        let shared = {
+            let mut guard = self.shared_watcher.lock();
+            if let Some(existing) = guard.as_ref() {
+                existing.clone()
+            } else {
+                let w = Arc::new(SharedWalWatcher::new(self.wal_path.clone()));
+                *guard = Some(w.clone());
+                w
+            }
+        };
+        let (sub_id, rx) = shared.subscribe();
         Ok(WalEvents {
-            _watcher: Arc::new(Mutex::new(Some(watcher))),
+            shared,
+            sub_id,
             rx: Arc::new(Mutex::new(rx)),
         })
     }
@@ -268,20 +288,23 @@ impl Transaction {
         run_query(conn, &sql, &params)
     }
 
-    /// Publish a cross-process notification. `payload` should be a
-    /// JSON string (caller JSON-encodes); this keeps the wire shape
-    /// explicit and matches the Python side.
+    /// Publish a cross-process notification. `payload` is any
+    /// JSON-serializable value; it's `JSON.stringify`'d on the way in
+    /// and `JSON.parse`'d by consumers on the way out. Matches the
+    /// Python binding's unconditional `json.dumps` contract so payloads
+    /// round-trip identically across bindings.
     #[napi]
-    pub fn notify(&self, channel: String, payload: String) -> Result<i64> {
+    pub fn notify(&self, channel: String, payload: JsonValue) -> Result<i64> {
         let state = self.inner.lock();
         let conn = state
             .conn
             .as_ref()
             .ok_or_else(|| napi_err("transaction already finished"))?;
+        let payload_str = payload.to_string();
         let id: i64 = conn
             .query_row(
                 "SELECT notify(?1, ?2)",
-                rusqlite::params![channel, payload],
+                rusqlite::params![channel, payload_str],
                 |r| r.get(0),
             )
             .map_err(napi_err)?;
@@ -331,9 +354,19 @@ impl Transaction {
 
 #[napi]
 pub struct WalEvents {
-    // Option so .close() can drop (and stop) the watcher thread eagerly.
-    _watcher: Arc<Mutex<Option<WalWatcher>>>,
+    /// Keep the shared watcher alive as long as this subscription
+    /// exists. `Drop` on WalEvents unsubscribes our channel — the
+    /// `rx.recv()` inside `next()` then returns Err and the await
+    /// resolves, letting JS see a clean end.
+    shared: Arc<SharedWalWatcher>,
+    sub_id: u64,
     rx: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl Drop for WalEvents {
+    fn drop(&mut self) {
+        self.shared.unsubscribe(self.sub_id);
+    }
 }
 
 #[napi]
@@ -351,10 +384,10 @@ impl WalEvents {
         Ok(())
     }
 
-    /// Stop the background stat-poll thread.
+    /// Stop this subscription eagerly. Idempotent.
     #[napi]
     pub fn close(&self) {
-        self._watcher.lock().take();
+        self.shared.unsubscribe(self.sub_id);
     }
 }
 
@@ -364,9 +397,12 @@ impl WalEvents {
 pub fn open(path: String, max_readers: Option<u32>) -> Result<Database> {
     let max_readers = max_readers.unwrap_or(8).max(1) as usize;
     let writer_conn = open_conn(&path, true).map_err(napi_err)?;
+    let wal_path: PathBuf = format!("{}-wal", path).into();
     Ok(Database {
         writer: Arc::new(Writer::new(writer_conn)),
         readers: Arc::new(Readers::new(path.clone(), max_readers)),
         path,
+        wal_path,
+        shared_watcher: Arc::new(Mutex::new(None)),
     })
 }

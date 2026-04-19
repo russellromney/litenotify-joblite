@@ -45,17 +45,19 @@ class Listener:
     """Async iterator yielding Notifications published to `channel`.
 
     Semantics:
-      * Starts from the CURRENT `MAX(id)` on the channel at construction
-        time — historical notifications are not replayed (like pg_notify).
-        Use `db.stream(...)` if you want durable replay.
-      * Wakes on every commit to the DB (WAL file change) and SELECTs
-        any new rows for this channel. Same-process and cross-process
-        commits both deliver in ~1ms.
-      * Ordered by monotonic `id`; no duplicates.
-      * Short-term buffer: the notifications table is pruned every
-        ~1000 notify() calls, keeping the last 10 seconds OR last 10k
-        rows. A listener that goes offline longer than that loses
-        missed events.
+      * Starts from the CURRENT `MAX(id)` on the channel at
+        construction — historical notifications are not replayed (same
+        shape as `pg_notify`). Use `db.stream(...)` if you want
+        durable replay with per-consumer offsets.
+      * Wakes on every `.db-wal` change (any process, any writer) and
+        SELECTs new rows for this channel. Cross-process wake latency
+        is bounded by the 1 ms stat-poll cadence (p50 ~= 1–2 ms on
+        M-series).
+      * Ordered by monotonic id; no duplicates.
+      * The notifications table is NOT auto-pruned. Rows accumulate
+        until you call `db.prune_notifications(...)`. A listener that
+        reconnects will skip any events pruned while it was offline —
+        if you need durability past that window, use `db.stream(...)`.
     """
 
     def __init__(self, db, channel: str):
@@ -198,71 +200,13 @@ class Queue:
         self._init_schema()
 
     def _init_schema(self):
-        # Single-table hybrid schema:
-        #   _joblite_live     - pending + processing rows, with a partial
-        #                       claim index filtered to those two states.
-        #   _joblite_dead     - terminal. Separate so retention policies
-        #                       (DROP TABLE, purge old rows, migrate
-        #                       elsewhere) don't disturb the hot path.
-        #   _joblite_jobs     - inspection VIEW. UNIONs _joblite_live and
-        #                       _joblite_dead with a synthetic `state`
-        #                       column ('pending' / 'processing' / 'dead').
-        #
-        # Picked over tables-per-state after measuring: DELETE+INSERT per
-        # claim cost ~25% more per claim than a single UPDATE on the
-        # single-table design, and the single-table partial index already
-        # excludes dead/done rows from the claim hot path. No measured
-        # benefit from splitting pending and processing into separate
-        # tables on any bench we've run. Simpler is faster.
+        # Canonical DDL lives in litenotify-core::BOOTSTRAP_JOBLITE_SQL
+        # so this binding and the SQLite loadable extension can't drift
+        # on column counts. View + schema-version cleanup are
+        # Python-binding-specific and stay here.
         with self.db.transaction() as tx:
-            tx.execute(
-                """
-                CREATE TABLE IF NOT EXISTS _joblite_live (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  queue TEXT NOT NULL,
-                  payload TEXT NOT NULL,
-                  state TEXT NOT NULL DEFAULT 'pending',
-                  priority INTEGER NOT NULL DEFAULT 0,
-                  run_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                  worker_id TEXT,
-                  claim_expires_at INTEGER,
-                  attempts INTEGER NOT NULL DEFAULT 0,
-                  max_attempts INTEGER NOT NULL DEFAULT 3,
-                  created_at INTEGER NOT NULL DEFAULT (unixepoch())
-                )
-                """
-            )
-            tx.execute(
-                """
-                CREATE TABLE IF NOT EXISTS _joblite_dead (
-                  id INTEGER PRIMARY KEY,
-                  queue TEXT NOT NULL,
-                  payload TEXT NOT NULL,
-                  priority INTEGER NOT NULL DEFAULT 0,
-                  run_at INTEGER NOT NULL DEFAULT 0,
-                  attempts INTEGER NOT NULL DEFAULT 0,
-                  max_attempts INTEGER NOT NULL DEFAULT 0,
-                  last_error TEXT,
-                  created_at INTEGER NOT NULL DEFAULT (unixepoch()),
-                  died_at INTEGER NOT NULL DEFAULT (unixepoch())
-                )
-                """
-            )
-            # Partial claim index. `state` is NOT in the key so
-            # `UPDATE state='processing'` doesn't reshuffle the row
-            # within the B-tree (measured ~9x slowdown when state was
-            # in the key). The partial WHERE restricts the index to
-            # rows that could possibly be claimed; done rows (DELETEd)
-            # and dead rows (separate table) never appear here, so the
-            # index stays small regardless of history size.
-            tx.execute(
-                """
-                CREATE INDEX IF NOT EXISTS _joblite_live_claim
-                  ON _joblite_live(queue, priority DESC, run_at, id)
-                  WHERE state IN ('pending', 'processing')
-                """
-            )
-            # Inspection view.
+            tx.bootstrap_joblite_schema()
+            # Inspection view: UNION live + dead with a synthetic `state`.
             tx.execute("DROP VIEW IF EXISTS _joblite_jobs")
             tx.execute(
                 """
@@ -296,6 +240,18 @@ class Queue:
         run_at: Optional[int] = None,
         priority: int = 0,
     ) -> None:
+        """Insert one job row. When called without `tx=`, opens its
+        own write transaction and fires one notify per call — so a
+        hot loop of 10 k enqueues means 10 k transactions and 10 k
+        wakes. For bulk inserts, pass a shared `tx` and the library
+        will only fire one commit (at the block exit) with one
+        cross-process wake:
+
+            with db.transaction() as tx:
+                for p in payloads:
+                    q.enqueue(p, tx=tx)
+                # single commit + one wake for all workers
+        """
         run_at_val = int(run_at) if run_at is not None else int(time.time())
         payload_str = json.dumps(payload)
         params = [self.name, payload_str, run_at_val, int(priority), self.max_attempts]
@@ -534,6 +490,13 @@ class Queue:
                 [extend, int(job_id), worker_id],
             )
         return len(rows) > 0
+
+
+def build_worker_id(framework: str, instance_id: str, queue: str, index: int) -> str:
+    """Framework-agnostic worker id format. Previously duplicated
+    verbatim across the FastAPI/Django/Flask plugins.
+    """
+    return f"{framework}-{instance_id}-{queue}-{index}"
 
 
 class Retryable(Exception):
@@ -827,6 +790,12 @@ class Database:
           * `older_than_s`: delete rows older than this many seconds.
           * `max_keep`: delete rows beyond the most recent N.
 
+        If BOTH are passed, a row matching EITHER condition is deleted
+        (OR semantics). `max_keep` is not a floor — combined with an
+        aggressive `older_than_s` it will not protect the most-recent
+        N rows from age-based deletion. Typical usage is one argument
+        at a time.
+
         Run whenever you want — on app startup, on a scheduled task,
         from a Django management command, whatever. This is a tool
         you invoke, not a background timer. `notify()` never prunes
@@ -843,10 +812,19 @@ class Database:
             conditions.append("created_at < unixepoch() - ?")
             params.append(int(older_than_s))
         if max_keep is not None:
-            conditions.append(
-                "id <= (SELECT MAX(id) - ? FROM _litenotify_notifications)"
+            # Pre-compute MAX(id) once instead of a subquery the
+            # planner might (or might not) hoist out of the DELETE
+            # predicate. Also correctly handles an empty table and
+            # a max_keep larger than the current row count — both
+            # devolve to "nothing qualifies for id-based deletion."
+            rows = self.query(
+                "SELECT MAX(id) AS m FROM _litenotify_notifications"
             )
-            params.append(int(max_keep))
+            max_id = rows[0]["m"] if rows and rows[0]["m"] is not None else 0
+            threshold = max_id - int(max_keep)
+            if threshold >= 1:
+                conditions.append("id <= ?")
+                params.append(threshold)
         if not conditions:
             return 0
         with self.transaction() as tx:
@@ -922,16 +900,15 @@ class _WorkerQueueIter:
     the write-tx count per job for the common worker pattern
     (`async for job in q.claim(...): handle(job); job.ack()`).
 
-    Wake sources when the queue is empty:
-      1. In-process commit-hook broadcast (`db.listen(channel)`):
-         sub-ms wake when an enqueuer in the SAME process commits.
-      2. WAL-file watcher (`db.wal_events()`): ~1ms wake when an
-         enqueuer in ANY process commits. The WAL file's mtime bumps
-         on every commit; kernel inotify/kqueue/RDCW delivers the
-         event. Re-polls the queue; over-triggering is fine — each
-         wasted wake is an indexed SELECT, cheap.
-      3. `idle_poll_s` timeout: last-resort safety net if both the
-         listener and the WAL watcher fail (sandboxed FS, etc).
+    Wake when the queue is empty:
+      1. WAL-file watcher (`db.wal_events()`): ~1ms wake when ANY
+         process commits. A background stat-poll thread watches the
+         `.db-wal` file's (size, mtime); the shared watcher fans out
+         to every subscriber. Wake fires per commit — we re-poll the
+         queue; over-triggering is cheap (indexed SELECT on a
+         partial-index row set).
+      2. `idle_poll_s` timeout: last-resort safety net if the WAL
+         watcher can't fire (sandboxed FS, odd container mount, etc).
     """
 
     def __init__(
@@ -975,15 +952,8 @@ class _WorkerQueueIter:
             # every commit, any process. Covers in-process enqueuers
             # (their commit appends to this DB's WAL too) AND
             # cross-process enqueuers. `idle_poll_s` is a paranoia
-            # fallback for sandboxed filesystems where kqueue/inotify
-            # events are suppressed.
-            #
-            # We don't race against the in-process commit-hook listener
-            # because doing so requires cancelling whichever task
-            # didn't fire, and cancelling an `asyncio.Queue.get()` has
-            # an ugly race where a just-enqueued item can be lost.
-            # The WAL watch alone gives ~1ms wake latency for both
-            # same-process and cross-process, which is fine.
+            # fallback for sandboxed filesystems where the stat-poll
+            # thread can't observe mtime changes reliably.
             if self._wal is None:
                 self._wal = self.queue.db.wal_events()
             try:

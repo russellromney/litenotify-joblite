@@ -145,6 +145,44 @@ async def test_rollback_drops_notification(db_path):
     assert got == ["delivered"]
 
 
+async def test_notify_payload_round_trips_common_json_shapes(db_path):
+    """tx.notify must JSON-encode any JSON-serializable value and the
+    receiver's Notification.payload must decode it identically. Matches
+    Queue.enqueue and Stream.publish, plus the Node binding (see
+    litenotify-node/test/basic.js:'notify payload round-trips common
+    JSON shapes'). Pre-normalization: strings were stored raw, so
+    notify("ch", "42") → int 42; notify("ch", "null") → None;
+    notify("ch", '"x"') → "x" without quotes. All gone now.
+    """
+    db = litenotify.open(db_path)
+    got = []
+    cases = [
+        {"id": 42, "name": "alice"},
+        [1, 2, 3],
+        "hello",
+        42,
+        3.14,
+        None,
+        True,
+    ]
+
+    async def listen():
+        async for n in db.listen("rt"):
+            got.append(n.payload)
+            if len(got) == len(cases):
+                return
+
+    task = asyncio.create_task(listen())
+    await asyncio.sleep(0.05)
+    with db.transaction() as tx:
+        for p in cases:
+            tx.notify("rt", p)
+
+    await asyncio.wait_for(task, timeout=2.0)
+    # `True` round-trips as `True` (JSON boolean, not integer 1).
+    assert got == cases
+
+
 async def test_dict_and_list_payloads_json_serialized(db_path):
     db = litenotify.open(db_path)
     _make_table(db)
@@ -218,7 +256,10 @@ def test_prune_notifications_by_age(db_path):
     rows = db.query(
         "SELECT payload FROM _litenotify_notifications ORDER BY id"
     )
-    assert [r["payload"] for r in rows] == ["fresh"]
+    # tx.notify now unconditionally json.dumps, so the stored payload is
+    # the JSON-encoded form. json.loads recovers the original string.
+    import json as _json
+    assert [_json.loads(r["payload"]) for r in rows] == ["fresh"]
 
 
 def test_prune_notifications_no_args_is_noop(db_path):
@@ -282,32 +323,34 @@ def test_connection_returned_after_commit_error(db_path):
     assert rows[0]["c"] == 6
 
 
-async def test_slow_listener_does_not_block_writer(db_path):
-    """A listener that falls behind must not stall subsequent commits.
-    Was originally a commit-hook test; now there's no commit hook, but
-    the invariant is still load-bearing: a dormant listener must not
-    affect the writer path at all.
+async def test_slow_wal_consumer_does_not_block_writer(db_path):
+    """A slow WAL-event consumer must not backpressure the writer.
+    The shared WalWatcher has bounded per-subscriber buffers; ticks
+    to a slow subscriber are dropped, but the writer path is never
+    slowed. Regression against a previous design where listeners
+    shared a tokio broadcast ring that could block on a full consumer.
     """
     db = litenotify.open(db_path)
     _make_table(db)
 
-    finished_commits = []
-
-    # Keep one listener alive but never consume it.
+    # One dormant listener that never consumes a WAL event. With a
+    # naive implementation, the subscriber channel fills and backpressure
+    # reaches the writer. With the bounded fan-out, the writer never
+    # touches the subscriber list.
     _dormant = db.listen("ch")  # noqa: F841
 
     loop = asyncio.get_running_loop()
     start = loop.time()
-    # Fire many commits; if the commit hook were blocking on the listener
-    # we'd see this take far longer than expected.
-    for i in range(50):
+    for i in range(500):
         with db.transaction() as tx:
             tx.notify("ch", f"m{i}")
-        finished_commits.append(i)
     elapsed = loop.time() - start
 
-    assert len(finished_commits) == 50
-    assert elapsed < 2.0, f"commits took {elapsed:.3f}s; commit hook may be blocking"
+    # 500 tx on M-series at ~3-5k tx/s ~= 100-160 ms. 2 s is a loose
+    # ceiling; a real regression would be >>2 s.
+    assert elapsed < 2.0, (
+        f"500 commits took {elapsed:.3f}s; slow-consumer backpressure?"
+    )
 
 
 def test_begin_immediate_serializes_writers(db_path):
@@ -386,38 +429,51 @@ def test_busy_timeout_is_set(db_path):
     assert rows[0]["journal_mode"].lower() == "wal"
 
 
-async def test_cross_channel_starvation_immune(db_path):
-    """Regression for the per-channel registry refactor: a slow listener on
-    a quiet channel must not miss its single message when an unrelated loud
-    channel emits thousands. Before the refactor both shared one tokio
-    broadcast ring, so loud could Lag cold out."""
+async def test_busy_channel_does_not_delay_quiet_channel(db_path):
+    """Per-channel SELECT isolation: a listener on a quiet channel
+    must see its message promptly even while another channel is
+    flooded. Under the current architecture this is true by
+    construction (each listener's SELECT filters on channel=?), but
+    the property is load-bearing enough to guard with a test —
+    a regression would break the fan-out story.
+    """
     db = litenotify.open(db_path)
     _make_table(db)
 
     got = []
 
-    async def cold_listener():
-        async for n in db.listen("cold"):
+    async def quiet_listener():
+        async for n in db.listen("quiet"):
             got.append(n.payload)
             return
 
-    task = asyncio.create_task(cold_listener())
+    task = asyncio.create_task(quiet_listener())
     await asyncio.sleep(0.05)
 
-    # Emit 3000 messages on "hot" and exactly one on "cold".
+    # Flood "loud" and send exactly one on "quiet" in the same tx.
     with db.transaction() as tx:
         for i in range(3000):
-            tx.notify("hot", f"p{i}")
-        tx.notify("cold", "only")
+            tx.notify("loud", f"p{i}")
+        tx.notify("quiet", "only")
 
+    # The quiet listener SELECTs with channel='quiet' and ignores the
+    # 3000 loud rows. Delivery should be fast, not proportional to the
+    # flood size. 1s is a loose bound.
+    loop = asyncio.get_running_loop()
+    start = loop.time()
     await asyncio.wait_for(task, timeout=3.0)
+    elapsed = loop.time() - start
     assert got == ["only"]
+    assert elapsed < 1.0, (
+        f"quiet listener took {elapsed:.3f}s with 3000 loud-channel rows"
+    )
 
 
 async def test_listener_drop_allows_clean_reuse(db_path):
-    """Regression: creating and dropping many listeners (as SSE reconnects
-    do) must not wedge the notifier. Before the refactor, each dropped
-    listener left a stranded bridge thread."""
+    """Creating and dropping many listeners (as SSE reconnects do)
+    must cleanly release their WAL-watcher subscriptions. Dropping a
+    WalEvents now unsubscribes its channel from the shared watcher;
+    the bridge thread exits on disconnect."""
     db = litenotify.open(db_path)
     _make_table(db)
 
