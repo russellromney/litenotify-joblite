@@ -976,6 +976,69 @@ class Database:
     def query(self, sql: str, params=None):
         return self._inner.query(sql, params)
 
+    def try_rate_limit(self, name: str, limit: int, per: int) -> bool:
+        """Fixed-window rate limiter. Returns True if the caller is
+        under `limit` invocations in the current `per`-second window
+        (and records this invocation as one of those); False if the
+        limit has been hit, in which case nothing is recorded.
+
+            if db.try_rate_limit("outbound-api", limit=10, per=60):
+                call_api()
+            else:
+                # over rate; caller decides whether to drop, retry,
+                # or enqueue-with-delay.
+                ...
+
+        Uses a fixed window (`window_start = unixepoch() // per * per`).
+        At window boundaries the count resets — simpler than a sliding
+        window and good enough for "don't hammer this endpoint past X
+        per minute" patterns. Old windows are not auto-pruned; run
+        `db.sweep_rate_limits(older_than_s=...)` if the table gets
+        large.
+
+        Entire check + increment runs in one write transaction so two
+        workers racing for the last slot never both see "under limit."
+        """
+        limit = int(limit)
+        per = int(per)
+        if limit <= 0 or per <= 0:
+            raise ValueError("limit and per must be positive")
+        with self.transaction() as tx:
+            window_start = (int(time.time()) // per) * per
+            rows = tx.query(
+                "SELECT count FROM _joblite_rate_limits "
+                "WHERE name = ? AND window_start = ?",
+                [name, window_start],
+            )
+            current = rows[0]["count"] if rows else 0
+            if current >= limit:
+                return False
+            tx.execute(
+                """
+                INSERT INTO _joblite_rate_limits (name, window_start, count)
+                VALUES (?, ?, 1)
+                ON CONFLICT(name, window_start) DO UPDATE
+                  SET count = count + 1
+                """,
+                [name, window_start],
+            )
+        return True
+
+    def sweep_rate_limits(self, older_than_s: int = 3600) -> int:
+        """Delete rate-limit rows whose `window_start` is older than
+        `older_than_s` seconds ago. Returns rows deleted. Purely a
+        table-space reclaim — old windows are never consulted by
+        `try_rate_limit`, so leaving them around is just disk use.
+        """
+        with self.transaction() as tx:
+            rows = tx.query(
+                "DELETE FROM _joblite_rate_limits "
+                "WHERE window_start < unixepoch() - ? "
+                "RETURNING name",
+                [int(older_than_s)],
+            )
+        return len(rows)
+
     def lock(
         self,
         name: str,

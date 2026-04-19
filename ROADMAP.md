@@ -89,47 +89,32 @@ To do (requires authenticated repo creation on GitHub):
 Ordered by value / effort. The "value" column is my best guess at
 how often the feature actually matters in real workloads.
 
-- [ ] **Handler timeout.** Wrap each handler call in
-  `asyncio.wait_for(handler(...), timeout=N)` inside the three
-  framework plugins. Closes a real correctness hole: today a hung
-  handler gets its claim expired after `visibility_timeout_s` and
-  another worker picks up the same job, so side effects can fire
-  twice while the first handler is still running. `@task(timeout=N)`
-  as the declarative shape. ~15 min per plugin.
-- [ ] **`delay=` kwarg on `enqueue`.** Sugar for
-  `run_at=int(time.time()) + delay`. Today callers have to compute
-  the absolute timestamp; this is the shorthand everyone expects.
-  ~5 min.
-- [ ] **Declarative retries.** `@task(retries=3, retry_delay=60,
-  backoff=2.0)` in plugin decorators. Worker catches exceptions from
-  the handler and calls `job.retry(delay_s=retry_delay * backoff**n,
-  error=str(e))` automatically. Plugins already do ad-hoc
-  `try/except: job.retry(60)` — this lifts it to declarative config.
-  ~30 min.
+- [x] **Handler timeout.** `@task(timeout=N)` wraps handler calls in
+  `asyncio.wait_for` via the shared `joblite._worker.run_task` helper.
+  Closed the reclaim-while-still-running correctness hole.
+- [x] **`delay=` kwarg on `enqueue`.** `Queue.enqueue(..., delay=60)`
+  sugar for `run_at=time.time() + 60`.
+- [x] **Declarative retries.** `@task(retries=3, retry_delay=60,
+  backoff=2.0)` in plugin decorators. Worker catches exceptions and
+  applies the exponential-backoff formula via `run_task`. Retryable
+  exceptions honor the caller's own `delay_s`.
+- [x] **Task expiration.** `Queue.enqueue(expires=60)` sets
+  `expires_at`. Claim path filters expired rows.
+  `queue.sweep_expired()` moves them to `_joblite_dead`.
+- [x] **Task locking.** `with db.lock(name, ttl=60): ...` via a new
+  `_joblite_locks` table. Raises `joblite.LockHeld` if the lock is
+  held. TTL bounds how long a crashed holder can block others.
+- [x] **Rate-limiting.** `db.try_rate_limit(name, limit, per)`
+  returns True/False. Fixed-window counter in `_joblite_rate_limits`.
+  `db.sweep_rate_limits()` reclaims stale windows.
 - [ ] **Crontab / periodic tasks.** `@periodic_task(crontab(minute='0',
   hour='3'))`. A scheduler process (dedicated CLI or in-process
   background task) enqueues periodic tasks at their cron boundaries.
   Needs: a crontab parser (either vendor from croniter or a minimal
   built-in), a scheduler loop that wakes at the next boundary and
   calls `enqueue`, and a way to avoid double-firing across multiple
-  scheduler processes (simplest: leader election via an
-  `INSERT OR IGNORE` on a `_joblite_scheduler_lock` row with TTL).
-  ~4 hours.
-- [ ] **Task expiration.** `@task(expires=60)` — if a job isn't
-  claimed within 60 seconds of enqueue, drop it. Add
-  `expires_at INTEGER` column; claim predicate filters
-  `expires_at IS NULL OR expires_at > unixepoch()`; a sweep SQL
-  moves expired-pending rows to `_joblite_dead` (or just DELETEs).
-  ~1 hour.
-- [ ] **Task locking.** `with queue.lock('name'): ...` — acquire a
-  named lock before running, skip (or block) if it's held. Used for
-  "only one of these at a time" cron-like patterns.
-  `_joblite_locks(name PRIMARY KEY, owner, expires_at)` table,
-  acquire = `INSERT OR IGNORE` with TTL check, release = `DELETE`.
-  ~1 hour.
-- [ ] **Rate-limiting.** `@task(rate_limit=(10, 60))` — at most 10
-  invocations per 60 seconds. Implementation: sliding-window counter
-  in `_joblite_rate_limits`, claim-path CHECK. ~2 hours.
+  scheduler processes (simplest: leader election via
+  `db.lock('scheduler', ttl=N)` — which we now have). ~4 hours.
 - [ ] **Task result storage.** `job.result(timeout=...)` returns the
   handler's return value. New `_joblite_results(id, value, expires_at)`
   table, worker UPSERTs on success, caller polls (or awaits a WAL

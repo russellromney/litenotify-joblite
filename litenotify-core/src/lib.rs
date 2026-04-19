@@ -190,6 +190,12 @@ pub const BOOTSTRAP_JOBLITE_SQL: &str = "
       owner TEXT NOT NULL,
       expires_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS _joblite_rate_limits (
+      name TEXT NOT NULL,
+      window_start INTEGER NOT NULL,
+      count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (name, window_start)
+    );
 ";
 
 /// Install the joblite queue schema on `conn`. Idempotent. See
@@ -673,5 +679,15 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(locks_cols, vec!["name", "owner", "expires_at"]);
+
+        // _joblite_rate_limits table present for db.try_rate_limit().
+        let rl_cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('_joblite_rate_limits')")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rl_cols, vec!["name", "window_start", "count"]);
     }
 }
