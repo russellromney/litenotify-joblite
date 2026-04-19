@@ -4,6 +4,8 @@
 
 `joblite` adds language bindings and framework integrations that let listeners/workers consume and act on messages from `litenotify`.
 
+For most applications, [SQLite alone is sufficient](https://www.epicweb.dev/why-you-should-probably-be-using-sqlite). This project's goal is to make that easier. 
+
 `litenotify` works by adding messages/tasks to tables in SQLite, similar to other task libraries that use SQLite as a durable backend. Unlike other task libraries, it takes advantage of kernel-level event notifications on SQLite's WAL file to replace a polling interval with push semantics. A 1 ms `stat(2)` thread on the WAL file turns `(size, mtime)` changes into cross-process notifications with single-digit millisecond latency.
 
 Three primitives on top: ephemeral pub/sub (`notify()`), durable pub/sub with per-consumer offsets (`stream()`), at-least-once work queue (`queue()`). All three are INSERTs inside your transaction, which lets a task "send" be atomic with your business write, and rollback drops everything.
@@ -118,23 +120,7 @@ The extension shares `_joblite_live`, `_joblite_dead`, and `_litenotify_notifica
 
 ## Performance
 
-M-series, release, WAL + `synchronous=NORMAL`.
-
-| Scenario | Throughput | p50 |
-|---|---|---|
-| 4 workers + 2 enqueuers @ 2k eps | 3,900 jobs/s | 0.5 ms |
-| ↑ with 100k dead-row history | 3,800 jobs/s | 0.5 ms |
-| Batched claim+ack (128) | 100,000 jobs/s | — |
-| Stream replay (SELECT) | 1,000,000 events/s | — |
-| Enqueue 1 / tx | 6–8k /s | — |
-| Enqueue 100 / tx | 110k /s | — |
-| Cross-process idle wake | — | **1.2 ms / 2.4 ms p90** |
-
-The e2e column is enqueue-to-ack under saturation, dominated by pipeline depth (Little's Law on a 3,900 j/s pipeline with queue depth ~2). The meaningful latency number for pub/sub is the cross-process wake row — commit in process A, idle listener in process B, measure the delta. Bounded by the 1 ms stat-poll cadence.
-
-Claim throughput is flat as the dead-row table grows: the partial claim index never touches dead rows. Raw Python `sqlite3` single-tx tops out ~47k/s on this machine (the WAL ceiling); litenotify runs ~14k/s through the PyO3 boundary for single-write transactions (3× slower), and batched inserts close the gap.
-
-Benches: `bench/real_bench.py` (multi-process saturation), `bench/wake_latency_bench.py` (idle cross-process wake), `bench/ext_bench.py` (raw-SQL ceiling via the extension).
+Handles thousands of messages per second on a modern laptop, with cross-process wake latency bounded by the 1 ms stat-poll cadence (~1–2 ms median on M-series). Run `bench/wake_latency_bench.py` and `bench/real_bench.py` to measure on your hardware.
 
 ## Architecture
 
