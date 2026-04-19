@@ -8,8 +8,6 @@ joblite builds three primitives on litenotify: ephemeral cross-process pub/sub (
 
 SQLite in WAL mode appends to the `.db-wal` file on every commit. turbopuffer and [Oban](https://hexdocs.pm/oban/) taught us that you can architect around a single constraint if you understand it well. This library does that for SQLite's WAL file: anything that commits bumps the file's `(size, mtime)`, so a `stat(2)` loop is enough to push notifications cross-process at single-digit-ms latency. The mechanism is identical on Linux, macOS, and Windows; we use stat-polling instead of `inotify`/`kqueue`/`FSEvents` because macOS FSEvents silently drops same-process writes.
 
-The initial goals were: keep all state in the `.db` file, couple pub/sub atomically with business writes, and deliver cross-process with no extra services. All three work.
-
 litenotify/joblite ships as a Rust workspace with:
 - A Python binding via [PyO3](https://pyo3.rs)
 - A Node.js binding via [napi-rs](https://napi.rs)
@@ -163,6 +161,22 @@ SELECT notify('orders', '{"id":42}');                   -- also installs notify(
 
 The extension shares `_joblite_live`, `_joblite_dead`, and `_litenotify_notifications` with the Python binding. A Python worker can claim jobs any other language (Go, Rust, shell) pushed via the extension. Schema compatibility is enforced by `tests/test_extension_interop.py`.
 
+## Design goals
+
+**SQLite-native.** Jobs, notifications, stream events, and consumer offsets all live in the same `.db` file as your application data. `cp` copies the system. No separate broker, no separate message store, no separate durable log.
+
+**Transactional coupling by default.** `queue.enqueue(..., tx=tx)`, `stream.publish(..., tx=tx)`, and `tx.notify(...)` are INSERTs inside the caller's transaction. Commit makes them visible to every reader in every process atomically with the business write. Rollback makes them never have happened. The transactional-outbox pattern is not a library feature to opt into, it's the shape of the API.
+
+**No polling interval to tune.** There is no `idle_poll_ms` knob. Idle listeners park on a stat-polled WAL file watch and do zero database queries. Wake fires when SQLite commits, not on a timer. The only "poll" knob in the library is a 5-second paranoia fallback that fires if the stat watcher somehow can't be established (sandboxed filesystems, odd container mounts).
+
+**No database load from idle listeners.** The wake signal is `stat(2)` on the `.db-wal` file, not a SQL query. Idle listeners don't touch SQLite, don't compete for the write lock, don't warm the page cache. A hundred idle listeners cost the same kernel work as one.
+
+**Over-triggering is cheaper than under-triggering.** A WAL change wakes every subscriber on that `Database` regardless of which channel committed. Each wasted wake is one indexed SELECT against the partial index (microseconds). We prefer waking ten listeners that don't care to missing one that does.
+
+**Durable where it matters, ephemeral where it doesn't.** Queue jobs persist until ack, with a separate `_joblite_dead` table for retry-exhausted rows. Stream events persist and each named consumer tracks its own offset. `notify()` is fire-and-forget and not auto-pruned; call `db.prune_notifications()` from a scheduled task or startup hook when you want to trim. Users get to decide the retention policy per primitive instead of inheriting a library default.
+
+**Cross-platform via `stat`, not `inotify`/`kqueue`/`FSEvents`.** macOS FSEvents silently drops events for same-process writes, which means an enqueuer and a listener in the same Python process would never see each other. Stat-polling is portable, works identically at ~1ms granularity everywhere, and costs a single syscall per millisecond. We traded ~0.5ms of latency against better kernel notifications for portability and correctness.
+
 ## Design
 
 litenotify adds a tiny coordination layer on top of SQLite's write-ahead log. Every decision flows from SQLite's model:
@@ -196,6 +210,14 @@ Every primitive takes a `tx=tx` argument. `queue.enqueue(..., tx=tx)`, `stream.p
 ### Shared WAL watcher
 
 `litenotify_core::SharedWalWatcher` owns one stat-poll thread per `.db-wal` path and fans out to N subscribers via bounded `SyncSender<()>` channels keyed by subscriber id. Each `db.wal_events()` call registers a subscriber and returns a handle whose `Drop` auto-unsubscribes (and disconnects the channel, so the bridge thread exits cleanly on `rx.recv() -> Err`). 100 listeners in one process = 1 stat thread + 100 lightweight receivers.
+
+## Current limitations
+
+- **Single machine, single writer.** Two servers writing to the same `.db` file over NFS will corrupt it. SQLite's locking is designed for a single host. Shard by file (queue-per-tenant, queue-per-database) or switch to Postgres if you need cross-host writers.
+- **Cross-machine delivery is the application's job.** The web handler writes to SQLite atomically, then fans out to HTTP / Kafka / NATS / whatever transport the other machines subscribe to. Framework plugins are where that glue goes today; built-in fan-out adapters are on the [ROADMAP](ROADMAP.md).
+- **Not a workflow orchestrator.** No DAGs, compensation, or human-in-the-loop. Use [Temporal](https://temporal.io), [Hatchet](https://hatchet.run), or [Inngest](https://inngest.com) for those.
+- **No wheels on PyPI, no CI yet.** Build from source (see [Quick start](#quick-start)). GitHub Actions wheels for PyPI + npm prebuilds for the Node binding are on the [ROADMAP](ROADMAP.md).
+- **Windows is untested.** The stat-polling mechanism should work (Windows `stat` returns mtime the same way), but we don't run CI there yet. Linux and macOS are exercised by the tests.
 
 ## Crash recovery
 
