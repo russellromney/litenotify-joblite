@@ -253,10 +253,28 @@ Handles thousands of messages per second on a modern laptop, with cross-process 
 
 ## Development
 
+Layout:
+
+```
+litenotify-core/              # Rust rlib shared across all bindings
+litenotify-extension/         # SQLite loadable extension (cdylib)
+packages/
+  litenotify/                 # PyO3 Python binding
+  litenotify-node/            # napi-rs Node.js binding
+  joblite/                    # Python higher-level Queue/Stream/Outbox
+  joblite_fastapi/            # FastAPI plugin
+  joblite_django/             # Django plugin
+  joblite_flask/              # Flask plugin
+tests/                        # integration tests (cross-package)
+bench/                        # benches
+```
+
+Each `packages/*` directory is self-contained (own `Cargo.toml` / `pyproject.toml` / `package.json`) and is intended to become its own repository published as a git submodule into this directory. Today it lives inline for fast iteration while the APIs settle.
+
 ```bash
-cargo test -p litenotify-core                # Rust core: writer/readers pool, watcher, schema
-pytest tests/                                # Python: 126 tests incl. cross-lang + extension interop
-cd litenotify-node && npm test               # Node: 8 tests incl. Python→Node wake
+cargo test -p litenotify-core                # Rust core
+pytest tests/                                # Python: integration + cross-lang + extension interop
+cd packages/litenotify-node && npm test      # Node: 8 tests incl. Python→Node wake
 
 python bench/wake_latency_bench.py --samples 500
 python bench/real_bench.py --workers 4 --enqueuers 2 --seconds 15

@@ -36,6 +36,7 @@ import textwrap
 import time
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PACKAGES_ROOT = os.path.join(REPO_ROOT, "packages")
 
 
 def seed_pending(db_path: str, queue: str, n: int) -> None:
@@ -110,7 +111,7 @@ def worker_script(
     return textwrap.dedent(
         f"""
         import asyncio, struct, sys, time
-        sys.path.insert(0, {REPO_ROOT!r})
+        sys.path.insert(0, {PACKAGES_ROOT!r})
         import joblite
 
         async def main():
@@ -150,7 +151,7 @@ def enqueuer_script(db_path: str, queue: str, rate_per_sec: int) -> str:
     return textwrap.dedent(
         f"""
         import sys, time
-        sys.path.insert(0, {REPO_ROOT!r})
+        sys.path.insert(0, {PACKAGES_ROOT!r})
         import joblite
 
         db = joblite.open({db_path!r})
@@ -345,7 +346,7 @@ def main():
     ap.add_argument("--runs", type=int, default=1)
     args = ap.parse_args()
 
-    sys.path.insert(0, REPO_ROOT)
+    sys.path.insert(0, os.path.join(REPO_ROOT, "packages"))
 
     print(f"Config: {args.workers} workers, {args.enqueuers} enqueuers, "
           f"{args.seconds}s, "

@@ -39,8 +39,13 @@ def uvicorn_server(tmp_path_factory):
     import time
 
     db_path = str(tmp_path_factory.mktemp("shared") / "shared.db")
+    packages_root = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "packages"
+    )
     app_code = textwrap.dedent(
         f"""
+        import sys
+        sys.path.insert(0, {packages_root!r})
         import joblite
         from fastapi import FastAPI
         from joblite_fastapi import JobliteApp

@@ -25,10 +25,13 @@ test('python writes notifications; node reads via WAL wake + SELECT', async () =
     lastSeen = initial[0].m;
 
     // Python writer: emits 3 notifications on channel 'orders'.
-    const REPO = path.resolve(__dirname, '..', '..');
+    // __dirname = packages/litenotify-node/test
+    // ../../..  = repo root;  ../..  = packages/
+    const REPO = path.resolve(__dirname, '..', '..', '..');
+    const PACKAGES = path.resolve(__dirname, '..', '..');
     const pyScript = `
 import sys, time
-sys.path.insert(0, ${JSON.stringify(REPO)})
+sys.path.insert(0, ${JSON.stringify(PACKAGES)})
 import joblite
 time.sleep(0.3)
 db = joblite.open(${JSON.stringify(dbPath)})

@@ -26,7 +26,7 @@ def _run_worker_script(db_path: str, worker_id: str, n: int) -> list:
         import asyncio
         import json
         import sys
-        sys.path.insert(0, {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))!r})
+        sys.path.insert(0, {os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "packages")!r})
 
         import joblite
 
@@ -140,7 +140,7 @@ def test_live_enqueuer_while_worker_drains(tmp_path):
     enqueuer_script = textwrap.dedent(
         f"""
         import sys, time
-        sys.path.insert(0, {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))!r})
+        sys.path.insert(0, {os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "packages")!r})
         import joblite
         db = joblite.open({db_path!r})
         q = db.queue('shared')

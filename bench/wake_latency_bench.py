@@ -38,10 +38,11 @@ import time
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PACKAGES_ROOT = os.path.join(REPO_ROOT, "packages")
 # Let `python bench/wake_latency_bench.py` find the in-repo joblite
 # package without needing `pip install -e`.
-if REPO_ROOT not in sys.path:
-    sys.path.insert(0, REPO_ROOT)
+if PACKAGES_ROOT not in sys.path:
+    sys.path.insert(0, PACKAGES_ROOT)
 
 
 _LISTENER_SCRIPT = r"""
@@ -50,7 +51,7 @@ import json
 import sys
 import time
 
-sys.path.insert(0, {repo!r})
+sys.path.insert(0, {packages!r})
 import joblite
 
 db = joblite.open({db_path!r})
@@ -78,7 +79,7 @@ asyncio.run(main())
 
 def run_sample(db_path: str, timeout_s: float) -> float:
     """One wake-latency sample, in seconds."""
-    script = _LISTENER_SCRIPT.format(repo=REPO_ROOT, db_path=db_path)
+    script = _LISTENER_SCRIPT.format(packages=PACKAGES_ROOT, db_path=db_path)
     proc = subprocess.Popen(
         [sys.executable, "-c", script],
         stdout=subprocess.PIPE,

@@ -58,6 +58,32 @@
 
 ## Next (post-correctness-push)
 
+### Repo layout → packages as git submodules
+
+Done: all language / framework packages moved into `packages/` —
+each is a self-contained subdirectory with its own
+`Cargo.toml` / `pyproject.toml` / `package.json`, ready to be split
+into its own GitHub repo and re-added as a git submodule.
+
+To do (requires authenticated repo creation on GitHub):
+
+- [ ] For each of `packages/litenotify`, `packages/litenotify-node`,
+  `packages/joblite`, `packages/joblite_fastapi`,
+  `packages/joblite_django`, `packages/joblite_flask`:
+  1. Create a new GitHub repo under `russellromney/<package-name>`.
+  2. `git subtree split --prefix=packages/<name> -b split-<name>`
+     to produce a branch containing only that subtree's history.
+  3. Push the branch to the new repo.
+  4. `git rm -r packages/<name>` in the main repo.
+  5. `git submodule add <repo-url> packages/<name>`.
+  6. Verify `cargo test -p litenotify-core`, `pytest tests/`,
+     `npm test` still pass.
+- [ ] Update CI once it exists to `git submodule update --init --recursive`
+  before running the test matrix.
+- [ ] Each package's own repo gets its own release / versioning /
+  publishing flow (PyPI, npm). The umbrella repo pins specific
+  submodule commits for "the official stack".
+
 ### Task queue features (huey parity, minus pipelines)
 
 Ordered by value / effort. The "value" column is my best guess at

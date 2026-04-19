@@ -1,7 +1,7 @@
 [project]
 name = "litenotify-workspace"
 version = "0.1.0"
-description = "litenotify + joblite development workspace (not a publishable package; see litenotify/, joblite/, joblite_fastapi/, joblite_django/)"
+description = "litenotify + joblite development workspace (not a publishable package; see packages/)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []

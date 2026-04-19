@@ -360,7 +360,7 @@ def test_management_command_two_workers_split_work_exclusively(tmp_path):
     import threading as _thr
     import time as _time
 
-    repo_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    repo_root = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "packages")
     db_path = str(tmp_path / "django-shared.db")
 
     import joblite

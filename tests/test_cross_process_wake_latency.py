@@ -24,6 +24,7 @@ import pytest
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PACKAGES_ROOT = os.path.join(REPO_ROOT, "packages")
 
 SAMPLES = 30  # small enough to keep CI fast; p99 stable at 30+ samples
 
@@ -32,7 +33,7 @@ _LISTENER_SCRIPT = r"""
 import asyncio
 import sys
 
-sys.path.insert(0, {repo!r})
+sys.path.insert(0, {packages!r})
 import joblite
 
 db = joblite.open({db_path!r})
@@ -56,7 +57,7 @@ def _run_sample(db_path: str) -> float:
     subprocess's WAKE line."""
     import joblite
 
-    script = _LISTENER_SCRIPT.format(repo=REPO_ROOT, db_path=db_path)
+    script = _LISTENER_SCRIPT.format(packages=PACKAGES_ROOT, db_path=db_path)
     proc = subprocess.Popen(
         [sys.executable, "-c", script],
         stdout=subprocess.PIPE,

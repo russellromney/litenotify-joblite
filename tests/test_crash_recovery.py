@@ -37,6 +37,7 @@ import pytest
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PACKAGES_ROOT = os.path.join(REPO_ROOT, "packages")
 
 
 def _spawn(script: str) -> subprocess.Popen:
@@ -107,7 +108,7 @@ def test_sigkill_mid_enqueue_tx_leaves_db_clean(tmp_path):
     script = textwrap.dedent(
         f"""
         import sys, time
-        sys.path.insert(0, {REPO_ROOT!r})
+        sys.path.insert(0, {PACKAGES_ROOT!r})
         import joblite
 
         db = joblite.open({db_path!r})
@@ -163,7 +164,7 @@ def test_sigkill_mid_enqueue_followed_by_concurrent_writer(tmp_path):
     script = textwrap.dedent(
         f"""
         import sys, time
-        sys.path.insert(0, {REPO_ROOT!r})
+        sys.path.insert(0, {PACKAGES_ROOT!r})
         import joblite
 
         db = joblite.open({db_path!r})
@@ -222,7 +223,7 @@ def test_sigkill_mid_honk_tx_delivers_no_notification(tmp_path):
     writer_script = textwrap.dedent(
         f"""
         import sys, time
-        sys.path.insert(0, {REPO_ROOT!r})
+        sys.path.insert(0, {PACKAGES_ROOT!r})
         import joblite as litenotify
 
         db = litenotify.open({db_path!r})
@@ -291,7 +292,7 @@ def test_sigkill_while_listener_preattached_sees_no_leak(tmp_path):
     writer_script = textwrap.dedent(
         f"""
         import sys, time
-        sys.path.insert(0, {REPO_ROOT!r})
+        sys.path.insert(0, {PACKAGES_ROOT!r})
         import joblite as litenotify
 
         db = litenotify.open({db_path!r})

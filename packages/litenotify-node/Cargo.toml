@@ -8,7 +8,7 @@ name = "litenotify_node"
 crate-type = ["cdylib"]
 
 [dependencies]
-litenotify-core = { path = "../litenotify-core" }
+litenotify-core = { path = "../../litenotify-core" }
 napi = { version = "3.2", features = ["async", "serde-json", "tokio_rt"] }
 napi-derive = "3.2"
 parking_lot = "0.12.5"

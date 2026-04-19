@@ -1,8 +1,8 @@
 [workspace]
 members = [
     "litenotify-core",
-    "litenotify",
     "litenotify-extension",
-    "litenotify-node",
+    "packages/litenotify",
+    "packages/litenotify-node",
 ]
 resolver = "2"
