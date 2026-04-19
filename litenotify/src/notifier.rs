@@ -13,10 +13,14 @@
 //!
 //! ## Retention
 //!
-//! The table is a short-term replay buffer, not a durable log. Every
-//! 1000th INSERT prunes rows that are older than 10 seconds OR beyond
-//! the most recent 10,000. For anything that needs longer replay or
-//! per-consumer offsets, use `joblite.Stream`.
+//! The table is meant as a short-term replay buffer. We do NOT prune
+//! it automatically on some magic timer — that's a footgun if the
+//! application ever depends on a slightly longer replay than we
+//! decided was "enough." Pruning is exposed as
+//! `Database.prune_notifications(older_than_s=?, max_keep=?)` so the
+//! user (or their framework's housekeeping layer) decides when and
+//! how much to drop. For anything that needs durable replay or
+//! per-consumer offsets, use `joblite.Stream` instead.
 //!
 //! ## IMPORTANT
 //!
@@ -63,23 +67,7 @@ pub fn attach(conn: &Connection) -> Result<(), Error> {
                 "INSERT INTO _litenotify_notifications (channel, payload) VALUES (?1, ?2)",
             )?;
             let id = ins.insert(rusqlite::params![channel, payload])?;
-
-            // Opportunistic pruning. Keeps the table bounded in size
-            // without needing a background task. `id % 1000 == 0`
-            // gives ~0.1% of notify() calls a small DELETE to run.
-            // Retention window: 10 seconds, OR most recent 10k rows,
-            // whichever leaves fewer rows. Anything past that window
-            // is someone else's problem — point them at
-            // `joblite.Stream` for persistent replay.
-            if id % 1000 == 0 {
-                let mut del = db.prepare_cached(
-                    "DELETE FROM _litenotify_notifications
-                     WHERE created_at < unixepoch() - 10
-                        OR id <= (SELECT MAX(id) - 10000 FROM _litenotify_notifications)",
-                )?;
-                let _ = del.execute([]);
-            }
-
+            // Intentionally no auto-prune. See module docstring.
             Ok(id)
         },
     )?;

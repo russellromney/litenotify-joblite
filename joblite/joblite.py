@@ -815,6 +815,49 @@ class Database:
     def query(self, sql: str, params=None):
         return self._inner.query(sql, params)
 
+    def prune_notifications(
+        self,
+        older_than_s: Optional[int] = None,
+        max_keep: Optional[int] = None,
+    ) -> int:
+        """Delete rows from `_litenotify_notifications`. Returns the
+        number of rows removed.
+
+        Provide one or both of:
+          * `older_than_s`: delete rows older than this many seconds.
+          * `max_keep`: delete rows beyond the most recent N.
+
+        Run whenever you want — on app startup, on a scheduled task,
+        from a Django management command, whatever. This is a tool
+        you invoke, not a background timer. `notify()` never prunes
+        on its own; that's intentional.
+
+        For anything that needs durable replay past ~seconds, use
+        `db.stream(...)` rather than `tx.notify(...)`; the stream's
+        consumer-offset tracking is a better fit than trying to keep
+        the notifications buffer large.
+        """
+        conditions: list = []
+        params: list = []
+        if older_than_s is not None:
+            conditions.append("created_at < unixepoch() - ?")
+            params.append(int(older_than_s))
+        if max_keep is not None:
+            conditions.append(
+                "id <= (SELECT MAX(id) - ? FROM _litenotify_notifications)"
+            )
+            params.append(int(max_keep))
+        if not conditions:
+            return 0
+        with self.transaction() as tx:
+            rows = tx.query(
+                "DELETE FROM _litenotify_notifications WHERE "
+                + " OR ".join(conditions)
+                + " RETURNING id",
+                params,
+            )
+        return len(rows)
+
     def queue(
         self,
         name: str,

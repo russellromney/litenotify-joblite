@@ -170,6 +170,67 @@ async def test_dict_and_list_payloads_json_serialized(db_path):
     assert got[1] == [1, 2, 3]
 
 
+def test_prune_notifications_by_max_keep(db_path):
+    """Pruning is user-invoked; notify() never auto-prunes."""
+    db = litenotify.open(db_path)
+
+    # 100 notifications across 2 channels.
+    for i in range(100):
+        with db.transaction() as tx:
+            tx.notify("ch", f"n{i}")
+
+    before = db.query(
+        "SELECT COUNT(*) AS c FROM _litenotify_notifications"
+    )[0]["c"]
+    assert before == 100, (
+        f"notify() must not auto-prune; expected 100 rows, got {before}"
+    )
+
+    # Keep the most recent 10.
+    deleted = db.prune_notifications(max_keep=10)
+    assert deleted == 90
+
+    after = db.query(
+        "SELECT COUNT(*) AS c FROM _litenotify_notifications"
+    )[0]["c"]
+    assert after == 10
+
+
+def test_prune_notifications_by_age(db_path):
+    db = litenotify.open(db_path)
+
+    # Two old rows (created_at well in the past) and one recent.
+    with db.transaction() as tx:
+        tx.execute(
+            "INSERT INTO _litenotify_notifications "
+            "(channel, payload, created_at) VALUES ('ch','old1', 0)",
+        )
+        tx.execute(
+            "INSERT INTO _litenotify_notifications "
+            "(channel, payload, created_at) VALUES ('ch','old2', 0)",
+        )
+    with db.transaction() as tx:
+        tx.notify("ch", "fresh")
+
+    # Drop anything older than 1 second.
+    deleted = db.prune_notifications(older_than_s=1)
+    assert deleted == 2
+    rows = db.query(
+        "SELECT payload FROM _litenotify_notifications ORDER BY id"
+    )
+    assert [r["payload"] for r in rows] == ["fresh"]
+
+
+def test_prune_notifications_no_args_is_noop(db_path):
+    """Calling prune with nothing configured just returns 0."""
+    db = litenotify.open(db_path)
+    with db.transaction() as tx:
+        tx.notify("ch", "a")
+    assert db.prune_notifications() == 0
+    rows = db.query("SELECT COUNT(*) AS c FROM _litenotify_notifications")
+    assert rows[0]["c"] == 1
+
+
 def test_connection_returned_on_commit_success(db_path):
     """Running many sequential transactions must not exhaust the writer slot."""
     db = litenotify.open(db_path)
