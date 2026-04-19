@@ -86,17 +86,12 @@ To do (requires authenticated repo creation on GitHub):
 
 ### Task queue features (huey parity, minus pipelines)
 
-Completed items (handler timeout, declarative retries, `delay=` kwarg,
-task expiration, named locks, rate-limiting, crontab / periodic
-tasks) are in the CHANGELOG. Remaining:
+All task-queue Batch items (Batch 1 + 2 + crontab + task result
+storage) have shipped. See CHANGELOG for the summary.
 
-- [ ] **Task result storage.** `job.result(timeout=...)` returns the
-  handler's return value. New `_joblite_results(id, value, expires_at)`
-  table, worker UPSERTs on success, caller polls (or awaits a WAL
-  wake, then SELECTs). TTL prune. Opens the door to
-  pipelines/chains/groups later if anyone asks, but keep those
-  **out of scope for v1** — they add real complexity for limited
-  real-world use. ~1 day.
+Pipelines / chains / groups / chords remain **out of scope for v1**
+— the build-it-yourself pattern (task A enqueues task B on success)
+is good enough and avoids the complexity.
 
 ### Bindings
 

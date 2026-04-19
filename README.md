@@ -45,14 +45,16 @@ Today:
 - Handler timeouts, declarative retries with exponential backoff
 - Delayed jobs, task expiration, named locks, rate-limiting
 - Crontab-style periodic tasks with a leader-elected scheduler
+- Opt-in task result storage (`enqueue` returns an id, worker persists the
+  return value, caller awaits `queue.wait_result(id)`)
 - Durable streams with per-consumer offsets and configurable flush interval
 - SQLite loadable extension so any SQLite client can read the same tables
 - Python and Node.js bindings
 
 Planned:
 
-- Task result storage
 - Go and Ruby bindings
+- `joblite-node` TypeScript port of the higher-level API
 - Framework plugins (FastAPI, Django, Flask, Express, Rails) — cut
   for now; the core API is small enough that wiring joblite into
   your web framework is ~20 lines. See `examples/` once it lands.
@@ -149,6 +151,9 @@ SELECT jl_rate_limit_try('api', 10, 60);                 -- 1 = under, 0 = at li
 SELECT jl_rate_limit_sweep(3600);                        -- drop windows >1h old
 SELECT jl_scheduler_record_fire('nightly', unixepoch()); -- UPSERT fire-time
 SELECT jl_scheduler_last_fire('nightly');                -- unix_ts or 0
+SELECT jl_result_save(42, '{"ok":true}', 3600);          -- save w/ 1h TTL
+SELECT jl_result_get(42);                                -- value or NULL
+SELECT jl_result_sweep();                                -- prune expired
 SELECT notify('orders', '{"id":42}');
 ```
 

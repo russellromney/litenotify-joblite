@@ -200,6 +200,12 @@ pub const BOOTSTRAP_JOBLITE_SQL: &str = "
       name TEXT PRIMARY KEY,
       last_fire_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS _joblite_results (
+      job_id INTEGER PRIMARY KEY,
+      value TEXT,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      expires_at INTEGER
+    );
 ";
 
 /// Install the joblite queue schema on `conn`. Idempotent. See
@@ -704,5 +710,18 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(sched_cols, vec!["name", "last_fire_at"]);
+
+        // _joblite_results table for task result storage.
+        let res_cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('_joblite_results')")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            res_cols,
+            vec!["job_id", "value", "created_at", "expires_at"]
+        );
     }
 }

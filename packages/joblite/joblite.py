@@ -227,13 +227,16 @@ class Queue:
         delay: Optional[float] = None,
         priority: int = 0,
         expires: Optional[float] = None,
-    ) -> None:
-        """Insert one job row. When called without `tx=`, opens its
-        own write transaction and fires one notify per call — so a
-        hot loop of 10 k enqueues means 10 k transactions and 10 k
-        wakes. For bulk inserts, pass a shared `tx` and the library
-        will only fire one commit (at the block exit) with one
-        cross-process wake:
+    ) -> int:
+        """Insert one job row. Returns the inserted `id` (primary key
+        in `_joblite_live`), which callers can use to fetch a result
+        later via `queue.get_result(id)` / `queue.wait_result(id)`.
+
+        When called without `tx=`, opens its own write transaction and
+        fires one notify per call — so a hot loop of 10 k enqueues
+        means 10 k transactions and 10 k wakes. For bulk inserts,
+        pass a shared `tx` and the library will only fire one commit
+        (at the block exit) with one cross-process wake:
 
             with db.transaction() as tx:
                 for p in payloads:
@@ -268,29 +271,21 @@ class Queue:
             self.max_attempts,
             expires_at_val,
         ]
-
+        sql = """
+            INSERT INTO _joblite_live
+              (queue, payload, run_at, priority, max_attempts, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            RETURNING id
+        """
         if tx is not None:
-            tx.execute(
-                """
-                INSERT INTO _joblite_live
-                  (queue, payload, run_at, priority, max_attempts, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                params,
-            )
+            rows = tx.query(sql, params)
             tx.notify(self._channel(), "new")
-            return
+            return rows[0]["id"]
 
         with self.db.transaction() as own_tx:
-            own_tx.execute(
-                """
-                INSERT INTO _joblite_live
-                  (queue, payload, run_at, priority, max_attempts, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                params,
-            )
+            rows = own_tx.query(sql, params)
             own_tx.notify(self._channel(), "new")
+            return rows[0]["id"]
 
     def claim_one(self, worker_id: str) -> Optional[Job]:
         jobs = self.claim_batch(worker_id, 1)
@@ -408,6 +403,131 @@ class Queue:
                         r["created_at"],
                     ],
                 )
+        return len(rows)
+
+    # --- result storage -------------------------------------------
+
+    def save_result(
+        self,
+        job_id: int,
+        value: Any,
+        ttl: Optional[float] = None,
+        tx=None,
+    ) -> None:
+        """Store the return value for a completed job under its id.
+        `value` is any JSON-serializable Python value. `ttl` is the
+        expiry in seconds — callers that never fetch the result can
+        set a short ttl to auto-reclaim disk; `None` means no expiry
+        (you're on the hook for pruning via `sweep_results()`).
+
+        UPSERTs — calling twice for the same `job_id` replaces the
+        first. Typical use is inside a worker after handler success,
+        though callers can also call it manually.
+        """
+        value_str = json.dumps(value)
+        ttl_s = int(ttl) if ttl is not None else 0
+        if tx is not None:
+            self._save_result_in_tx(tx, job_id, value_str, ttl_s)
+            return
+        with self.db.transaction() as own_tx:
+            self._save_result_in_tx(own_tx, job_id, value_str, ttl_s)
+
+    @staticmethod
+    def _save_result_in_tx(tx, job_id: int, value_str: str, ttl_s: int) -> None:
+        if ttl_s > 0:
+            tx.execute(
+                """
+                INSERT INTO _joblite_results (job_id, value, expires_at)
+                VALUES (?, ?, unixepoch() + ?)
+                ON CONFLICT(job_id) DO UPDATE
+                  SET value = excluded.value,
+                      expires_at = excluded.expires_at
+                """,
+                [job_id, value_str, ttl_s],
+            )
+        else:
+            tx.execute(
+                """
+                INSERT INTO _joblite_results (job_id, value, expires_at)
+                VALUES (?, ?, NULL)
+                ON CONFLICT(job_id) DO UPDATE
+                  SET value = excluded.value,
+                      expires_at = NULL
+                """,
+                [job_id, value_str],
+            )
+
+    def get_result(self, job_id: int) -> tuple:
+        """Return `(found: bool, value: Any)` for a saved result.
+
+        `(False, None)` means the result hasn't been saved yet OR has
+        expired and been swept. `(True, value)` means we have it;
+        `value` can still be `None` (task legitimately returned None).
+        Two-tuple disambiguates.
+        """
+        rows = self.db.query(
+            """
+            SELECT value, expires_at FROM _joblite_results
+            WHERE job_id = ?
+            """,
+            [job_id],
+        )
+        if not rows:
+            return (False, None)
+        row = rows[0]
+        if row["expires_at"] is not None and row["expires_at"] <= time.time():
+            return (False, None)
+        raw = row["value"]
+        return (True, json.loads(raw) if raw is not None else None)
+
+    async def wait_result(
+        self,
+        job_id: int,
+        timeout: Optional[float] = None,
+    ) -> Any:
+        """Block until a result is saved for `job_id`, then return it.
+
+        Wakes on every WAL commit (any process), so a worker in a
+        different process saving the result is picked up within the
+        stat-poll cadence. `timeout` is in seconds; `None` waits
+        forever. Raises `asyncio.TimeoutError` on expiry.
+        """
+        deadline = time.time() + float(timeout) if timeout is not None else None
+        # Check once before subscribing, in case it's already there.
+        found, value = self.get_result(job_id)
+        if found:
+            return value
+        wal = self.db.wal_events()
+        while True:
+            remaining = (
+                max(0.0, deadline - time.time()) if deadline is not None else 15.0
+            )
+            if deadline is not None and remaining <= 0:
+                raise asyncio.TimeoutError(
+                    f"wait_result({job_id}) timed out"
+                )
+            try:
+                await asyncio.wait_for(wal.__anext__(), timeout=remaining)
+            except asyncio.TimeoutError:
+                if deadline is None:
+                    # Paranoia-poll on the 15s fallback; loop again.
+                    pass
+                else:
+                    raise
+            found, value = self.get_result(job_id)
+            if found:
+                return value
+
+    def sweep_results(self) -> int:
+        """Delete all expired result rows. Returns count deleted."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                """
+                DELETE FROM _joblite_results
+                WHERE expires_at IS NOT NULL AND expires_at <= unixepoch()
+                RETURNING job_id
+                """,
+            )
         return len(rows)
 
     def ack(self, job_id: int, worker_id: str) -> bool:

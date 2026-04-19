@@ -195,6 +195,44 @@ fn install_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
+    // jl_result_save(job_id, value_json, ttl_s) -> 1
+    // ttl_s=0 means no expiration (NULL expires_at).
+    conn.create_scalar_function(
+        "jl_result_save",
+        3,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let job_id: i64 = ctx.get(0)?;
+            let value: String = ctx.get(1)?;
+            let ttl_s: i64 = ctx.get(2)?;
+            let db = unsafe { ctx.get_connection() }?;
+            result_save(&db, job_id, &value, ttl_s).map_err(to_sql_err)
+        },
+    )?;
+
+    // jl_result_get(job_id) -> value_json or NULL (row absent or expired)
+    conn.create_scalar_function(
+        "jl_result_get",
+        1,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let job_id: i64 = ctx.get(0)?;
+            let db = unsafe { ctx.get_connection() }?;
+            result_get(&db, job_id).map_err(to_sql_err)
+        },
+    )?;
+
+    // jl_result_sweep() -> count expired rows deleted
+    conn.create_scalar_function(
+        "jl_result_sweep",
+        0,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let db = unsafe { ctx.get_connection() }?;
+            result_sweep(&db).map_err(to_sql_err)
+        },
+    )?;
+
     Ok(())
 }
 
@@ -457,6 +495,77 @@ fn scheduler_last_fire(conn: &Connection, name: &str) -> rusqlite::Result<i64> {
             |r| r.get(0),
         )
         .unwrap_or(0))
+}
+
+/// Save a task's return value keyed by its job id. `ttl_s=0` or
+/// negative means no expiration (expires_at = NULL). UPSERTs, so
+/// a worker saving twice for the same job_id replaces the first.
+fn result_save(
+    conn: &Connection,
+    job_id: i64,
+    value: &str,
+    ttl_s: i64,
+) -> rusqlite::Result<i64> {
+    let expires_at: Option<i64> = if ttl_s > 0 {
+        Some(ttl_s)  // treated as relative, turned absolute in SQL below
+    } else {
+        None
+    };
+    match expires_at {
+        Some(rel) => conn.execute(
+            "INSERT INTO _joblite_results (job_id, value, expires_at)
+             VALUES (?1, ?2, unixepoch() + ?3)
+             ON CONFLICT(job_id) DO UPDATE
+               SET value = excluded.value,
+                   expires_at = excluded.expires_at",
+            rusqlite::params![job_id, value, rel],
+        )?,
+        None => conn.execute(
+            "INSERT INTO _joblite_results (job_id, value, expires_at)
+             VALUES (?1, ?2, NULL)
+             ON CONFLICT(job_id) DO UPDATE
+               SET value = excluded.value,
+                   expires_at = NULL",
+            rusqlite::params![job_id, value],
+        )?,
+    };
+    Ok(1)
+}
+
+/// Fetch a saved result. Returns the stored value text, or NULL
+/// (Option::None) if the row doesn't exist OR has expired. Callers
+/// can't distinguish "result was stored as null-string" from "no
+/// result" from this function alone — store values as JSON and
+/// interpret null appropriately.
+fn result_get(conn: &Connection, job_id: i64) -> rusqlite::Result<Option<String>> {
+    let row: Option<(Option<String>, Option<i64>)> = conn
+        .query_row(
+            "SELECT value, expires_at FROM _joblite_results WHERE job_id = ?1",
+            rusqlite::params![job_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    match row {
+        None => Ok(None),
+        Some((_, Some(exp))) if exp <= now_unix(conn)? => Ok(None),
+        Some((value, _)) => Ok(value),
+    }
+}
+
+fn now_unix(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT unixepoch()", [], |r| r.get(0))
+}
+
+/// Delete expired result rows. Returns count deleted. Call on a
+/// schedule; result storage is disk-space only so this isn't
+/// correctness-critical.
+fn result_sweep(conn: &Connection) -> rusqlite::Result<i64> {
+    let deleted = conn.execute(
+        "DELETE FROM _joblite_results
+         WHERE expires_at IS NOT NULL AND expires_at <= unixepoch()",
+        [],
+    )?;
+    Ok(deleted as i64)
 }
 
 struct ClaimedRow {

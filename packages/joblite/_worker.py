@@ -35,13 +35,22 @@ async def run_task(
     retries: Optional[int] = None,
     retry_delay: float = 60.0,
     backoff: float = 1.0,
+    save_result: bool = False,
+    result_ttl: Optional[float] = 3600.0,
 ) -> None:
     """Execute `handler(job.payload)` with the given retry policy.
 
-    On success: job.ack().
+    On success: job.ack(). If `save_result=True`, also persists the
+    handler's return value to `_joblite_results` via
+    `queue.save_result(job.id, value, ttl=result_ttl)` before the
+    ack, so a caller awaiting `queue.wait_result(job.id)` will
+    receive the value on their next WAL wake.
+
     On timeout or exception: job.retry(delay) unless `retries` is set
     and the job has reached that attempt count, in which case
-    job.fail() moves the row to _joblite_dead.
+    job.fail() moves the row to _joblite_dead. Results are not saved
+    on failure — callers should treat a missing result as "did not
+    complete successfully."
 
     Retryable is honored as a handler-driven retry with a
     caller-chosen delay, bypassing `retry_delay` / `backoff`.
@@ -52,15 +61,19 @@ async def run_task(
     try:
         if asyncio.iscoroutinefunction(handler):
             if timeout is not None:
-                await asyncio.wait_for(handler(job.payload), timeout=timeout)
+                result = await asyncio.wait_for(
+                    handler(job.payload), timeout=timeout
+                )
             else:
-                await handler(job.payload)
+                result = await handler(job.payload)
         else:
             # Sync handlers don't get wall-clock timeout enforcement —
             # asyncio can't interrupt a blocking sync call. We run and
             # hope. Users who want a hard deadline on a sync handler
             # should wrap it themselves or switch to async.
-            handler(job.payload)
+            result = handler(job.payload)
+        if save_result:
+            job.queue.save_result(job.id, result, ttl=result_ttl)
         job.ack()
     except asyncio.CancelledError:
         # Let the worker-loop unwind. Don't ack / retry — the job's

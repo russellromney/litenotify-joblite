@@ -1,5 +1,75 @@
 # CHANGELOG
 
+## Unreleased — task result storage
+
+Workers can now persist a handler's return value, and callers can
+await the result by job id. Extension-first — the SQL functions
+exist in `liblitenotify_ext` so any SQLite client can use them;
+Python wraps the same behavior.
+
+### Schema
+
+New `_joblite_results(job_id PRIMARY KEY, value TEXT, created_at,
+expires_at)` table in `BOOTSTRAP_JOBLITE_SQL`. Core test pins its
+column layout.
+
+### Extension SQL functions
+
+- `jl_result_save(job_id, value_json, ttl_s)` — UPSERTs. ttl_s=0
+  means no expiration.
+- `jl_result_get(job_id)` — returns value text or NULL (row absent
+  or expired).
+- `jl_result_sweep()` — deletes expired rows, returns count.
+
+### Python API
+
+- `Queue.enqueue(...)` now returns the inserted `id: int`. Callers
+  that previously discarded the return value are unaffected.
+- `Queue.save_result(job_id, value, ttl=None, tx=None)` — UPSERT
+  via the same table. Accepts a `tx=` so a worker can save the
+  result atomically with its ack if it wants to.
+- `Queue.get_result(job_id) -> (found: bool, value: Any)` —
+  two-tuple disambiguates "None result saved" from "no result".
+- `Queue.wait_result(job_id, timeout=None) -> value` — async,
+  blocks until saved; wakes on WAL commit so a worker in another
+  process finishing the job gets the caller's attention within the
+  stat-poll cadence. Raises `asyncio.TimeoutError` on expiry.
+- `Queue.sweep_results()` — disk-space reclaim.
+
+### Worker integration
+
+`joblite._worker.run_task` gains `save_result=False` (default off)
+and `result_ttl=3600.0`. When enabled, a successful handler's return
+value is persisted via `queue.save_result(job.id, value, ttl=...)`
+before the ack. Failed handlers save nothing — callers treat
+missing-result as did-not-complete.
+
+### Interop guarantees
+
+Extension interop tests pin:
+- Extension save → Python read; Python save → Extension read.
+- Expired rows filter correctly on both sides.
+- UPSERT semantics match.
+
+### Why opt-in
+
+Result storage invites RPC-style patterns; the library's main design
+is "enqueue a side effect, worker runs it." `save_result` stays
+`False` by default so callers who don't need the RPC shape don't pay
+the per-job UPSERT cost. Callers who do need it flip one kwarg.
+
+### Tests
+
+tests/test_task_results.py — 17 tests: enqueue-returns-id, save/get
+round trip, UPSERT, rollback inside user tx, expired-filter + sweep,
+wait_result immediate / blocks / timeout, run_task integration (on /
+off / failed-handler cases), full enqueue→worker→wait_result e2e.
+
+tests/test_extension_interop.py — 5 new tests covering the new
+`jl_result_*` functions plus cross-side interop with Python.
+
+166/166 tests pass under parallel pytest.
+
 ## Unreleased — extension SQL for Batch 2 + scheduler features
 
 Every feature we added in Batches 2.1-2.3 plus the crontab

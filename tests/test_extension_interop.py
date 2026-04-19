@@ -396,3 +396,97 @@ def test_extension_scheduler_interops_with_python(ext_db_path):
         "SELECT jl_scheduler_last_fire('t')"
     ).fetchone()[0] == 1700000000
     conn.close()
+
+
+# ---------- jl_result_save / jl_result_get / jl_result_sweep ----------
+
+
+@pytest.mark.skipif(_EXT_PATH is None, reason=_SKIP_REASON)
+def test_extension_result_save_and_get(ext_db_path):
+    conn = _open_ext(ext_db_path)
+    # ttl=0 means no expiration.
+    conn.execute("SELECT jl_result_save(1, '{\"ok\":true}', 0)")
+    conn.commit()
+
+    row = conn.execute("SELECT jl_result_get(1)").fetchone()[0]
+    assert row == '{"ok":true}'
+
+    # Missing id returns NULL.
+    row = conn.execute("SELECT jl_result_get(999)").fetchone()[0]
+    assert row is None
+    conn.close()
+
+
+@pytest.mark.skipif(_EXT_PATH is None, reason=_SKIP_REASON)
+def test_extension_result_save_upserts(ext_db_path):
+    """Second save for the same id replaces the first."""
+    conn = _open_ext(ext_db_path)
+    conn.execute("SELECT jl_result_save(42, '\"first\"', 0)")
+    conn.execute("SELECT jl_result_save(42, '\"second\"', 0)")
+    conn.commit()
+
+    row = conn.execute("SELECT jl_result_get(42)").fetchone()[0]
+    assert row == '"second"'
+    conn.close()
+
+
+@pytest.mark.skipif(_EXT_PATH is None, reason=_SKIP_REASON)
+def test_extension_result_get_filters_expired(ext_db_path):
+    """Extension get() returns NULL for a row whose expires_at has
+    passed (same filter semantics as Python's `get_result`)."""
+    conn = _open_ext(ext_db_path)
+    conn.execute(
+        "INSERT INTO _joblite_results (job_id, value, expires_at) "
+        "VALUES (7, '\"stale\"', unixepoch() - 10)"
+    )
+    conn.commit()
+
+    assert conn.execute("SELECT jl_result_get(7)").fetchone()[0] is None
+    # Row still present until sweep.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM _joblite_results"
+    ).fetchone()[0] == 1
+    assert conn.execute("SELECT jl_result_sweep()").fetchone()[0] == 1
+    conn.commit()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM _joblite_results"
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+@pytest.mark.skipif(_EXT_PATH is None, reason=_SKIP_REASON)
+def test_extension_result_ttl_absolute(ext_db_path):
+    """ttl_s>0 is interpreted as seconds-from-now; the extension
+    stores `unixepoch() + ttl_s` as expires_at."""
+    conn = _open_ext(ext_db_path)
+    conn.execute("SELECT jl_result_save(1, '\"x\"', 3600)")
+    conn.commit()
+
+    exp = conn.execute(
+        "SELECT expires_at FROM _joblite_results WHERE job_id=1"
+    ).fetchone()[0]
+    now = conn.execute("SELECT unixepoch()").fetchone()[0]
+    assert 3598 <= exp - now <= 3602
+    conn.close()
+
+
+@pytest.mark.skipif(_EXT_PATH is None, reason=_SKIP_REASON)
+def test_extension_result_interops_with_python(ext_db_path):
+    """Extension-side save is readable from Python and vice versa —
+    one `_joblite_results` table."""
+    db = joblite.open(ext_db_path)
+    q = db.queue("interop-results")
+
+    conn = _open_ext(ext_db_path)
+    conn.execute("SELECT jl_result_save(100, '{\"from\":\"ext\"}', 0)")
+    conn.commit()
+
+    # Python reads extension's write.
+    found, value = q.get_result(100)
+    assert found and value == {"from": "ext"}
+
+    # Python writes, extension reads.
+    q.save_result(200, {"from": "py"})
+    row = conn.execute("SELECT jl_result_get(200)").fetchone()[0]
+    assert row == '{"from": "py"}'
+    conn.close()
