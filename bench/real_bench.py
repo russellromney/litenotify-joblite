@@ -100,7 +100,6 @@ def worker_script(
     db_path: str,
     worker_id: str,
     queue: str,
-    batch: int,
     idle_poll_s: float,
     lat_file: str,
 ) -> str:
@@ -123,7 +122,6 @@ def worker_script(
             with open({lat_file!r}, "ab", buffering=0) as f:
                 async for job in q.claim(
                     {worker_id!r},
-                    batch_size={batch},
                     idle_poll_s={idle_poll_s},
                 ):
                     payload = job.payload
@@ -195,7 +193,6 @@ def run_bench(
     duration_s: float,
     rate_per_enqueuer: int,
     queue_name: str,
-    batch_size: int,
     idle_poll_s: float,
 ) -> dict:
     # One latency file per worker. Binary-packed doubles -- workers
@@ -216,7 +213,6 @@ def run_bench(
                 db_path,
                 f"worker-{i}",
                 queue_name,
-                batch_size,
                 idle_poll_s,
                 lat_files[i],
             )
@@ -324,7 +320,6 @@ def main():
         default=0,
         help="Jobs per second per enqueuer (0 = as fast as possible)",
     )
-    ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument(
         "--idle-poll-s",
         type=float,
@@ -353,7 +348,7 @@ def main():
     sys.path.insert(0, REPO_ROOT)
 
     print(f"Config: {args.workers} workers, {args.enqueuers} enqueuers, "
-          f"{args.seconds}s, batch={args.batch_size}, "
+          f"{args.seconds}s, "
           f"rate/enq={args.rate_per_enqueuer or 'unlimited'}")
     print()
 
@@ -381,7 +376,6 @@ def main():
                     duration_s=args.seconds,
                     rate_per_enqueuer=args.rate_per_enqueuer,
                     queue_name=args.queue,
-                    batch_size=args.batch_size,
                     idle_poll_s=args.idle_poll_s,
                 )
                 print(fmt(result))

@@ -118,6 +118,132 @@ async def test_subscribe_with_named_consumer_resumes(db_path):
     assert got == [3, 4]
 
 
+async def test_named_consumer_auto_saves_offset_every_n_events(db_path):
+    """`subscribe(consumer=..., save_every_n=N)` flushes the offset
+    every N yielded events through a single UPSERT, instead of per-event.
+    The saved offset lags the last-yielded offset by up to N-1.
+    """
+    db = joblite.open(db_path)
+    s = db.stream("autosave")
+    for i in range(25):
+        s.publish({"i": i})
+
+    # Small n, huge s — force count-based saves.
+    async def consume():
+        got = []
+        async for event in s.subscribe(
+            consumer="c1", save_every_n=10, save_every_s=9999
+        ):
+            got.append(event.payload["i"])
+            if len(got) == 25:
+                return
+
+    await asyncio.wait_for(consume(), timeout=3.0)
+
+    # After yielding all 25 events, saves happened at events 10 and 20.
+    # Event 25's offset is pending (not saved yet because threshold not hit).
+    saved = s.get_offset("c1")
+    assert saved == 20, (
+        f"expected saved offset at 20 (event 20 = offset 20), got {saved}"
+    )
+
+
+async def test_named_consumer_auto_saves_offset_every_s_seconds(db_path):
+    """Time-based threshold: even a low-volume stream flushes within
+    save_every_s. Using 0.1s + small N so the time path triggers.
+    """
+    db = joblite.open(db_path)
+    s = db.stream("autosave-time")
+
+    async def consume():
+        got = []
+        async for event in s.subscribe(
+            consumer="c2", save_every_n=9999, save_every_s=0.1
+        ):
+            got.append(event.payload["i"])
+            # Small sleep between iterations so ≥100ms elapses across
+            # two iterations, triggering a time-based save.
+            await asyncio.sleep(0.12)
+            if len(got) == 3:
+                return
+
+    for i in range(3):
+        s.publish({"i": i})
+
+    await asyncio.wait_for(consume(), timeout=3.0)
+
+    # The time threshold is hit between events; by the end of the loop,
+    # at least offset 1 or 2 is saved (depending on which iteration
+    # crossed 100ms first).
+    saved = s.get_offset("c2")
+    assert saved >= 1, f"expected time-based save, got saved={saved}"
+
+
+async def test_named_consumer_auto_save_disabled(db_path):
+    """save_every_n=0 and save_every_s=0 disables auto-save. The
+    consumer row stays at its initial offset even after many events."""
+    db = joblite.open(db_path)
+    s = db.stream("no-autosave")
+    for i in range(50):
+        s.publish({"i": i})
+
+    async def consume():
+        got = []
+        async for event in s.subscribe(
+            consumer="c3", save_every_n=0, save_every_s=0.0
+        ):
+            got.append(event.payload["i"])
+            if len(got) == 50:
+                return
+
+    await asyncio.wait_for(consume(), timeout=3.0)
+
+    # No auto-save means the consumer row never advanced.
+    assert s.get_offset("c3") == 0
+
+
+async def test_named_consumer_crash_replays_from_last_saved_offset(db_path):
+    """At-least-once semantics: the saved offset always lags the last
+    yielded event, so a handler crash re-delivers in-flight events on
+    reconnect.
+    """
+    db = joblite.open(db_path)
+    s = db.stream("crash")
+    for i in range(15):
+        s.publish({"i": i})
+
+    # First consumer processes 12 events then "crashes."
+    async def first():
+        got = []
+        async for event in s.subscribe(
+            consumer="crashy", save_every_n=5, save_every_s=9999
+        ):
+            got.append(event.payload["i"])
+            if len(got) == 12:
+                return got
+
+    got1 = await asyncio.wait_for(first(), timeout=3.0)
+    assert got1 == list(range(12))
+
+    # Saved offset is at event 10 (save_every_n=5 fires after events 5
+    # and 10). Events 11 and 12 were yielded but not flushed.
+    assert s.get_offset("crashy") == 10
+
+    # Second consumer reconnects with the same name — replays from
+    # offset 10, so events 11-15 come through.
+    async def second():
+        got = []
+        async for event in s.subscribe(
+            consumer="crashy", save_every_n=5, save_every_s=9999
+        ):
+            got.append(event.payload["i"])
+            if len(got) == 5:
+                return got
+
+    got2 = await asyncio.wait_for(second(), timeout=3.0)
+    assert got2 == [10, 11, 12, 13, 14]
+
+
 async def test_two_consumers_at_different_offsets(db_path):
     db = joblite.open(db_path)
     s = db.stream("events")

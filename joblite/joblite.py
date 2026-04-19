@@ -118,13 +118,6 @@ class Job:
         "max_attempts",
         "last_error",
         "created_at",
-        # Iterator that owns this Job, if any. When set, `ack()` defers
-        # the UPDATE into the next claim's transaction (pipelined), which
-        # halves the tx count for the common async-iterator worker loop.
-        # `claim_one()` / `claim_batch()` leave this None so direct
-        # callers still get the per-tx semantics (and an accurate bool
-        # return from ack).
-        "_iter",
     )
 
     # Sentinel distinguishing "payload decoded to None" from "not yet decoded".
@@ -133,16 +126,11 @@ class Job:
     def __init__(self, queue: "Queue", row: dict):
         # `row` comes from the claim UPDATE's RETURNING. The narrow claim
         # path only returns hot-path fields (id, queue, payload, worker_id,
-        # attempts, claim_expires_at) because the other columns are rarely
-        # accessed and cost a noticeable chunk per claim. Fields not in the
-        # row default to sensible post-claim values; if code actually reads
-        # one of those attributes, the value is still meaningful.
+        # attempts, claim_expires_at); other columns default to sensible
+        # post-claim values.
         self.queue = queue
         self.id = row["id"]
         self.queue_name = row["queue"]
-        # Lazy JSON decode: handlers that only need id/worker_id/state skip
-        # the parse entirely. Matters at claim_batch(128) where decoding
-        # 128 payloads on every batch is visible in the hot path.
         self._payload_raw = row["payload"]
         self._payload = Job._UNSET
         self.worker_id = row["worker_id"]
@@ -155,7 +143,6 @@ class Job:
         self.max_attempts = row.get("max_attempts", queue.max_attempts)
         self.last_error = row.get("last_error", None)
         self.created_at = row.get("created_at", 0)
-        self._iter = None
 
     @property
     def payload(self) -> Any:
@@ -166,13 +153,11 @@ class Job:
         return self._payload
 
     def ack(self) -> bool:
-        if self._iter is not None:
-            # Deferred ack: the iterator will flush this id inside the
-            # next claim's transaction. Optimistic True is safe because
-            # the pipeline executes within milliseconds of the claim, so
-            # the visibility window hasn't elapsed.
-            self._iter._pending_acks.append(self.id)
-            return True
+        """DELETE the row if the caller's claim is still valid. Returns
+        True iff the claim hadn't expired. Always goes through one write
+        transaction; no deferred / pipelined batching. If you want batched
+        ack, call `queue.ack_batch([ids], worker_id)` directly.
+        """
         return self.queue.ack(self.id, self.worker_id)
 
     def retry(self, delay_s: int = 60, error: str = "") -> bool:
@@ -316,38 +301,6 @@ class Queue:
             )
         return [Job(self, row) for row in rows]
 
-    def ack_and_claim_batch(
-        self, ack_ids, worker_id: str, n: int
-    ) -> list:
-        """One transaction: ack `ack_ids` (if any) then claim up to `n`
-        new jobs. Used by the async iterator to pipeline the previous
-        batch's ack with the next batch's claim.
-        """
-        n = int(n)
-        if n <= 0 and not ack_ids:
-            return []
-        with self.db.transaction() as tx:
-            if ack_ids:
-                # ack = DELETE from live. 'done' is not a stored state;
-                # the row simply stops existing in _joblite_live and
-                # drops out of the partial claim index.
-                tx.execute(
-                    """
-                    DELETE FROM _joblite_live
-                    WHERE id IN (SELECT value FROM json_each(?))
-                      AND worker_id = ?
-                      AND claim_expires_at >= unixepoch()
-                    """,
-                    [json.dumps([int(i) for i in ack_ids]), worker_id],
-                )
-            if n <= 0:
-                return []
-            rows = tx.query(
-                self._CLAIM_SQL,
-                [worker_id, self.visibility_timeout_s, self.name, n],
-            )
-        return [Job(self, row) for row in rows]
-
     def ack_batch(self, job_ids, worker_id: str) -> int:
         """Ack multiple jobs in one tx. Returns count of jobs whose claim
         was still valid."""
@@ -371,9 +324,16 @@ class Queue:
         self,
         worker_id: str,
         idle_poll_s: float = 5.0,
-        batch_size: int = 32,
     ) -> AsyncIterator[Job]:
-        return _WorkerQueueIter(self, worker_id, idle_poll_s, batch_size)
+        """Async iterator over this queue. Yields one claimed Job per
+        `__anext__` via a single-row `claim_batch(worker_id, 1)` — one
+        write transaction per job. Wakes on WAL commit from any process;
+        `idle_poll_s` is a paranoia fallback for environments where the
+        stat watcher can't fire.
+
+        For batched claims, call `claim_batch(worker_id, n)` directly.
+        """
+        return _WorkerQueueIter(self, worker_id, idle_poll_s)
 
     def ack(self, job_id: int, worker_id: str) -> bool:
         with self.db.transaction() as tx:
@@ -650,20 +610,52 @@ class Stream:
         self,
         consumer: Optional[str] = None,
         from_offset: Optional[int] = None,
+        save_every_n: int = 1000,
+        save_every_s: float = 1.0,
     ) -> AsyncIterator[Event]:
-        """Yield events with offset > from_offset, then live events as they
-        arrive. If `consumer` is given and `from_offset` is None, the last
-        saved offset for that consumer is used.
+        """Yield events with offset > from_offset, then live events as
+        they arrive. If `consumer` is given and `from_offset` is None,
+        the last saved offset for that consumer is used.
+
+        When `consumer` is set, the iterator auto-saves offset to
+        `_joblite_stream_consumers` on a cadence: at most every
+        `save_every_n` yielded events or every `save_every_s` seconds,
+        whichever comes first. This amortizes the offset-save write
+        across many events — critical because every `save_offset` is
+        an UPSERT through the single-writer slot.
+
+        Set `save_every_n=0` and `save_every_s=0` to disable auto-save
+        entirely; then call `stream.save_offset(consumer, offset)`
+        yourself, optionally inside a business transaction.
+
+        At-least-once: the save flushes BEFORE yielding the next event,
+        so a crash during handler execution means the in-flight event
+        is re-delivered on reconnect. Up to `save_every_n` events (or
+        `save_every_s` seconds' worth) may be re-delivered after a
+        crash — tune to taste.
         """
         if from_offset is None and consumer is not None:
             from_offset = self.get_offset(consumer)
         if from_offset is None:
             from_offset = 0
-        return _StreamIter(self, int(from_offset))
+        return _StreamIter(
+            self,
+            int(from_offset),
+            consumer=consumer,
+            save_every_n=int(save_every_n),
+            save_every_s=float(save_every_s),
+        )
 
 
 class _StreamIter:
-    def __init__(self, stream: Stream, from_offset: int):
+    def __init__(
+        self,
+        stream: Stream,
+        from_offset: int,
+        consumer: Optional[str] = None,
+        save_every_n: int = 1000,
+        save_every_s: float = 1.0,
+    ):
         self.stream = stream
         self.offset = from_offset
         # `deque` for O(1) popleft; `list.pop(0)` was O(n) per yield which
@@ -674,15 +666,48 @@ class _StreamIter:
         # on every commit (any process), so it covers both same-process
         # and cross-process publishers.
         self._wal = stream.db.wal_events()
+        # Offset auto-save bookkeeping.
+        self._consumer = consumer
+        self._save_every_n = max(0, save_every_n)
+        self._save_every_s = max(0.0, save_every_s)
+        # Highest offset yielded that hasn't been flushed to
+        # _joblite_stream_consumers yet. Flushed on threshold crossing
+        # inside __anext__, before yielding the next event.
+        self._pending_save_offset = 0
+        self._events_since_save = 0
+        self._last_save_at = time.monotonic()
 
     def __aiter__(self):
         return self
 
+    def _maybe_save_offset(self) -> None:
+        if not self._consumer or self._pending_save_offset <= 0:
+            return
+        count_hit = (
+            self._save_every_n > 0
+            and self._events_since_save >= self._save_every_n
+        )
+        time_hit = (
+            self._save_every_s > 0
+            and (time.monotonic() - self._last_save_at) >= self._save_every_s
+        )
+        if count_hit or time_hit:
+            self.stream.save_offset(self._consumer, self._pending_save_offset)
+            self._events_since_save = 0
+            self._last_save_at = time.monotonic()
+
     async def __anext__(self):
         while True:
             if self._buffer:
+                # Flush BEFORE yielding the next event. A crash during
+                # the user's handler rolls back in-progress work; the
+                # saved offset is never ahead of "last handler success",
+                # giving honest at-least-once semantics.
+                self._maybe_save_offset()
                 row = self._buffer.popleft()
                 self.offset = row["offset"]
+                self._pending_save_offset = self.offset
+                self._events_since_save += 1
                 return Event(row)
 
             rows = self.stream._read_since(self.offset)
@@ -890,70 +915,31 @@ def open(path: str, max_readers: int = 8) -> Database:
 
 
 class _WorkerQueueIter:
-    """Async iterator that yields jobs one at a time but claims them in
-    batches of `batch_size`. One write transaction per batch amortizes the
-    per-tx overhead across many jobs.
+    """Async iterator for `queue.claim()`. Yields one job at a time via
+    `claim_batch(worker_id, 1)`. One write transaction per job.
 
-    Pipelines ack-of-previous with claim-of-next: `Job.ack()` on
-    jobs yielded from this iterator defers into `_pending_acks`, and the
-    next batch's claim transaction flushes them in the same tx. Halves
-    the write-tx count per job for the common worker pattern
-    (`async for job in q.claim(...): handle(job); job.ack()`).
-
-    Wake when the queue is empty:
-      1. WAL-file watcher (`db.wal_events()`): ~1ms wake when ANY
-         process commits. A background stat-poll thread watches the
-         `.db-wal` file's (size, mtime); the shared watcher fans out
-         to every subscriber. Wake fires per commit — we re-poll the
-         queue; over-triggering is cheap (indexed SELECT on a
-         partial-index row set).
-      2. `idle_poll_s` timeout: last-resort safety net if the WAL
-         watcher can't fire (sandboxed FS, odd container mount, etc).
+    Wake sources when the queue is empty:
+      1. WAL-file watcher (`db.wal_events()`): ~1ms wake on any commit
+         to this database from any process. The shared watcher fans
+         out to every subscriber; over-triggering is cheap.
+      2. `idle_poll_s` timeout: paranoia fallback if the WAL watcher
+         can't fire (sandboxed FS, odd container mount).
     """
 
-    def __init__(
-        self,
-        queue: Queue,
-        worker_id: str,
-        idle_poll_s: float,
-        batch_size: int = 32,
-    ):
+    def __init__(self, queue: Queue, worker_id: str, idle_poll_s: float):
         self.queue = queue
         self.worker_id = worker_id
         self.idle_poll_s = idle_poll_s
-        self.batch_size = max(1, int(batch_size))
-        self._listener = None
         self._wal = None
-        # Deque for O(1) popleft; list.pop(0) was O(n) per yield which
-        # compounded at batch_size=128 (~128x worse than batch=8 before).
-        self._buffer: deque = deque()
-        # Ids from previously-yielded jobs that the user has ack'd.
-        # Flushed inside the next claim transaction via
-        # `ack_and_claim_batch`.
-        self._pending_acks: list = []
 
     def __aiter__(self):
         return self
 
     async def __anext__(self):
         while True:
-            if self._buffer:
-                return self._buffer.popleft()
-            batch = self.queue.ack_and_claim_batch(
-                self._pending_acks, self.worker_id, self.batch_size
-            )
-            self._pending_acks = []
-            if batch:
-                for job in batch:
-                    job._iter = self
-                self._buffer.extend(batch)
-                continue
-            # Queue drained. Block on the WAL file watcher — wakes on
-            # every commit, any process. Covers in-process enqueuers
-            # (their commit appends to this DB's WAL too) AND
-            # cross-process enqueuers. `idle_poll_s` is a paranoia
-            # fallback for sandboxed filesystems where the stat-poll
-            # thread can't observe mtime changes reliably.
+            jobs = self.queue.claim_batch(self.worker_id, 1)
+            if jobs:
+                return jobs[0]
             if self._wal is None:
                 self._wal = self.queue.db.wal_events()
             try:
