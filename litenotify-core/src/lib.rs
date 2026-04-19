@@ -167,7 +167,8 @@ pub const BOOTSTRAP_JOBLITE_SQL: &str = "
       claim_expires_at INTEGER,
       attempts INTEGER NOT NULL DEFAULT 0,
       max_attempts INTEGER NOT NULL DEFAULT 3,
-      created_at INTEGER NOT NULL DEFAULT (unixepoch())
+      created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+      expires_at INTEGER
     );
     CREATE INDEX IF NOT EXISTS _joblite_live_claim
       ON _joblite_live(queue, priority DESC, run_at, id)
@@ -621,7 +622,7 @@ mod tests {
         // Idempotent.
         bootstrap_joblite_schema(&conn).unwrap();
 
-        // _joblite_live has the 11 columns we expect (Python binding
+        // _joblite_live has the 12 columns we expect (Python binding
         // and the extension have historically disagreed on _joblite_dead
         // column count; this pins both).
         let live_cols: Vec<String> = conn
@@ -631,7 +632,8 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(live_cols.len(), 11);
+        assert_eq!(live_cols.len(), 12);
+        assert!(live_cols.contains(&"expires_at".to_string()));
 
         let dead_cols: Vec<String> = conn
             .prepare("SELECT name FROM pragma_table_info('_joblite_dead')")

@@ -225,6 +225,7 @@ class Queue:
         run_at: Optional[int] = None,
         delay: Optional[float] = None,
         priority: int = 0,
+        expires: Optional[float] = None,
     ) -> None:
         """Insert one job row. When called without `tx=`, opens its
         own write transaction and fires one notify per call — so a
@@ -243,6 +244,10 @@ class Queue:
           - `delay`:  seconds from now. Shorthand for
                       `run_at = time.time() + delay`. If both are
                       passed, `delay` wins.
+          - `expires`: seconds from now after which this job is no
+                      longer eligible for claim. Claim path filters
+                      expired rows; `queue.sweep_expired()` moves
+                      them into `_joblite_dead`.
         """
         if delay is not None:
             run_at_val = int(time.time() + float(delay))
@@ -250,14 +255,25 @@ class Queue:
             run_at_val = int(run_at)
         else:
             run_at_val = int(time.time())
+        expires_at_val = (
+            int(time.time() + float(expires)) if expires is not None else None
+        )
         payload_str = json.dumps(payload)
-        params = [self.name, payload_str, run_at_val, int(priority), self.max_attempts]
+        params = [
+            self.name,
+            payload_str,
+            run_at_val,
+            int(priority),
+            self.max_attempts,
+            expires_at_val,
+        ]
 
         if tx is not None:
             tx.execute(
                 """
-                INSERT INTO _joblite_live (queue, payload, run_at, priority, max_attempts)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO _joblite_live
+                  (queue, payload, run_at, priority, max_attempts, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 params,
             )
@@ -267,8 +283,9 @@ class Queue:
         with self.db.transaction() as own_tx:
             own_tx.execute(
                 """
-                INSERT INTO _joblite_live (queue, payload, run_at, priority, max_attempts)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO _joblite_live
+                  (queue, payload, run_at, priority, max_attempts, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 params,
             )
@@ -282,6 +299,10 @@ class Queue:
     # index `_joblite_live_claim` covers the subquery. State transition
     # pending -> processing stays inside the partial WHERE so the row
     # doesn't drop out of the index mid-UPDATE.
+    #
+    # `expires_at IS NULL OR expires_at > unixepoch()` filters jobs that
+    # have already expired out of the claim path. Expired rows stay in
+    # _joblite_live until `sweep_expired()` moves them to _joblite_dead.
     _CLAIM_SQL = """
         UPDATE _joblite_live
         SET state = 'processing',
@@ -292,6 +313,7 @@ class Queue:
           SELECT id FROM _joblite_live
           WHERE queue = ?
             AND state IN ('pending', 'processing')
+            AND (expires_at IS NULL OR expires_at > unixepoch())
             AND ((state = 'pending' AND run_at <= unixepoch())
               OR (state = 'processing' AND claim_expires_at < unixepoch()))
           ORDER BY priority DESC, run_at ASC, id ASC
@@ -346,6 +368,46 @@ class Queue:
         For batched claims, call `claim_batch(worker_id, n)` directly.
         """
         return _WorkerQueueIter(self, worker_id, idle_poll_s)
+
+    def sweep_expired(self) -> int:
+        """Move rows whose `expires_at` has passed from `_joblite_live`
+        into `_joblite_dead` with `last_error='expired'`. The claim path
+        already ignores expired rows, so sweep is cleanup-only — not
+        correctness-critical. Call on a schedule if you enqueue jobs
+        with `expires=` and want to reclaim the table space.
+
+        Returns the number of rows moved.
+        """
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                """
+                DELETE FROM _joblite_live
+                WHERE queue = ?
+                  AND state = 'pending'
+                  AND expires_at IS NOT NULL
+                  AND expires_at <= unixepoch()
+                RETURNING id, queue, payload, priority, run_at, max_attempts,
+                          attempts, created_at
+                """,
+                [self.name],
+            )
+            if not rows:
+                return 0
+            for r in rows:
+                tx.execute(
+                    """
+                    INSERT INTO _joblite_dead
+                      (id, queue, payload, priority, run_at, max_attempts,
+                       attempts, last_error, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'expired', ?)
+                    """,
+                    [
+                        r["id"], r["queue"], r["payload"], r["priority"],
+                        r["run_at"], r["max_attempts"], r["attempts"],
+                        r["created_at"],
+                    ],
+                )
+        return len(rows)
 
     def ack(self, job_id: int, worker_id: str) -> bool:
         with self.db.transaction() as tx:
@@ -779,9 +841,15 @@ class Outbox:
         priority: int = 0,
         delay: Optional[float] = None,
         run_at: Optional[int] = None,
+        expires: Optional[float] = None,
     ) -> None:
         self._queue.enqueue(
-            payload, tx=tx, priority=priority, delay=delay, run_at=run_at
+            payload,
+            tx=tx,
+            priority=priority,
+            delay=delay,
+            run_at=run_at,
+            expires=expires,
         )
 
     async def run_worker(self, worker_id: str):

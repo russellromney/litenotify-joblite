@@ -151,6 +151,7 @@ fn claim_batch(
            SELECT id FROM _joblite_live
            WHERE queue = ?2
              AND state IN ('pending', 'processing')
+             AND (expires_at IS NULL OR expires_at > unixepoch())
              AND ((state = 'pending' AND run_at <= unixepoch())
                OR (state = 'processing' AND claim_expires_at < unixepoch()))
            ORDER BY priority DESC, run_at ASC, id ASC
