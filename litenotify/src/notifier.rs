@@ -1,27 +1,32 @@
-//! Commit-hook driven NOTIFY/LISTEN for SQLite (core primitive).
+//! Cross-process NOTIFY/LISTEN for SQLite, backed by a table.
 //!
-//! `Notifier` maintains a per-channel subscriber registry. Each
-//! `subscribe(channel)` hands back a `Subscription` carrying a unique id
-//! and a tokio broadcast `Receiver<Arc<Notification>>`. When a connection
-//! calls the registered `notify(channel, payload)` scalar function inside
-//! a transaction, the notification is buffered until commit; on commit the
-//! hook groups pending notifications by channel and fans out to exactly
-//! the subscribers of that channel. On rollback the buffer is dropped.
+//! `notify(channel, payload)` is a SQL scalar function: inside any
+//! transaction, it does an INSERT into `_litenotify_notifications`.
+//! The INSERT is part of the caller's transaction, so rollback drops
+//! the notification atomically. On commit, the row becomes visible to
+//! any reader in any process (via WAL).
 //!
-//! `unsubscribe(id)` removes a subscriber so language bindings can
-//! implement Drop-based cleanup — the bridge thread's `blocking_recv`
-//! returns `Closed` once the last `Sender` is dropped.
+//! Listeners watch the `.db-wal` file for changes, then SELECT new
+//! rows matching their channel. This is done by the Python side in
+//! `litenotify.Listener`; this module only provides the server-side
+//! SQL primitive.
 //!
-//! IMPORTANT: SQLite's `commit_hook` does NOT fire for `BEGIN DEFERRED`
+//! ## Retention
+//!
+//! The table is a short-term replay buffer, not a durable log. Every
+//! 1000th INSERT prunes rows that are older than 10 seconds OR beyond
+//! the most recent 10,000. For anything that needs longer replay or
+//! per-consumer offsets, use `joblite.Stream`.
+//!
+//! ## IMPORTANT
+//!
+//! SQLite's `commit_hook` does NOT fire for `BEGIN DEFERRED`
 //! transactions with no writes. Callers must use `BEGIN IMMEDIATE` (or
-//! perform at least one write) for `notify()` notifications to be emitted.
+//! perform at least one write) for `notify()` to take effect — which
+//! is automatic because notify() itself is a write.
 
-use parking_lot::Mutex;
 use rusqlite::Connection;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::broadcast;
+use rusqlite::functions::FunctionFlags;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -29,370 +34,154 @@ pub enum Error {
     Sqlite(#[from] rusqlite::Error),
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct Notification {
-    pub channel: String,
-    pub payload: String,
-}
+/// Attach the notifications schema + notify() SQL function to a
+/// connection. Idempotent; safe to call on every open_conn.
+pub fn attach(conn: &Connection) -> Result<(), Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _litenotify_notifications (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           channel TEXT NOT NULL,
+           payload TEXT NOT NULL,
+           created_at INTEGER NOT NULL DEFAULT (unixepoch())
+         );
+         CREATE INDEX IF NOT EXISTS _litenotify_notifications_recent
+           ON _litenotify_notifications(channel, id);",
+    )?;
 
-/// Per-subscriber handle; drop this (via `Notifier::unsubscribe`) to release
-/// the registry slot.
-///
-/// The channel carries `Arc<Notification>` rather than `Notification` so
-/// the fan-out loop in the commit hook only does a ref-count bump per
-/// subscriber, not a `String` realloc for `channel` + `payload`. For a
-/// notification with N subscribers this turns the fan-out from
-/// O(N * payload_len) into O(N atomic increments).
-pub struct Subscription {
-    pub id: u64,
-    pub channel: String,
-    pub rx: broadcast::Receiver<Arc<Notification>>,
-}
+    conn.create_scalar_function(
+        "notify",
+        2,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let channel: String = ctx.get(0)?;
+            let payload: String = ctx.get(1)?;
+            // The scalar function runs inside whatever transaction
+            // the caller is in. INSERTing here just appends to that
+            // transaction — rolled back on ROLLBACK, visible on COMMIT.
+            let db = unsafe { ctx.get_connection() }?;
+            let mut ins = db.prepare_cached(
+                "INSERT INTO _litenotify_notifications (channel, payload) VALUES (?1, ?2)",
+            )?;
+            let id = ins.insert(rusqlite::params![channel, payload])?;
 
-struct SubscriberEntry {
-    id: u64,
-    tx: broadcast::Sender<Arc<Notification>>,
-}
-
-#[derive(Default)]
-struct NotifierInner {
-    by_channel: HashMap<String, Vec<SubscriberEntry>>,
-}
-
-pub struct Notifier {
-    inner: Arc<Mutex<NotifierInner>>,
-    next_id: AtomicU64,
-    buffer_size: usize,
-}
-
-impl Default for Notifier {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Notifier {
-    pub fn new() -> Self {
-        Self::with_buffer(1024)
-    }
-
-    /// `buffer_size` is the per-subscriber broadcast ring size. Slow
-    /// subscribers drop oldest messages when full (same semantics as
-    /// `pg_notify` from the receiver's point of view).
-    pub fn with_buffer(buffer_size: usize) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(NotifierInner::default())),
-            next_id: AtomicU64::new(1),
-            buffer_size: buffer_size.max(1),
-        }
-    }
-
-    /// Subscribe to a single channel. Returns a unique `id` and a
-    /// `Receiver`. Call `unsubscribe(id)` when done.
-    pub fn subscribe(&self, channel: impl Into<String>) -> Subscription {
-        let channel = channel.into();
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = broadcast::channel(self.buffer_size);
-        let mut inner = self.inner.lock();
-        inner
-            .by_channel
-            .entry(channel.clone())
-            .or_default()
-            .push(SubscriberEntry { id, tx });
-        Subscription { id, channel, rx }
-    }
-
-    /// Remove a subscriber by id. Idempotent; a no-op if the id is unknown.
-    /// Dropping the returned `Subscription` from `subscribe()` does NOT
-    /// automatically unsubscribe — call this from your binding's Drop impl.
-    pub fn unsubscribe(&self, id: u64) {
-        let mut inner = self.inner.lock();
-        let mut empty_channels: Vec<String> = Vec::new();
-        for (ch, subs) in inner.by_channel.iter_mut() {
-            let before = subs.len();
-            subs.retain(|s| s.id != id);
-            if subs.len() != before && subs.is_empty() {
-                empty_channels.push(ch.clone());
+            // Opportunistic pruning. Keeps the table bounded in size
+            // without needing a background task. `id % 1000 == 0`
+            // gives ~0.1% of notify() calls a small DELETE to run.
+            // Retention window: 10 seconds, OR most recent 10k rows,
+            // whichever leaves fewer rows. Anything past that window
+            // is someone else's problem — point them at
+            // `joblite.Stream` for persistent replay.
+            if id % 1000 == 0 {
+                let mut del = db.prepare_cached(
+                    "DELETE FROM _litenotify_notifications
+                     WHERE created_at < unixepoch() - 10
+                        OR id <= (SELECT MAX(id) - 10000 FROM _litenotify_notifications)",
+                )?;
+                let _ = del.execute([]);
             }
-        }
-        for ch in empty_channels {
-            inner.by_channel.remove(&ch);
-        }
-    }
 
-    /// Attach the `notify(channel, payload)` scalar function plus commit
-    /// and rollback hooks to `conn`.
-    pub fn attach(&self, conn: &Connection) -> Result<(), Error> {
-        let pending: Arc<Mutex<Vec<Notification>>> =
-            Arc::new(Mutex::new(Vec::new()));
+            Ok(id)
+        },
+    )?;
 
-        let pending_notify = Arc::clone(&pending);
-        conn.create_scalar_function(
-            "notify",
-            2,
-            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
-            move |ctx| {
-                let channel: String = ctx.get(0)?;
-                let payload: String = ctx.get(1)?;
-                pending_notify.lock().push(Notification { channel, payload });
-                Ok(true)
-            },
-        )?;
-
-        let pending_commit = Arc::clone(&pending);
-        let inner_commit = Arc::clone(&self.inner);
-        let _ = conn.commit_hook(Some(move || {
-            // Drain the pending buffer first so we hold its lock for the
-            // minimum time.
-            let drained: Vec<Notification> =
-                std::mem::take(&mut *pending_commit.lock());
-            if drained.is_empty() {
-                return false;
-            }
-            let registry = inner_commit.lock();
-            for notif in drained {
-                if let Some(subs) = registry.by_channel.get(&notif.channel) {
-                    // Wrap the notification once; subscriber sends clone
-                    // the Arc (ref-count bump), not the underlying Strings.
-                    let arc_notif = Arc::new(notif);
-                    for sub in subs.iter() {
-                        let _ = sub.tx.send(Arc::clone(&arc_notif));
-                    }
-                }
-            }
-            false
-        }));
-
-        let pending_rollback = Arc::clone(&pending);
-        let _ = conn.rollback_hook(Some(move || {
-            pending_rollback.lock().clear();
-        }));
-
-        Ok(())
-    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn setup() -> (Connection, Notifier) {
+    fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        let notifier = Notifier::new();
-        notifier.attach(&conn).unwrap();
-        (conn, notifier)
-    }
-
-    fn begin(conn: &Connection) {
-        conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
-    }
-    fn commit(conn: &Connection) {
-        conn.execute_batch("COMMIT;").unwrap();
-    }
-    fn rollback(conn: &Connection) {
-        conn.execute_batch("ROLLBACK;").unwrap();
+        attach(&conn).unwrap();
+        conn
     }
 
     #[test]
-    fn test_notify_rollback_produces_no_notification() {
-        let (conn, notifier) = setup();
-        let mut sub = notifier.subscribe("test");
-
-        begin(&conn);
-        conn.query_row("SELECT notify('test', 'data')", [], |_| Ok(()))
+    fn test_notify_inserts_row() {
+        let conn = setup();
+        conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        conn.query_row("SELECT notify('orders', 'new')", [], |_| Ok(()))
             .unwrap();
-        rollback(&conn);
+        conn.execute_batch("COMMIT;").unwrap();
 
-        assert!(sub.rx.try_recv().is_err());
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _litenotify_notifications WHERE channel='orders'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
-    #[tokio::test]
-    async fn test_notify_commit_produces_exactly_one_notification_per_subscriber() {
-        let (conn, notifier) = setup();
-        let mut sub1 = notifier.subscribe("test");
-        let mut sub2 = notifier.subscribe("test");
-
-        begin(&conn);
-        conn.query_row("SELECT notify('test', 'data')", [], |_| Ok(()))
+    #[test]
+    fn test_rollback_drops_notification() {
+        let conn = setup();
+        conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        conn.query_row("SELECT notify('x', 'y')", [], |_| Ok(()))
             .unwrap();
-        commit(&conn);
+        conn.execute_batch("ROLLBACK;").unwrap();
 
-        let msg1 = sub1.rx.recv().await.unwrap();
-        assert_eq!(msg1.channel, "test");
-        assert_eq!(msg1.payload, "data");
-        assert!(sub1.rx.try_recv().is_err());
-
-        let msg2 = sub2.rx.recv().await.unwrap();
-        assert_eq!(msg2, msg1);
-        assert!(sub2.rx.try_recv().is_err());
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _litenotify_notifications",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
-    #[tokio::test]
-    async fn test_cross_channel_isolation() {
-        let (conn, notifier) = setup();
-        let mut cold = notifier.subscribe("cold");
-
-        begin(&conn);
-        for i in 0..5000 {
+    #[test]
+    fn test_multiple_notifies_preserve_order() {
+        let conn = setup();
+        conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        for i in 0..5 {
             conn.query_row(
-                "SELECT notify('hot', ?1)",
+                "SELECT notify('ch', ?1)",
                 [format!("p{}", i)],
                 |_| Ok(()),
             )
             .unwrap();
         }
-        conn.query_row("SELECT notify('cold', 'only')", [], |_| Ok(()))
-            .unwrap();
-        commit(&conn);
+        conn.execute_batch("COMMIT;").unwrap();
 
-        let n = cold.rx.recv().await.unwrap();
-        assert_eq!(n.channel, "cold");
-        assert_eq!(n.payload, "only");
-        assert!(cold.rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn test_channel_routing_does_not_cross() {
-        let (conn, notifier) = setup();
-        let mut a = notifier.subscribe("a");
-        let mut b = notifier.subscribe("b");
-
-        begin(&conn);
-        conn.query_row("SELECT notify('a', '1')", [], |_| Ok(())).unwrap();
-        conn.query_row("SELECT notify('b', '2')", [], |_| Ok(())).unwrap();
-        conn.query_row("SELECT notify('a', '3')", [], |_| Ok(())).unwrap();
-        commit(&conn);
-
-        let n1 = a.rx.recv().await.unwrap();
-        assert_eq!(n1.payload, "1");
-        let n2 = a.rx.recv().await.unwrap();
-        assert_eq!(n2.payload, "3");
-        assert!(a.rx.try_recv().is_err());
-
-        let m1 = b.rx.recv().await.unwrap();
-        assert_eq!(m1.payload, "2");
-        assert!(b.rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn test_unsubscribe_frees_the_slot_and_closes_receiver() {
-        let (conn, notifier) = setup();
-        let sub = notifier.subscribe("x");
-        let id = sub.id;
-        let mut rx = sub.rx;
-        notifier.unsubscribe(id);
-
-        let err = rx.recv().await.unwrap_err();
-        matches!(err, tokio::sync::broadcast::error::RecvError::Closed);
-
-        begin(&conn);
-        conn.query_row("SELECT notify('x', 'nope')", [], |_| Ok(()))
-            .unwrap();
-        commit(&conn);
+        let payloads: Vec<String> = conn
+            .prepare(
+                "SELECT payload FROM _litenotify_notifications
+                 WHERE channel='ch' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(payloads, vec!["p0", "p1", "p2", "p3", "p4"]);
     }
 
     #[test]
-    fn test_unsubscribe_unknown_id_is_noop() {
-        let notifier = Notifier::new();
-        notifier.unsubscribe(999);
-    }
-
-    #[tokio::test]
-    async fn test_multiple_notifies_in_one_tx_are_delivered_in_order() {
-        let (conn, notifier) = setup();
-        let mut sub = notifier.subscribe("ch");
-
-        begin(&conn);
-        for i in 0..5 {
-            conn.query_row("SELECT notify('ch', ?1)", [format!("p{}", i)], |_| Ok(()))
-                .unwrap();
-        }
-        commit(&conn);
-
-        for i in 0..5 {
-            let n = sub.rx.recv().await.unwrap();
-            assert_eq!(n.payload, format!("p{}", i));
-        }
-        assert!(sub.rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn test_full_rollback_drops_all_pending() {
-        let (conn, notifier) = setup();
-        let mut sub = notifier.subscribe("a");
-        let mut sub_b = notifier.subscribe("b");
-
-        begin(&conn);
-        conn.query_row("SELECT notify('a', '1')", [], |_| Ok(())).unwrap();
-        conn.execute_batch("SAVEPOINT sp1;").unwrap();
-        conn.query_row("SELECT notify('b', '2')", [], |_| Ok(())).unwrap();
-        conn.execute_batch("RELEASE sp1;").unwrap();
-        rollback(&conn);
-
-        assert!(sub.rx.try_recv().is_err());
-        assert!(sub_b.rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn test_unicode_and_large_payloads_roundtrip() {
-        let (conn, notifier) = setup();
-        let mut sub = notifier.subscribe("ch");
-
-        let big = "a".repeat(1_000_000);
-        let unicode = "héllo 🦆 мир";
-        begin(&conn);
-        conn.query_row("SELECT notify('ch', ?1)", [unicode], |_| Ok(()))
+    fn test_unicode_and_large_payload() {
+        let conn = setup();
+        let big = "a".repeat(100_000);
+        conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        conn.query_row("SELECT notify('ch', 'héllo 🦆')", [], |_| Ok(()))
             .unwrap();
-        conn.query_row("SELECT notify('ch', ?1)", [big.clone()], |_| Ok(()))
-            .unwrap();
-        commit(&conn);
-
-        let a = sub.rx.recv().await.unwrap();
-        assert_eq!(a.payload, unicode);
-        let b = sub.rx.recv().await.unwrap();
-        assert_eq!(b.payload.len(), 1_000_000);
-        assert_eq!(b.payload, big);
-    }
-
-    #[tokio::test]
-    async fn test_subscribe_before_attach_is_safe() {
-        let notifier = Notifier::new();
-        let mut sub = notifier.subscribe("x");
-        let conn = Connection::open_in_memory().unwrap();
-        notifier.attach(&conn).unwrap();
-
-        begin(&conn);
-        conn.query_row("SELECT notify('x', 'y')", [], |_| Ok(()))
-            .unwrap();
-        commit(&conn);
-
-        let n = sub.rx.recv().await.unwrap();
-        assert_eq!(n.channel, "x");
-        assert_eq!(n.payload, "y");
-    }
-
-    #[test]
-    fn test_deferred_readonly_transaction_does_not_deliver_notify() {
-        // Documented contract: SQLite skips commit_hook for read-only
-        // DEFERRED transactions. Python/TS bindings always use
-        // BEGIN IMMEDIATE, which is why this works in practice there.
-        let (conn, notifier) = setup();
-        let mut sub = notifier.subscribe("ch");
-
-        conn.execute_batch("BEGIN DEFERRED;").unwrap();
-        conn.query_row("SELECT notify('ch', 'lost')", [], |_| Ok(()))
+        conn.query_row("SELECT notify('ch', ?1)", [&big], |_| Ok(()))
             .unwrap();
         conn.execute_batch("COMMIT;").unwrap();
 
-        assert!(sub.rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn test_no_subscribers_notify_is_dropped_silently() {
-        let (conn, _notifier) = setup();
-        begin(&conn);
-        conn.query_row("SELECT notify('orphan', 'lost')", [], |_| Ok(()))
-            .unwrap();
-        commit(&conn); // no panic; no receiver registered; hook just no-ops
+        let payloads: Vec<String> = conn
+            .prepare(
+                "SELECT payload FROM _litenotify_notifications
+                 WHERE channel='ch' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(payloads[0], "héllo 🦆");
+        assert_eq!(payloads[1].len(), 100_000);
     }
 }

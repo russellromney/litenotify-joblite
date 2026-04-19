@@ -214,7 +214,7 @@ def test_sigkill_mid_honk_tx_delivers_no_notification(tmp_path):
     channel = f"crash-channel-{os.getpid()}-{time.time_ns()}"
 
     # Create the file so subprocess can open immediately.
-    import litenotify
+    import joblite as litenotify
 
     seed = litenotify.open(db_path)
     del seed
@@ -223,7 +223,7 @@ def test_sigkill_mid_honk_tx_delivers_no_notification(tmp_path):
         f"""
         import sys, time
         sys.path.insert(0, {REPO_ROOT!r})
-        import litenotify
+        import joblite as litenotify
 
         db = litenotify.open({db_path!r})
         with db.transaction() as tx:
@@ -266,7 +266,7 @@ def test_sigkill_mid_honk_tx_delivers_no_notification(tmp_path):
 
     result = asyncio.run(drain_and_replay())
     import json as _json
-    assert _json.loads(result.payload) == {"alive": True}
+    assert result.payload == {"alive": True}
 
 
 def test_sigkill_while_listener_preattached_sees_no_leak(tmp_path):
@@ -283,7 +283,7 @@ def test_sigkill_while_listener_preattached_sees_no_leak(tmp_path):
     db_path = str(tmp_path / "crash-preattached.db")
     channel = f"pre-{os.getpid()}-{time.time_ns()}"
 
-    import litenotify
+    import joblite as litenotify
 
     db = litenotify.open(db_path)
     listener = db.listen(channel)  # pre-attached in the test process
@@ -292,7 +292,7 @@ def test_sigkill_while_listener_preattached_sees_no_leak(tmp_path):
         f"""
         import sys, time
         sys.path.insert(0, {REPO_ROOT!r})
-        import litenotify
+        import joblite as litenotify
 
         db = litenotify.open({db_path!r})
         with db.transaction() as tx:
@@ -325,5 +325,5 @@ def test_sigkill_while_listener_preattached_sees_no_leak(tmp_path):
 
     result = asyncio.run(assert_no_leak_then_live_honk_works())
     import json as _json
-    assert _json.loads(result.payload) == {"alive": True}
+    assert result.payload == {"alive": True}
     assert _integrity_check(db_path) == "ok"

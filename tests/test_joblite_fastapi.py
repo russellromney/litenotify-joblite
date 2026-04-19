@@ -262,7 +262,7 @@ async def test_sse_delivers_honk_as_event(uvicorn_server):
                 await fire_task
 
     assert received[0]["channel"] == channel
-    assert json.loads(received[0]["payload"]) == {"id": 42}
+    assert received[0]["payload"] == {"id": 42}
 
 
 async def test_stream_endpoint_replays_from_last_event_id(uvicorn_server):

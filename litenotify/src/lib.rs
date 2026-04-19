@@ -1,6 +1,5 @@
 mod notifier;
 
-use notifier::{Notification, Notifier};
 use parking_lot::{Condvar, Mutex};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
@@ -9,7 +8,11 @@ use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, OpenFlags};
 use std::sync::Arc;
 
-fn open_conn(path: &str, attach: Option<&Notifier>) -> PyResult<Connection> {
+/// Open a SQLite connection with litenotify's PRAGMA setup. If
+/// `install_notify` is true, attach the notify() SQL function and
+/// ensure the notifications table exists. Readers don't need notify()
+/// installed; only the writer does.
+fn open_conn(path: &str, install_notify: bool) -> PyResult<Connection> {
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -46,8 +49,8 @@ fn open_conn(path: &str, attach: Option<&Notifier>) -> PyResult<Connection> {
          PRAGMA wal_autocheckpoint = 10000;",
     )
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    if let Some(n) = attach {
-        n.attach(&conn)
+    if install_notify {
+        notifier::attach(&conn)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
     }
     Ok(conn)
@@ -121,7 +124,7 @@ impl Readers {
                 *out += 1;
                 drop(out);
                 drop(pool);
-                return open_conn(&self.path, None);
+                return open_conn(&self.path, false);
             }
             drop(out);
             self.available.wait(&mut pool);
@@ -137,7 +140,6 @@ impl Readers {
 
 #[pyclass]
 struct Database {
-    notifier: Arc<Notifier>,
     writer: Arc<Writer>,
     readers: Arc<Readers>,
     path: String,
@@ -148,10 +150,11 @@ impl Database {
     #[new]
     #[pyo3(signature = (path, max_readers=8))]
     fn new(path: String, max_readers: usize) -> PyResult<Self> {
-        let notifier = Arc::new(Notifier::new());
-        let writer_conn = open_conn(&path, Some(&notifier))?;
+        // Writer connection registers the notify() SQL function +
+        // creates the _litenotify_notifications table if missing.
+        // Readers don't need it — they just SELECT.
+        let writer_conn = open_conn(&path, true)?;
         Ok(Self {
-            notifier,
             writer: Arc::new(Writer::new(writer_conn)),
             readers: Arc::new(Readers::new(path.clone(), max_readers)),
             path,
@@ -162,19 +165,6 @@ impl Database {
         Ok(Transaction {
             writer: self.writer.clone(),
             inner: Arc::new(Mutex::new(TxState::default())),
-        })
-    }
-
-    fn listen(&self, channel: String) -> PyResult<Listener> {
-        let sub = self.notifier.subscribe(channel.clone());
-        Ok(Listener {
-            channel,
-            subscription_id: sub.id,
-            notifier: self.notifier.clone(),
-            inner: Arc::new(Mutex::new(ListenerState {
-                rx: Some(sub.rx),
-                queue: None,
-            })),
         })
     }
 
@@ -515,113 +505,6 @@ fn serialize_payload(py: Python<'_>, payload: &Bound<'_, PyAny>) -> PyResult<Str
     result.extract::<String>()
 }
 
-#[pyclass]
-struct NotificationResult {
-    #[pyo3(get)]
-    channel: String,
-    #[pyo3(get)]
-    payload: String,
-}
-
-struct ListenerState {
-    rx: Option<tokio::sync::broadcast::Receiver<Arc<Notification>>>,
-    queue: Option<Py<PyAny>>,
-}
-
-#[pyclass]
-struct Listener {
-    channel: String,
-    subscription_id: u64,
-    notifier: Arc<Notifier>,
-    inner: Arc<Mutex<ListenerState>>,
-}
-
-impl Drop for Listener {
-    fn drop(&mut self) {
-        // Remove the subscriber from the notifier so the registry entry
-        // doesn't leak and the bridge thread's blocking_recv() returns
-        // Closed instead of waiting forever.
-        self.notifier.unsubscribe(self.subscription_id);
-    }
-}
-
-impl Listener {
-    /// Lazily start the bridge thread the first time this listener is
-    /// iterated. The thread blocks on the tokio broadcast receiver and hands
-    /// each notification to the asyncio loop that called __aiter__ via
-    /// loop.call_soon_threadsafe(queue.put_nowait, ...). Works on any
-    /// asyncio loop (TestClient portal, anyio, Jupyter, asyncio.run).
-    ///
-    /// No channel filter here — the notifier's per-channel registry means we only
-    /// receive notifications for our own channel.
-    fn ensure_started(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let mut state = self.inner.lock();
-        if let Some(q) = &state.queue {
-            return Ok(q.clone_ref(py));
-        }
-        let asyncio = py.import("asyncio")?;
-        let queue = asyncio.call_method0("Queue")?;
-        let loop_obj = asyncio.call_method0("get_running_loop")?;
-
-        let queue_py: Py<PyAny> = queue.clone().unbind();
-        let queue_py_for_thread = queue_py.clone_ref(py);
-        let loop_py: Py<PyAny> = loop_obj.unbind();
-        let channel = self.channel.clone();
-        let mut rx = state.rx.take().expect("rx already taken");
-
-        std::thread::Builder::new()
-            .name(format!("litenotify-listen-{}", channel))
-            .spawn(move || {
-                loop {
-                    match rx.blocking_recv() {
-                        Ok(n) => {
-                            Python::attach(|py| {
-                                let notif = match Py::new(
-                                    py,
-                                    NotificationResult {
-                                        channel: n.channel.clone(),
-                                        payload: n.payload.clone(),
-                                    },
-                                ) {
-                                    Ok(v) => v,
-                                    Err(_) => return,
-                                };
-                                let put = match queue_py_for_thread.getattr(py, "put_nowait") {
-                                    Ok(v) => v,
-                                    Err(_) => return,
-                                };
-                                let _ = loop_py.call_method1(
-                                    py,
-                                    "call_soon_threadsafe",
-                                    (put, notif),
-                                );
-                            });
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            })
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-        state.queue = Some(queue_py.clone_ref(py));
-        Ok(queue_py)
-    }
-}
-
-#[pymethods]
-impl Listener {
-    fn __aiter__<'a>(slf: PyRef<'a, Self>, py: Python<'a>) -> PyResult<PyRef<'a, Self>> {
-        slf.ensure_started(py)?;
-        Ok(slf)
-    }
-
-    fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let queue = self.ensure_started(py)?;
-        queue.bind(py).call_method0("get")
-    }
-}
-
 /// WAL-file watcher that yields `None` every time the watched DB's
 /// `-wal` file changes. "Changes" is detected by a background thread
 /// polling `(size, mtime_ns)` at ~1ms intervals.
@@ -754,8 +637,6 @@ fn litenotify(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_class::<Database>()?;
     m.add_class::<Transaction>()?;
-    m.add_class::<Listener>()?;
-    m.add_class::<NotificationResult>()?;
     m.add_class::<WalEvents>()?;
     Ok(())
 }

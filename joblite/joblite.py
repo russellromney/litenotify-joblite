@@ -8,6 +8,98 @@ from typing import Any, AsyncIterator, Callable, Optional
 import litenotify
 
 
+class Notification:
+    """A single row from `_litenotify_notifications`, as delivered to a
+    `Listener`. `payload` is lazy-decoded JSON on access — matches the
+    `Job.payload` convention."""
+
+    __slots__ = ("id", "channel", "_payload_raw", "_payload", "created_at")
+    _UNSET = object()
+
+    def __init__(self, row: dict):
+        self.id = row["id"]
+        self.channel = row["channel"]
+        self._payload_raw = row["payload"]
+        self._payload = Notification._UNSET
+        self.created_at = row.get("created_at", 0)
+
+    @property
+    def payload(self) -> Any:
+        if self._payload is Notification._UNSET:
+            raw = self._payload_raw
+            if raw in (None, "", "null"):
+                self._payload = None
+            else:
+                try:
+                    self._payload = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    # payload wasn't JSON; hand back the raw string.
+                    self._payload = raw
+        return self._payload
+
+    def __repr__(self):
+        return f"Notification(id={self.id}, channel={self.channel!r})"
+
+
+class Listener:
+    """Async iterator yielding Notifications published to `channel`.
+
+    Semantics:
+      * Starts from the CURRENT `MAX(id)` on the channel at construction
+        time — historical notifications are not replayed (like pg_notify).
+        Use `db.stream(...)` if you want durable replay.
+      * Wakes on every commit to the DB (WAL file change) and SELECTs
+        any new rows for this channel. Same-process and cross-process
+        commits both deliver in ~1ms.
+      * Ordered by monotonic `id`; no duplicates.
+      * Short-term buffer: the notifications table is pruned every
+        ~1000 notify() calls, keeping the last 10 seconds OR last 10k
+        rows. A listener that goes offline longer than that loses
+        missed events.
+    """
+
+    def __init__(self, db, channel: str):
+        self.db = db
+        self.channel = channel
+        self._buffer: deque = deque()
+        # Skip anything that existed before this Listener started.
+        rows = db.query(
+            "SELECT COALESCE(MAX(id), 0) AS m "
+            "FROM _litenotify_notifications WHERE channel=?",
+            [channel],
+        )
+        self._last_seen = int(rows[0]["m"]) if rows else 0
+        self._wal = db.wal_events()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self) -> Notification:
+        while True:
+            if self._buffer:
+                return self._buffer.popleft()
+            rows = self.db.query(
+                "SELECT id, channel, payload, created_at "
+                "FROM _litenotify_notifications "
+                "WHERE channel=? AND id > ? ORDER BY id",
+                [self.channel, self._last_seen],
+            )
+            if rows:
+                for r in rows:
+                    self._last_seen = int(r["id"])
+                    self._buffer.append(Notification(r))
+                continue
+            # No new rows — wait on WAL. 15s paranoia timeout.
+            try:
+                await asyncio.wait_for(
+                    self._wal.__anext__(), timeout=15.0
+                )
+            except asyncio.TimeoutError:
+                pass
+            except StopAsyncIteration:
+                raise StopAsyncIteration
+
+
 class Job:
     __slots__ = (
         "queue",
@@ -715,7 +807,7 @@ class Database:
         return self._inner.transaction()
 
     def listen(self, channel: str):
-        return self._inner.listen(channel)
+        return Listener(self, channel)
 
     def wal_events(self):
         return self._inner.wal_events()

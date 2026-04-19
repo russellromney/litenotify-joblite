@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-import litenotify
+import joblite as litenotify
 
 
 def _make_table(db):
@@ -165,9 +165,9 @@ async def test_dict_and_list_payloads_json_serialized(db_path):
         tx.notify("ch", [1, 2, 3])
 
     await asyncio.wait_for(task, timeout=2.0)
-    import json
-    assert json.loads(got[0]) == {"id": 42, "name": "alice"}
-    assert json.loads(got[1]) == [1, 2, 3]
+    # Notification.payload now auto-decodes JSON on access.
+    assert got[0] == {"id": 42, "name": "alice"}
+    assert got[1] == [1, 2, 3]
 
 
 def test_connection_returned_on_commit_success(db_path):
