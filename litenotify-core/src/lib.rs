@@ -185,6 +185,11 @@ pub const BOOTSTRAP_JOBLITE_SQL: &str = "
       created_at INTEGER NOT NULL DEFAULT (unixepoch()),
       died_at INTEGER NOT NULL DEFAULT (unixepoch())
     );
+    CREATE TABLE IF NOT EXISTS _joblite_locks (
+      name TEXT PRIMARY KEY,
+      owner TEXT NOT NULL,
+      expires_at INTEGER NOT NULL
+    );
 ";
 
 /// Install the joblite queue schema on `conn`. Idempotent. See
@@ -658,5 +663,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(idx, 1);
+
+        // _joblite_locks table present for db.lock() support.
+        let locks_cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('_joblite_locks')")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(locks_cols, vec!["name", "owner", "expires_at"]);
     }
 }

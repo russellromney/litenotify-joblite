@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 import traceback
+import uuid
 from collections import deque
 from typing import Any, AsyncIterator, Callable, Optional
 
@@ -871,6 +872,84 @@ class Outbox:
                 )
 
 
+class LockHeld(Exception):
+    """Raised when `db.lock(name).__enter__()` can't acquire the lock
+    because another holder has it and the TTL hasn't elapsed. Use this
+    to skip overlapping runs:
+
+        try:
+            with db.lock('nightly-backup', ttl=3600):
+                do_backup()
+        except joblite.LockHeld:
+            # another worker is already running this; skip this run
+            pass
+    """
+
+
+class _Lock:
+    """Context manager returned by `Database.lock(name, ttl=60)`.
+
+    Acquires the named lock in `_joblite_locks` via `INSERT OR IGNORE`.
+    Expired rows (owner crashed before release) are opportunistically
+    pruned on every acquire attempt, so a stale lock doesn't block
+    forever — the TTL is an upper bound on how long a crashed holder
+    can block others.
+
+    Releases via `DELETE` on `__exit__`. If the TTL elapsed before
+    release (holder took longer than expected and someone else acquired
+    in the meantime), release is a no-op.
+    """
+
+    __slots__ = ("db", "name", "ttl", "owner", "acquired")
+
+    def __init__(self, db: "Database", name: str, ttl: int, owner: str):
+        self.db = db
+        self.name = name
+        self.ttl = int(ttl)
+        self.owner = owner
+        self.acquired = False
+
+    def __enter__(self) -> "_Lock":
+        with self.db.transaction() as tx:
+            # Prune stale rows first so a crashed holder's TTL can
+            # elapse before anyone else tries. Cheap — one indexed
+            # DELETE.
+            tx.execute(
+                "DELETE FROM _joblite_locks "
+                "WHERE name = ? AND expires_at <= unixepoch()",
+                [self.name],
+            )
+            # Try to claim it. INSERT OR IGNORE is a no-op if the row
+            # exists (another holder).
+            tx.execute(
+                """
+                INSERT OR IGNORE INTO _joblite_locks
+                  (name, owner, expires_at)
+                VALUES (?, ?, unixepoch() + ?)
+                """,
+                [self.name, self.owner, self.ttl],
+            )
+            rows = tx.query(
+                "SELECT owner FROM _joblite_locks WHERE name = ?",
+                [self.name],
+            )
+            if not rows or rows[0]["owner"] != self.owner:
+                raise LockHeld(f"lock {self.name!r} is already held")
+            self.acquired = True
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        if self.acquired:
+            with self.db.transaction() as tx:
+                tx.execute(
+                    "DELETE FROM _joblite_locks "
+                    "WHERE name = ? AND owner = ?",
+                    [self.name, self.owner],
+                )
+            self.acquired = False
+        return False  # don't suppress exceptions from the with-body
+
+
 class Database:
     """Wrapper over the litenotify Database that adds queue/stream/outbox."""
 
@@ -879,6 +958,11 @@ class Database:
         self._queues: dict = {}
         self._streams: dict = {}
         self._outboxes: dict = {}
+        # Bootstrap the shared joblite schema up-front so features
+        # like db.lock() (which doesn't touch Queue or Stream) find
+        # their tables on first use.
+        with self._inner.transaction() as tx:
+            tx.bootstrap_joblite_schema()
 
     def transaction(self):
         return self._inner.transaction()
@@ -891,6 +975,36 @@ class Database:
 
     def query(self, sql: str, params=None):
         return self._inner.query(sql, params)
+
+    def lock(
+        self,
+        name: str,
+        ttl: int = 60,
+        owner: Optional[str] = None,
+    ) -> _Lock:
+        """Named-lock context manager backed by the `_joblite_locks`
+        table. Raises `joblite.LockHeld` on `__enter__` if the lock is
+        currently held by someone else.
+
+        Typical use is around work that shouldn't overlap with itself —
+        cron tasks that might run longer than their schedule interval:
+
+            try:
+                with db.lock('nightly-backup', ttl=3600):
+                    do_backup()
+            except joblite.LockHeld:
+                # previous run still going; skip this cron tick
+                pass
+
+        `ttl` bounds how long a crashed holder can block others.
+        Default 60s.
+        """
+        return _Lock(
+            self,
+            name,
+            ttl=ttl,
+            owner=owner or uuid.uuid4().hex,
+        )
 
     def prune_notifications(
         self,
