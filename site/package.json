@@ -8,12 +8,17 @@
     "start": "astro dev",
     "build": "astro build",
     "preview": "astro preview",
-    "astro": "astro"
+    "astro": "astro",
+    "deploy": "astro build && wrangler pages deploy dist --project-name=honker --commit-dirty=true",
+    "deploy:preview": "astro build && wrangler pages deploy dist --project-name=honker --branch=preview --commit-dirty=true"
   },
   "dependencies": {
     "@astrojs/starlight": "^0.34.0",
     "astro": "^5.14.0",
     "sharp": "^0.34.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.100.0"
   },
   "overrides": {
     "@astrojs/sitemap": "3.4.2"

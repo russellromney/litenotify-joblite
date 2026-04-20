@@ -1,0 +1,20 @@
+/**
+ * Cloudflare Pages configuration for honker.dev.
+ *
+ * Deploy locally with `npm run deploy` (runs `astro build` then
+ * `wrangler pages deploy dist`). First-time setup:
+ *
+ *   npx wrangler login                       # browser-based auth
+ *   npx wrangler pages project create honker --production-branch=main
+ *   # then point honker.dev at the Pages project in the Cloudflare
+ *   # dashboard (Pages → honker → Custom domains → Set up a domain).
+ *
+ * Preview deploys: `npm run deploy:preview` pushes to a `preview`
+ * branch which Cloudflare serves at `<hash>.honker.pages.dev`.
+ */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "honker",
+  "compatibility_date": "2025-04-01",
+  "pages_build_output_dir": "./dist"
+}
