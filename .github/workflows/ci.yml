@@ -98,9 +98,18 @@ jobs:
         run: |
           uv venv .venv
           . .venv/bin/activate
-          uv pip install pytest pytest-asyncio pytest-xdist
+          uv pip install pytest pytest-asyncio pytest-xdist maturin
       - name: Build honker-extension
         run: cargo build --release -p honker-extension
+      - name: Build PyO3 _honker_native (maturin develop)
+        # The `honker` Python package exposes a PyO3 cdylib named
+        # `_honker_native`. setuptools in pyproject.toml only handles
+        # the pure-Python files; maturin is what compiles + installs
+        # the Rust cdylib into the venv's site-packages.
+        working-directory: packages/honker
+        run: |
+          . ../../.venv/bin/activate
+          maturin develop --release
       - name: Run pytest
         run: |
           . .venv/bin/activate
