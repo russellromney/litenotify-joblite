@@ -5,7 +5,7 @@ Go binding for [Honker](https://honker.dev) — durable queues, streams, pub/sub
 ## Install
 
 ```bash
-go get github.com/honker/honker-go
+go get github.com/russellromney/honker-go
 ```
 
 You'll also need the Honker SQLite extension (`libhonker.dylib` on macOS, `libhonker.so` on Linux). Prebuilds live at [GitHub releases](https://github.com/russellromney/honker/releases/latest), or build from source:
@@ -36,7 +36,7 @@ import (
     "fmt"
     "log"
 
-    "github.com/honker/honker-go"
+    "github.com/russellromney/honker-go"
 )
 
 func main() {

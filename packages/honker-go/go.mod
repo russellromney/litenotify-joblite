@@ -1,4 +1,4 @@
-module github.com/honker/honker-go
+module github.com/russellromney/honker-go
 
 go 1.24
 
