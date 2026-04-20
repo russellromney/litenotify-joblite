@@ -29,10 +29,24 @@ Local dev + CI secrets live in the `honker/honker` Soup project
 | Key                     | Notes                                             |
 |-------------------------|---------------------------------------------------|
 | `CARGO_REGISTRY_TOKEN`  | crates.io publish token. **Populated.**           |
-| `NPM_TOKEN`             | npm publish for `@honker/node`. Placeholder.      |
 | `PYPI_TOKEN`            | PyPI publish for `honker`. Placeholder.           |
-| `CLOUDFLARE_API_TOKEN`  | CI deploy of honker.dev. Placeholder.             |
-| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID. Placeholder.               |
+| `CLOUDFLARE_API_TOKEN`  | CI deploy of honker.dev. Placeholder — see below. |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID. **Populated.**             |
+
+**npm** uses trusted publishing (OIDC) rather than a long-lived
+token. Configure it once at <https://www.npmjs.com/package/@honker/node/access>
+→ Trusted Publishers → GitHub Actions → `russellromney/honker-node`.
+No secret needed on our side; the workflow gets a short-lived token
+from npm via the OIDC exchange.
+
+**Cloudflare API token** isn't creatable via wrangler's OAuth flow
+(wrangler uses a browser-scoped session). Create one manually at
+<https://dash.cloudflare.com/profile/api-tokens> with the
+"Edit Cloudflare Pages" template scoped to the honker project, then:
+
+```bash
+soup secrets set CLOUDFLARE_API_TOKEN <token>
+```
 
 ### Using Soup locally
 
