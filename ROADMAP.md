@@ -100,18 +100,18 @@ would otherwise re-implement the same SQL + cron parsing + scheduler
 logic. The less code that lives in the language wrapper, the easier
 each new binding is. Six-commit refactor:
 
-- [ ] **1. Move Rust helpers from `litenotify-extension/src/lib.rs`
+- [x] **1. Move Rust helpers from `litenotify-extension/src/lib.rs`
   to `litenotify-core::joblite_ops`.** Add
   `attach_joblite_functions(conn)`. Extension collapses to
   `attach_notify + attach_joblite_functions`. PyO3 `Database.new()`
   also calls `attach_joblite_functions` so Python can use
   `SELECT jl_*(...)` without loading the `.dylib`.
-- [ ] **2. Fill the gap.** Add `jl_enqueue`, `jl_retry`, `jl_fail`,
+- [x] **2. Fill the gap.** Add `jl_enqueue`, `jl_retry`, `jl_fail`,
   `jl_heartbeat`, `jl_ack` (the singular, not just `jl_ack_batch`).
   These are currently Python-only; every other binding would have to
   reinvent them. Enqueue param coercion (delay / run_at / expires)
   lives in Rust.
-- [ ] **3. Python inline SQL → `SELECT jl_*()`.** Replace every inline
+- [x] **3. Python inline SQL → `SELECT jl_*()`.** Replace every inline
   SQL string in `joblite.py` (roughly `Queue.ack`, `Queue.retry`,
   `Queue.fail`, `Queue.heartbeat`, `Queue.claim_batch`,
   `Queue.ack_batch`, `Queue.sweep_expired`, `Database.lock`,

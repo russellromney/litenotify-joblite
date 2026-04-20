@@ -228,13 +228,8 @@ class Scheduler:
 
     def _record_fire(self, name: str, fire_at_unix: int) -> None:
         with self.db.transaction() as tx:
-            tx.execute(
-                """
-                INSERT INTO _joblite_scheduler_state (name, last_fire_at)
-                VALUES (?, ?)
-                ON CONFLICT(name) DO UPDATE
-                  SET last_fire_at = excluded.last_fire_at
-                """,
+            tx.query(
+                "SELECT jl_scheduler_record_fire(?, ?)",
                 [name, fire_at_unix],
             )
 

@@ -229,126 +229,75 @@ class Queue:
         expires: Optional[float] = None,
     ) -> int:
         """Insert one job row. Returns the inserted `id` (primary key
-        in `_joblite_live`), which callers can use to fetch a result
-        later via `queue.get_result(id)` / `queue.wait_result(id)`.
+        in `_joblite_live`). Delegates to `jl_enqueue`, which handles
+        run_at / delay precedence + expires computation + firing the
+        wake notification atomically in Rust — same SQL path every
+        binding uses.
 
-        When called without `tx=`, opens its own write transaction and
-        fires one notify per call — so a hot loop of 10 k enqueues
-        means 10 k transactions and 10 k wakes. For bulk inserts,
-        pass a shared `tx` and the library will only fire one commit
-        (at the block exit) with one cross-process wake:
+        Scheduling precedence:
+          - `delay`:   seconds from now (wins over run_at if both set)
+          - `run_at`:  absolute unix epoch
+          - neither:   now (claimable immediately)
+
+        `expires`: seconds from now. Claim path filters expired rows;
+        `queue.sweep_expired()` moves them into `_joblite_dead`.
+
+        For bulk inserts with one commit + one cross-process wake,
+        pass a shared `tx`:
 
             with db.transaction() as tx:
                 for p in payloads:
                     q.enqueue(p, tx=tx)
-                # single commit + one wake for all workers
-
-        Scheduling:
-          - `run_at`: absolute unix epoch when the job becomes claimable.
-          - `delay`:  seconds from now. Shorthand for
-                      `run_at = time.time() + delay`. If both are
-                      passed, `delay` wins.
-          - `expires`: seconds from now after which this job is no
-                      longer eligible for claim. Claim path filters
-                      expired rows; `queue.sweep_expired()` moves
-                      them into `_joblite_dead`.
+                # single commit at block exit, one wake for all
         """
-        if delay is not None:
-            run_at_val = int(time.time() + float(delay))
-        elif run_at is not None:
-            run_at_val = int(run_at)
-        else:
-            run_at_val = int(time.time())
-        expires_at_val = (
-            int(time.time() + float(expires)) if expires is not None else None
-        )
         payload_str = json.dumps(payload)
+        run_at_val = int(run_at) if run_at is not None else None
+        delay_val = int(delay) if delay is not None else None
+        expires_val = int(expires) if expires is not None else None
+        sql = "SELECT jl_enqueue(?, ?, ?, ?, ?, ?, ?) AS id"
         params = [
-            self.name,
-            payload_str,
-            run_at_val,
-            int(priority),
-            self.max_attempts,
-            expires_at_val,
+            self.name, payload_str, run_at_val, delay_val,
+            int(priority), self.max_attempts, expires_val,
         ]
-        sql = """
-            INSERT INTO _joblite_live
-              (queue, payload, run_at, priority, max_attempts, expires_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            RETURNING id
-        """
         if tx is not None:
             rows = tx.query(sql, params)
-            tx.notify(self._channel(), "new")
             return rows[0]["id"]
-
         with self.db.transaction() as own_tx:
             rows = own_tx.query(sql, params)
-            own_tx.notify(self._channel(), "new")
             return rows[0]["id"]
 
     def claim_one(self, worker_id: str) -> Optional[Job]:
         jobs = self.claim_batch(worker_id, 1)
         return jobs[0] if jobs else None
 
-    # SQL for a single-batch claim. Single UPDATE ... RETURNING; partial
-    # index `_joblite_live_claim` covers the subquery. State transition
-    # pending -> processing stays inside the partial WHERE so the row
-    # doesn't drop out of the index mid-UPDATE.
-    #
-    # `expires_at IS NULL OR expires_at > unixepoch()` filters jobs that
-    # have already expired out of the claim path. Expired rows stay in
-    # _joblite_live until `sweep_expired()` moves them to _joblite_dead.
-    _CLAIM_SQL = """
-        UPDATE _joblite_live
-        SET state = 'processing',
-            worker_id = ?,
-            claim_expires_at = unixepoch() + ?,
-            attempts = attempts + 1
-        WHERE id IN (
-          SELECT id FROM _joblite_live
-          WHERE queue = ?
-            AND state IN ('pending', 'processing')
-            AND (expires_at IS NULL OR expires_at > unixepoch())
-            AND ((state = 'pending' AND run_at <= unixepoch())
-              OR (state = 'processing' AND claim_expires_at < unixepoch()))
-          ORDER BY priority DESC, run_at ASC, id ASC
-          LIMIT ?
-        )
-        RETURNING id, queue, payload, worker_id, attempts, claim_expires_at
-    """
-
     def claim_batch(self, worker_id: str, n: int) -> list:
-        """Atomically claim up to `n` jobs. One UPDATE ... RETURNING
-        against _joblite_live via the partial claim index."""
+        """Atomically claim up to `n` jobs. Delegates to
+        `jl_claim_batch`, which does one `UPDATE ... RETURNING` via
+        the partial claim index in Rust — same SQL every binding uses.
+        """
         n = int(n)
         if n <= 0:
             return []
         with self.db.transaction() as tx:
             rows = tx.query(
-                self._CLAIM_SQL,
-                [worker_id, self.visibility_timeout_s, self.name, n],
+                "SELECT jl_claim_batch(?, ?, ?, ?) AS rows_json",
+                [self.name, worker_id, n, self.visibility_timeout_s],
             )
-        return [Job(self, row) for row in rows]
+        data = json.loads(rows[0]["rows_json"])
+        return [Job(self, row) for row in data]
 
     def ack_batch(self, job_ids, worker_id: str) -> int:
-        """Ack multiple jobs in one tx. Returns count of jobs whose claim
-        was still valid."""
+        """Ack multiple jobs in one tx. Delegates to `jl_ack_batch`.
+        Returns count of jobs whose claim was still valid."""
         ids = [int(i) for i in job_ids]
         if not ids:
             return 0
         with self.db.transaction() as tx:
             rows = tx.query(
-                """
-                DELETE FROM _joblite_live
-                WHERE id IN (SELECT value FROM json_each(?))
-                  AND worker_id = ?
-                  AND claim_expires_at >= unixepoch()
-                RETURNING id
-                """,
+                "SELECT jl_ack_batch(?, ?) AS n",
                 [json.dumps(ids), worker_id],
             )
-        return len(rows)
+        return rows[0]["n"]
 
     def claim(
         self,
@@ -376,34 +325,9 @@ class Queue:
         """
         with self.db.transaction() as tx:
             rows = tx.query(
-                """
-                DELETE FROM _joblite_live
-                WHERE queue = ?
-                  AND state = 'pending'
-                  AND expires_at IS NOT NULL
-                  AND expires_at <= unixepoch()
-                RETURNING id, queue, payload, priority, run_at, max_attempts,
-                          attempts, created_at
-                """,
-                [self.name],
+                "SELECT jl_sweep_expired(?) AS n", [self.name]
             )
-            if not rows:
-                return 0
-            for r in rows:
-                tx.execute(
-                    """
-                    INSERT INTO _joblite_dead
-                      (id, queue, payload, priority, run_at, max_attempts,
-                       attempts, last_error, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'expired', ?)
-                    """,
-                    [
-                        r["id"], r["queue"], r["payload"], r["priority"],
-                        r["run_at"], r["max_attempts"], r["attempts"],
-                        r["created_at"],
-                    ],
-                )
-        return len(rows)
+        return rows[0]["n"]
 
     # --- result storage -------------------------------------------
 
@@ -420,65 +344,41 @@ class Queue:
         set a short ttl to auto-reclaim disk; `None` means no expiry
         (you're on the hook for pruning via `sweep_results()`).
 
-        UPSERTs — calling twice for the same `job_id` replaces the
-        first. Typical use is inside a worker after handler success,
-        though callers can also call it manually.
+        Delegates to `jl_result_save`. UPSERTs — calling twice for
+        the same `job_id` replaces the first. Typical use is inside
+        a worker after handler success, though callers can also call
+        it manually.
         """
         value_str = json.dumps(value)
         ttl_s = int(ttl) if ttl is not None else 0
+        params = [int(job_id), value_str, ttl_s]
         if tx is not None:
-            self._save_result_in_tx(tx, job_id, value_str, ttl_s)
+            tx.query("SELECT jl_result_save(?, ?, ?)", params)
             return
         with self.db.transaction() as own_tx:
-            self._save_result_in_tx(own_tx, job_id, value_str, ttl_s)
-
-    @staticmethod
-    def _save_result_in_tx(tx, job_id: int, value_str: str, ttl_s: int) -> None:
-        if ttl_s > 0:
-            tx.execute(
-                """
-                INSERT INTO _joblite_results (job_id, value, expires_at)
-                VALUES (?, ?, unixepoch() + ?)
-                ON CONFLICT(job_id) DO UPDATE
-                  SET value = excluded.value,
-                      expires_at = excluded.expires_at
-                """,
-                [job_id, value_str, ttl_s],
-            )
-        else:
-            tx.execute(
-                """
-                INSERT INTO _joblite_results (job_id, value, expires_at)
-                VALUES (?, ?, NULL)
-                ON CONFLICT(job_id) DO UPDATE
-                  SET value = excluded.value,
-                      expires_at = NULL
-                """,
-                [job_id, value_str],
-            )
+            own_tx.query("SELECT jl_result_save(?, ?, ?)", params)
 
     def get_result(self, job_id: int) -> tuple:
         """Return `(found: bool, value: Any)` for a saved result.
 
         `(False, None)` means the result hasn't been saved yet OR has
-        expired and been swept. `(True, value)` means we have it;
-        `value` can still be `None` (task legitimately returned None).
-        Two-tuple disambiguates.
+        expired. `(True, value)` means we have it; `value` can still
+        be `None` (task legitimately returned None). Two-tuple
+        disambiguates.
+
+        Delegates to `jl_result_get`, which returns SQL NULL for
+        "absent or expired" and the stored JSON text otherwise. The
+        literal string `'null'` (stored None) is distinguishable from
+        SQL NULL (absent) at the rusqlite boundary.
         """
-        rows = self.db.query(
-            """
-            SELECT value, expires_at FROM _joblite_results
-            WHERE job_id = ?
-            """,
-            [job_id],
-        )
-        if not rows:
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT jl_result_get(?) AS v", [int(job_id)]
+            )
+        raw = rows[0]["v"]
+        if raw is None:
             return (False, None)
-        row = rows[0]
-        if row["expires_at"] is not None and row["expires_at"] <= time.time():
-            return (False, None)
-        raw = row["value"]
-        return (True, json.loads(raw) if raw is not None else None)
+        return (True, json.loads(raw))
 
     async def wait_result(
         self,
@@ -519,132 +419,55 @@ class Queue:
                 return value
 
     def sweep_results(self) -> int:
-        """Delete all expired result rows. Returns count deleted."""
+        """Delete all expired result rows. Returns count deleted.
+        Delegates to `jl_result_sweep`."""
         with self.db.transaction() as tx:
-            rows = tx.query(
-                """
-                DELETE FROM _joblite_results
-                WHERE expires_at IS NOT NULL AND expires_at <= unixepoch()
-                RETURNING job_id
-                """,
-            )
-        return len(rows)
+            rows = tx.query("SELECT jl_result_sweep() AS n")
+        return rows[0]["n"]
 
     def ack(self, job_id: int, worker_id: str) -> bool:
+        """Delegates to `jl_ack`."""
         with self.db.transaction() as tx:
             rows = tx.query(
-                """
-                DELETE FROM _joblite_live
-                WHERE id=? AND worker_id=? AND claim_expires_at >= unixepoch()
-                RETURNING id
-                """,
+                "SELECT jl_ack(?, ?) AS r",
                 [int(job_id), worker_id],
             )
-        return len(rows) > 0
+        return bool(rows[0]["r"])
 
     def retry(self, job_id: int, worker_id: str, delay_s: int, error: str) -> bool:
         """Put a claimed job back into pending with a delayed run_at, or
         move it to dead if attempts have reached max_attempts. Returns
-        True iff the caller's claim was still valid."""
+        True iff the caller's claim was still valid. Delegates to
+        `jl_retry`, which handles the attempts-vs-max-attempts branching
+        + wake-notification atomically."""
         with self.db.transaction() as tx:
-            # Pull the current row so we can branch on attempts vs
-            # max_attempts. Single SELECT by PK; partial index not needed.
             rows = tx.query(
-                """
-                SELECT id, queue, payload, priority, run_at, max_attempts,
-                       attempts, created_at
-                FROM _joblite_live
-                WHERE id=? AND worker_id=?
-                  AND claim_expires_at >= unixepoch()
-                  AND state = 'processing'
-                """,
-                [int(job_id), worker_id],
+                "SELECT jl_retry(?, ?, ?, ?) AS r",
+                [int(job_id), worker_id, int(delay_s), error],
             )
-            if not rows:
-                return False
-            r = rows[0]
-            if r["attempts"] >= r["max_attempts"]:
-                # Move to dead. DELETE from live (drops out of partial
-                # index) + INSERT into _joblite_dead.
-                tx.execute(
-                    "DELETE FROM _joblite_live WHERE id=?", [r["id"]]
-                )
-                tx.execute(
-                    """
-                    INSERT INTO _joblite_dead
-                      (id, queue, payload, priority, run_at, max_attempts,
-                       attempts, last_error, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        r["id"], r["queue"], r["payload"], r["priority"],
-                        r["run_at"], r["max_attempts"], r["attempts"],
-                        error, r["created_at"],
-                    ],
-                )
-            else:
-                # Flip back to 'pending', push run_at by delay_s. State
-                # stays inside the partial index's WHERE so the row just
-                # becomes claimable again after the delay.
-                tx.execute(
-                    """
-                    UPDATE _joblite_live
-                    SET state = 'pending',
-                        run_at = unixepoch() + ?,
-                        worker_id = NULL,
-                        claim_expires_at = NULL
-                    WHERE id = ?
-                    """,
-                    [int(delay_s), r["id"]],
-                )
-                tx.notify(self._channel(), "retry")
-        return True
+        return bool(rows[0]["r"])
 
     def fail(self, job_id: int, worker_id: str, error: str) -> bool:
-        """Move the claim straight to dead regardless of attempts."""
+        """Move the claim straight to dead regardless of attempts.
+        Delegates to `jl_fail`."""
         with self.db.transaction() as tx:
             rows = tx.query(
-                """
-                DELETE FROM _joblite_live
-                WHERE id=? AND worker_id=? AND claim_expires_at >= unixepoch()
-                RETURNING id, queue, payload, priority, run_at,
-                          max_attempts, attempts, created_at
-                """,
-                [int(job_id), worker_id],
+                "SELECT jl_fail(?, ?, ?) AS r",
+                [int(job_id), worker_id, error],
             )
-            if not rows:
-                return False
-            r = rows[0]
-            tx.execute(
-                """
-                INSERT INTO _joblite_dead
-                  (id, queue, payload, priority, run_at, max_attempts,
-                   attempts, last_error, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    r["id"], r["queue"], r["payload"], r["priority"],
-                    r["run_at"], r["max_attempts"], r["attempts"],
-                    error, r["created_at"],
-                ],
-            )
-        return True
+        return bool(rows[0]["r"])
 
     def heartbeat(
         self, job_id: int, worker_id: str, extend_s: Optional[int] = None
     ) -> bool:
+        """Delegates to `jl_heartbeat`."""
         extend = int(extend_s) if extend_s is not None else self.visibility_timeout_s
         with self.db.transaction() as tx:
             rows = tx.query(
-                """
-                UPDATE _joblite_live
-                SET claim_expires_at = unixepoch() + ?
-                WHERE id = ? AND worker_id = ? AND state = 'processing'
-                RETURNING id
-                """,
-                [extend, int(job_id), worker_id],
+                "SELECT jl_heartbeat(?, ?, ?) AS r",
+                [int(job_id), worker_id, extend],
             )
-        return len(rows) > 0
+        return bool(rows[0]["r"])
 
 
 class Retryable(Exception):
@@ -1024,29 +847,11 @@ class _Lock:
 
     def __enter__(self) -> "_Lock":
         with self.db.transaction() as tx:
-            # Prune stale rows first so a crashed holder's TTL can
-            # elapse before anyone else tries. Cheap — one indexed
-            # DELETE.
-            tx.execute(
-                "DELETE FROM _joblite_locks "
-                "WHERE name = ? AND expires_at <= unixepoch()",
-                [self.name],
-            )
-            # Try to claim it. INSERT OR IGNORE is a no-op if the row
-            # exists (another holder).
-            tx.execute(
-                """
-                INSERT OR IGNORE INTO _joblite_locks
-                  (name, owner, expires_at)
-                VALUES (?, ?, unixepoch() + ?)
-                """,
+            rows = tx.query(
+                "SELECT jl_lock_acquire(?, ?, ?) AS r",
                 [self.name, self.owner, self.ttl],
             )
-            rows = tx.query(
-                "SELECT owner FROM _joblite_locks WHERE name = ?",
-                [self.name],
-            )
-            if not rows or rows[0]["owner"] != self.owner:
+            if not rows[0]["r"]:
                 raise LockHeld(f"lock {self.name!r} is already held")
             self.acquired = True
         return self
@@ -1054,9 +859,8 @@ class _Lock:
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         if self.acquired:
             with self.db.transaction() as tx:
-                tx.execute(
-                    "DELETE FROM _joblite_locks "
-                    "WHERE name = ? AND owner = ?",
+                tx.query(
+                    "SELECT jl_lock_release(?, ?)",
                     [self.name, self.owner],
                 )
             self.acquired = False
@@ -1117,40 +921,24 @@ class Database:
         if limit <= 0 or per <= 0:
             raise ValueError("limit and per must be positive")
         with self.transaction() as tx:
-            window_start = (int(time.time()) // per) * per
             rows = tx.query(
-                "SELECT count FROM _joblite_rate_limits "
-                "WHERE name = ? AND window_start = ?",
-                [name, window_start],
+                "SELECT jl_rate_limit_try(?, ?, ?) AS r",
+                [name, limit, per],
             )
-            current = rows[0]["count"] if rows else 0
-            if current >= limit:
-                return False
-            tx.execute(
-                """
-                INSERT INTO _joblite_rate_limits (name, window_start, count)
-                VALUES (?, ?, 1)
-                ON CONFLICT(name, window_start) DO UPDATE
-                  SET count = count + 1
-                """,
-                [name, window_start],
-            )
-        return True
+        return bool(rows[0]["r"])
 
     def sweep_rate_limits(self, older_than_s: int = 3600) -> int:
         """Delete rate-limit rows whose `window_start` is older than
         `older_than_s` seconds ago. Returns rows deleted. Purely a
         table-space reclaim — old windows are never consulted by
         `try_rate_limit`, so leaving them around is just disk use.
+        Delegates to `jl_rate_limit_sweep`.
         """
         with self.transaction() as tx:
             rows = tx.query(
-                "DELETE FROM _joblite_rate_limits "
-                "WHERE window_start < unixepoch() - ? "
-                "RETURNING name",
-                [int(older_than_s)],
+                "SELECT jl_rate_limit_sweep(?) AS n", [int(older_than_s)]
             )
-        return len(rows)
+        return rows[0]["n"]
 
     def lock(
         self,
