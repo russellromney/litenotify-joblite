@@ -1,5 +1,5 @@
 .PHONY: help test test-rust test-python test-python-slow test-node test-all \
-        build build-pyo3 build-ext \
+        build build-ext build-node \
         coverage coverage-rust coverage-python coverage-python-all \
         install-coverage-deps clean
 
@@ -15,9 +15,9 @@ help:
 	@echo "  make test-all       - everything, including slow marks"
 	@echo ""
 	@echo "Builds:"
-	@echo "  make build          - build both PyO3 + loadable extension"
-	@echo "  make build-pyo3     - maturin develop --release"
+	@echo "  make build          - loadable extension + node binding"
 	@echo "  make build-ext      - cargo build -p honker-extension --release"
+	@echo "  make build-node     - napi build for packages/honker-node"
 	@echo ""
 	@echo "Coverage (run 'make install-coverage-deps' once):"
 	@echo "  make coverage       - both rust + python HTML reports into coverage/"
@@ -32,13 +32,13 @@ test: test-rust test-python test-node
 test-rust:
 	cargo test -p honker-core --release
 
-test-python:
+test-python: build-ext
 	.venv/bin/python -m pytest tests/
 
-test-python-slow:
+test-python-slow: build-ext
 	.venv/bin/python -m pytest tests/ -m slow
 
-test-node:
+test-node: build-node
 	cd packages/honker-node && npm test
 
 test-all: test test-python-slow
@@ -46,14 +46,13 @@ test-all: test test-python-slow
 
 # ---- builds ----
 
-build: build-pyo3 build-ext
-
-build-pyo3:
-	cd packages/honker && VIRTUAL_ENV=$(CURDIR)/.venv \
-		$(CURDIR)/.venv/bin/python -m maturin develop --release
+build: build-ext build-node
 
 build-ext:
 	cargo build --release -p honker-extension
+
+build-node:
+	cd packages/honker-node && npm run build
 
 # ---- coverage ----
 

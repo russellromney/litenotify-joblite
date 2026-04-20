@@ -52,7 +52,7 @@ import time
 from datetime import datetime
 from typing import Any, Optional
 
-import _honker_native
+from honker import _honker_native
 
 
 class CronSchedule:
@@ -108,6 +108,19 @@ class Scheduler:
     Task registration + fire-due logic live in Rust
     (`honker_scheduler_register` / `honker_scheduler_tick`); this class is
     ~40 lines of asyncio glue around lock + tick + sleep + heartbeat.
+
+    Leader-lock caveat: the scheduler lock is TTL-based and
+    best-effort, not true mutual exclusion. If a leader process pauses
+    for longer than `LOCK_TTL` (60s, e.g. GC pause, laptop sleep,
+    kernel OOM pressure), another process can acquire the lock while
+    the "dead" leader is still running. Both would fire scheduled
+    tasks until the original wakes and notices its lock is gone.
+
+    For idempotent cron work (health checks, metrics rollups) this is
+    fine. For work that must run exactly once per fire (nightly
+    backup, invoice generation), wrap the task body in a second
+    `db.lock('task-name', ttl=...)` and have it exit early on
+    `LockHeld`.
     """
 
     LOCK_NAME = "honker-scheduler"
@@ -185,10 +198,22 @@ class Scheduler:
         stop_event = stop_event or asyncio.Event()
 
         if not self._registered:
-            # Nothing to do; return without acquiring the lock so a
-            # misconfigured scheduler doesn't block out other
-            # processes.
-            return
+            # This process didn't call .add(), but tasks may have been
+            # registered by another process (separate registrar, CLI,
+            # migration, prior run persisted to disk). Check the
+            # authoritative table before bailing. Raising is friendlier
+            # than silent no-op — a dedicated runner process that
+            # loads tasks from elsewhere would otherwise log nothing
+            # and fire nothing.
+            rows = self.db.query(
+                "SELECT COUNT(*) AS n FROM _honker_scheduler_tasks"
+            )
+            if not rows or rows[0]["n"] == 0:
+                raise RuntimeError(
+                    "Scheduler.run() called with no registered tasks. "
+                    "Call scheduler.add(...) first, or ensure another "
+                    "process has populated _honker_scheduler_tasks."
+                )
 
         with self.db.lock(self.lock_name, ttl=self.LOCK_TTL):
             hb = asyncio.create_task(self._heartbeat_loop(stop_event))

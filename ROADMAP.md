@@ -1,5 +1,120 @@
 # ROADMAP
 
+## Phase naming
+
+Phases use the format `Phase <Name>`, not numbers — avoids renumbering
+when inserting new phases. Names are unique, picked from space missions,
+battles, mountains, or epic-sounding words. Each phase header includes
+adjacency links (`After: · Before:`). Subphases use letters.
+
+## Phase Shakedown — Pre-launch correctness sweep
+
+> After: (first named phase) · Before: Phase Submodule
+
+Cleanup pass found during the pre-HN-launch review. Each item is a
+semi-hidden race or footgun: the code appears to work because the
+happy path masks the window where a commit, registration, or
+configuration choice silently doesn't do what the caller expects.
+
+### a. Subscribe-before-first-read race (DONE)
+
+`_WorkerQueueIter`, `Queue.wait_result`, and `Listener` previously
+snapshotted some state (claim result / get_result / MAX(id)) and then
+subscribed to `wal_events()`. A commit landing between snapshot and
+subscribe fired its WAL tick to no subscriber, leaving the consumer
+parked on its paranoia timeout (15s / idle_poll_s) instead of the
+stat-poll cadence.
+
+Fixed by subscribing eagerly in `__init__` (or before the first check
+in `wait_result`). `_StreamIter` was already correct and unchanged.
+Regression guard: `tests/test_subscribe_race.py` — 6 tests covering
+the structural invariant (`_wal` set at construction) and the
+behavioral bound (wake in <1s, not 15s/5s fallback).
+
+### b. Scheduler silent no-op when `_registered` is empty (DONE)
+
+`Scheduler.run()` previously returned immediately without acquiring
+the leader lock if the current process hadn't called `.add()`. A
+deploy with a dedicated "runner" process (tasks registered by a
+different process / CLI / migration) silently no-opped — no logs, no
+lock contention, no fires.
+
+Fixed in `_scheduler.py`: `run()` now checks
+`_honker_scheduler_tasks` when local `_registered` is empty. If rows
+exist, proceed. If none, raise `RuntimeError` with a clear message.
+Regression guards: `test_scheduler_run_raises_without_tasks` and
+`test_scheduler_run_proceeds_if_another_process_registered` in
+`tests/test_scheduler.py`.
+
+### c. Scheduler does not wake on new registrations mid-sleep (TODO)
+
+Main loop sleeps until `honker_scheduler_soonest()`. If another
+process registers a new task whose `next_fire_at` is earlier than the
+current sleep target, the leader doesn't notice until the current
+sleep ends.
+
+**Fix:** have `honker_scheduler_register` fire a notify on a reserved
+channel (e.g. `honker:scheduler`). Main loop races its timer sleep
+against `wal_events()` so a new registration kicks it out of the
+sleep early.
+
+### d. `honker_bootstrap` should assert WAL mode (TODO)
+
+The loadable extension is loaded into any client's connection,
+inheriting whatever PRAGMAs the user set. A client in
+`journal_mode=DELETE` gets tables that work (INSERTs into
+`_honker_*`) but no other process can wake on the WAL because there
+isn't one. The setup looks fine until nothing fires.
+
+**Fix:** in the `honker_bootstrap` SQL function, query
+`PRAGMA journal_mode` and raise a SQL error if it's not `wal`. The
+Python binding already opens in WAL (`open_conn`) so it's unaffected;
+the check catches extension users with mis-PRAGMA'd connections.
+Skip the check if the DB is `:memory:` (in-memory can't be WAL —
+used by Rust unit tests).
+
+### e. Listener + `prune_notifications` interaction (DONE, docs-only)
+
+Pruning deletes rows. A listener offline (or slow) during prune loses
+events pruned past its `last_seen`. Was documented on `Listener` but
+not cross-referenced from `prune_notifications` — easy footgun for
+users who set up an hourly cron to trim the table and wonder why
+subscribers occasionally miss events.
+
+Fixed: `prune_notifications` docstring now includes an explicit
+warning pointing offline-tolerant consumers at `db.stream(...)`.
+
+### f. WalEvents thread-leak regression test (DONE, already covered)
+
+Existing `tests/test_resource_bounds.py::test_listener_churn_does_not_leak_threads`
+and `test_many_simultaneous_listeners_bounded_thread_count` exercise
+the `Drop → unsubscribe → bridge-thread-exit` chain (300× and 100×
+respectively), since `Listener` uses `db.wal_events()` internally.
+No new test needed.
+
+### g. Scheduler lock pause-tolerance (DONE, docs-only)
+
+`LOCK_TTL=60`, `HEARTBEAT_INTERVAL=30`. If the leader pauses >60s
+(GC, laptop sleep, kernel OOM pressure), another process can acquire
+the lock and both fire the same tasks. Acceptable for idempotent
+cron work but not for long-running exclusive tasks.
+
+Fixed: `Scheduler` class docstring now has an explicit caveat
+paragraph recommending a second `db.lock('task-name', ttl=...)`
+inside the task body for exclusive work. No code change — the right
+design, just needs to be said.
+
+### Remaining (post-launch candidates)
+
+- **(c) Scheduler wake-on-new-registration** — needs Rust change
+  (`honker_scheduler_register` emits a wake on `honker:scheduler`)
+  plus Python scheduler loop racing its timer against `wal_events()`.
+  Not blocking: late-bound registrations still fire on the next tick.
+- **(d) `honker_bootstrap` WAL mode assertion** — needs Rust change
+  with a `:memory:` carve-out for in-memory tests. Not blocking:
+  mis-PRAGMA'd extension users are a narrow edge case, and the
+  Python binding is unaffected.
+
 ## Shipped
 
 - Cross-process NOTIFY/LISTEN via a `_honker_notifications` table

@@ -359,15 +359,56 @@ async def test_two_schedulers_one_runs_one_raises_lockheld(db_path):
     await asyncio.wait_for(t1, timeout=3.0)
 
 
-def test_scheduler_run_noop_without_tasks(db_path):
-    """A scheduler with no tasks added returns without acquiring the
-    lock — avoids blocking real schedulers that might be trying to
-    hold it."""
+def test_scheduler_run_raises_without_tasks(db_path):
+    """A scheduler with no tasks added and an empty DB raises a clear
+    error rather than silently no-opping. Phase Shakedown (b)."""
     db = honker.open(db_path)
     sched = Scheduler(db)
-    asyncio.run(sched.run())
-    # Lock never acquired.
+    with pytest.raises(RuntimeError, match="no registered tasks"):
+        asyncio.run(sched.run())
+    # Lock never acquired — we raised before the lock block.
     rows = db.query(
         "SELECT COUNT(*) AS c FROM _honker_locks WHERE name='honker-scheduler'"
     )
     assert rows[0]["c"] == 0
+
+
+async def test_scheduler_run_proceeds_if_another_process_registered(db_path):
+    """A scheduler that didn't `.add()` anything locally but finds rows
+    in `_honker_scheduler_tasks` (registered by another process or a
+    prior run) still runs. Phase Shakedown (b) — prevents silent no-op
+    for dedicated runner processes."""
+    db = honker.open(db_path)
+    # Simulate another process having registered a task.
+    Scheduler(db).add(
+        name="from-elsewhere",
+        queue="health",
+        schedule=crontab("0 3 * * *"),
+    )
+
+    # Fresh instance — no local self._registered entries. Must still run.
+    runner = Scheduler(db)
+    stop = asyncio.Event()
+
+    async def stop_soon():
+        await asyncio.sleep(0.1)
+        stop.set()
+
+    # Race the scheduler loop against a quick stop. If it silently
+    # returns (the old bug), the gather completes immediately and
+    # the lock was never acquired. If the fix is in place, it
+    # acquires the lock, enters the main loop, and stops on the event.
+    async def check_lock_was_held():
+        await asyncio.sleep(0.05)
+        rows = db.query(
+            "SELECT COUNT(*) AS c FROM _honker_locks "
+            "WHERE name='honker-scheduler'"
+        )
+        return rows[0]["c"]
+
+    holds_lock_during_run = asyncio.create_task(check_lock_was_held())
+    await asyncio.gather(runner.run(stop_event=stop), stop_soon())
+    assert await holds_lock_during_run == 1, (
+        "scheduler silently returned without acquiring the lock — "
+        "regression of Phase Shakedown (b)"
+    )

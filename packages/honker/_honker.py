@@ -8,7 +8,7 @@ from typing import Any, AsyncIterator, Callable, Optional
 
 
 def _core_open(path, max_readers):
-    from _honker_native import open as _open
+    from honker._honker_native import open as _open
     return _open(path, max_readers=max_readers)
 
 
@@ -68,14 +68,18 @@ class Listener:
         self.db = db
         self.channel = channel
         self._buffer: deque = deque()
-        # Skip anything that existed before this Listener started.
+        # Subscribe BEFORE the MAX(id) snapshot so a publish landing in
+        # the window between the two is captured in our mpsc channel
+        # rather than firing to nobody. The __anext__ loop's SELECT-then-
+        # wait would catch it either way, but eager subscribe matches
+        # _StreamIter / _WorkerQueueIter and keeps the invariant uniform.
+        self._wal = db.wal_events()
         rows = db.query(
             "SELECT COALESCE(MAX(id), 0) AS m "
             "FROM _honker_notifications WHERE channel=?",
             [channel],
         )
         self._last_seen = int(rows[0]["m"]) if rows else 0
-        self._wal = db.wal_events()
 
     def __aiter__(self):
         return self
@@ -396,11 +400,15 @@ class Queue:
         forever. Raises `asyncio.TimeoutError` on expiry.
         """
         deadline = time.time() + float(timeout) if timeout is not None else None
-        # Check once before subscribing, in case it's already there.
+        # Subscribe BEFORE the first get_result so a save landing between
+        # "not yet" and "start listening" can't fire its WAL tick to no
+        # subscriber. The shared watcher buffers ticks from subscribe()
+        # onward, so the first wait_for() consumes any that arrived
+        # during the initial check.
+        wal = self.db.wal_events()
         found, value = self.get_result(job_id)
         if found:
             return value
-        wal = self.db.wal_events()
         while True:
             remaining = (
                 max(0.0, deadline - time.time()) if deadline is not None else 15.0
@@ -960,6 +968,12 @@ class Database:
         `db.stream(...)` rather than `tx.notify(...)`; the stream's
         consumer-offset tracking is a better fit than trying to keep
         the notifications buffer large.
+
+        Warning: listeners offline or slow during a prune silently
+        skip any events pruned past their `last_seen`. There is no
+        re-delivery mechanism for `notify`; rows deleted here are
+        gone. If your consumers need to tolerate downtime, use a
+        stream.
         """
         conditions: list = []
         params: list = []
@@ -1060,7 +1074,11 @@ class _WorkerQueueIter:
         self.queue = queue
         self.worker_id = worker_id
         self.idle_poll_s = idle_poll_s
-        self._wal = None
+        # Subscribe BEFORE the first claim so an enqueue landing between
+        # "claim returned empty" and "start listening" can't fire its WAL
+        # tick to no subscriber. The shared watcher buffers ticks into
+        # our mpsc channel from the moment subscribe() returns.
+        self._wal = queue.db.wal_events()
 
     def __aiter__(self):
         return self
@@ -1070,8 +1088,6 @@ class _WorkerQueueIter:
             jobs = self.queue.claim_batch(self.worker_id, 1)
             if jobs:
                 return jobs[0]
-            if self._wal is None:
-                self._wal = self.queue.db.wal_events()
             try:
                 await asyncio.wait_for(
                     self._wal.__anext__(),

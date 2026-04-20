@@ -65,6 +65,8 @@ Deliberately out of scope: task pipelines/chains/groups/chords, multi-writer rep
 pip install honker
 ```
 
+The Python binding is pure Python over the bundled `libhonker_ext` SQLite loadable extension, so it needs a `python` whose stdlib `sqlite3` was built with `enable_load_extension` on. python.org / Homebrew / pyenv / conda / most Linux distros are fine; Apple's `/usr/bin/python3` ships with extension loading disabled.
+
 ### Python — queue (durable at-least-once work)
 
 ```python
@@ -291,7 +293,7 @@ Layout:
 honker-core/              # Rust rlib shared across all bindings
 honker-extension/         # SQLite loadable extension (cdylib)
 packages/
-  honker/                 # Python package (PyO3 cdylib + Queue/Stream/Outbox/Scheduler)
+  honker/                 # Python package (pure-Python over libhonker_ext.dylib)
   honker-node/            # napi-rs Node.js binding
 tests/                    # integration tests (cross-package)
 bench/                    # benches
@@ -304,7 +306,7 @@ make test                   # default: rust + python + node (fast, ~10s)
 make test-python-slow       # soak + real-time cron tests (~2 min)
 make test-all               # everything including slow marks
 
-make build                  # PyO3 maturin develop + loadable extension
+make build                  # loadable extension + node binding
 
 python bench/wake_latency_bench.py --samples 500
 python bench/real_bench.py --workers 4 --enqueuers 2 --seconds 15
@@ -321,7 +323,7 @@ make coverage-python        # honker python paths
 make coverage-rust          # honker-core Rust unit tests
 ```
 
-Python coverage reflects the full honker test suite (~92% of `packages/honker/`). Rust coverage reflects only `cargo test` — many `honker_ops.rs` paths (`honker_enqueue`, `honker_claim_batch`, etc.) are only exercised via the Python test suite and won't show up in the Rust report. Combined cross-language coverage is non-trivial (LLVM profile-data merging across PyO3 boundaries) and is deferred.
+Python coverage reflects the full honker test suite (~92% of `packages/honker/`). Rust coverage reflects only `cargo test` — many `honker_ops.rs` paths (`honker_enqueue`, `honker_claim_batch`, etc.) are only exercised via the Python test suite, and the Python binding drives them through the loadable extension, so those paths don't show up in `cargo llvm-cov`. Combined cross-language coverage is non-trivial and is deferred.
 
 ## License
 

@@ -34,8 +34,6 @@ def _run_worker_script(db_path: str, worker_id: str, n: int) -> list:
             db = honker.open({db_path!r})
             q = db.queue('shared', visibility_timeout_s=30)
             processed = []
-            # Drain loop: claim until None, but don't loop forever — if we
-            # don't get a job in 500 ms assume the queue is empty.
             import time
             idle_start = None
             while True:
@@ -44,6 +42,13 @@ def _run_worker_script(db_path: str, worker_id: str, n: int) -> list:
                     processed.append(job.payload['i'])
                     job.ack()
                     idle_start = None
+                    # Yield between claims so SQLite's busy-timeout
+                    # has a chance to hand the write lock to the other
+                    # process. Without this, whichever process opens
+                    # first drains serially while the other blocks on
+                    # BEGIN IMMEDIATE — artifact of SQLite's non-FIFO
+                    # busy retry, not a fairness bug worth testing.
+                    await asyncio.sleep(0.002)
                     continue
                 if idle_start is None:
                     idle_start = time.time()
