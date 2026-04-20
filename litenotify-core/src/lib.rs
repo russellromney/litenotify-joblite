@@ -654,7 +654,22 @@ mod tests {
             assert_eq!(shared.subscriber_count(), 10);
         }
         std::fs::write(&tmp, b"wake").unwrap();
-        std::thread::sleep(Duration::from_millis(30));
+        // Poll for pruning instead of sleeping a fixed duration —
+        // the 1 ms poll thread needs to notice the file change AND
+        // attempt to send on each dropped receiver AND prune. Under
+        // parallel test load (`cargo test` runs threads in parallel),
+        // 30 ms is not enough; previously this flaked ~5% of runs.
+        // 2 s gives plenty of headroom without slowing the test.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while shared.subscriber_count() != 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+            // Keep poking the file so the stat-poll thread has a
+            // change to react to. Without this, a missed wake on
+            // the first poke means we wait the full 2s.
+            std::fs::write(&tmp, b"wake").unwrap();
+        }
         assert_eq!(shared.subscriber_count(), 0);
 
         let _ = std::fs::remove_file(&tmp);

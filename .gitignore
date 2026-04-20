@@ -20,6 +20,12 @@ venv/
 # Rust
 target/
 
+# Coverage
+coverage/
+.coverage
+.coverage.*
+htmlcov/
+
 # SQLite test databases / WAL / shared-memory
 *.db
 *.db-shm

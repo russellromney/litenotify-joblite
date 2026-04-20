@@ -303,14 +303,28 @@ bench/                        # benches
 Each `packages/*` directory is self-contained (own `Cargo.toml` / `pyproject.toml` / `package.json`) and is intended to become its own repository published as a git submodule into this directory. Today it lives inline for fast iteration while the APIs settle.
 
 ```bash
-cargo test -p litenotify-core                # Rust core
-pytest tests/                                # Python: integration + cross-lang + extension interop
-cd packages/litenotify-node && npm test      # Node: 8 tests incl. Python→Node wake
+make test                   # default: rust + python + node (fast, ~10s)
+make test-python-slow       # soak + real-time cron tests (~2 min)
+make test-all               # everything including slow marks
+
+make build                  # PyO3 maturin develop + loadable extension
 
 python bench/wake_latency_bench.py --samples 500
 python bench/real_bench.py --workers 4 --enqueuers 2 --seconds 15
 python bench/ext_bench.py
 ```
+
+### Coverage
+
+One-time: `make install-coverage-deps` (installs `coverage.py` + `cargo-llvm-cov`).
+
+```bash
+make coverage               # both HTML reports into coverage/
+make coverage-python        # joblite + litenotify python paths
+make coverage-rust          # litenotify-core Rust unit tests
+```
+
+Python coverage reflects the full joblite test suite (~92% of `packages/joblite/`). Rust coverage reflects only `cargo test` — many `joblite_ops.rs` paths (`jl_enqueue`, `jl_claim_batch`, etc.) are only exercised via the Python test suite and won't show up in the Rust report. Combined cross-language coverage is non-trivial (LLVM profile-data merging across PyO3 boundaries) and is deferred.
 
 ## License
 
