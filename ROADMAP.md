@@ -123,7 +123,7 @@ each new binding is. Six-commit refactor:
   -> unix_ts`. Python's `CronSchedule` class collapses to a marker
   holding the expression string; `next_after()` is one SQL call. 100
   lines of Python parsing deleted.
-- [ ] **5. Scheduler state + fire-due to Rust.** New SQL functions
+- [x] **5. Scheduler state + fire-due to Rust.** New SQL functions
   `jl_scheduler_register(name, queue, cron_expr, payload, priority,
   expires)` and `jl_scheduler_tick() -> JSON of due fires`. Python
   `Scheduler.run()` collapses to ~40 lines of asyncio glue around

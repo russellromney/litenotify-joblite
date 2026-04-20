@@ -49,9 +49,11 @@ pub unsafe extern "C" fn sqlite3_litenotifyext_init(
             })?;
             // jl_bootstrap, jl_claim_batch, jl_ack_batch, jl_sweep_expired,
             // jl_lock_acquire, jl_lock_release, jl_rate_limit_try,
-            // jl_rate_limit_sweep, jl_scheduler_record_fire,
-            // jl_scheduler_last_fire, jl_result_save, jl_result_get,
-            // jl_result_sweep.
+            // jl_rate_limit_sweep, jl_cron_next_after,
+            // jl_scheduler_register, jl_scheduler_unregister,
+            // jl_scheduler_tick, jl_scheduler_soonest, jl_result_save,
+            // jl_result_get, jl_result_sweep, jl_enqueue, jl_ack,
+            // jl_retry, jl_fail, jl_heartbeat.
             litenotify_core::attach_joblite_functions(&conn)?;
             // Persistent load: extension stays registered across
             // connection close in the same process.

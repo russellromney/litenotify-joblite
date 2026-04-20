@@ -5,20 +5,21 @@ A scheduler process holds a set of named schedules (cron expressions
 into the named queue. Regular workers claim and execute it. The
 scheduler itself doesn't run handlers — it just dispatches.
 
+Registration + fire-due logic live in Rust via `jl_scheduler_register`
+and `jl_scheduler_tick`; this module is a thin asyncio wrapper. Tasks
+persist in `_joblite_scheduler_tasks`, so any process (Python, a `sqlite3
+.load` session, a future Node/Go binding) sees the same registrations.
+
 Leader election via `db.lock('joblite-scheduler', ttl=60)` ensures at
 most one scheduler fires across all scheduler processes. A periodic
 heartbeat refreshes the lock's TTL during long sleeps between fires.
 If the leader crashes, the TTL elapses and a standby can take over.
 
-Per-task `last_fire_at` is persisted in `_joblite_scheduler_state`,
-so scheduler restart within the same boundary window doesn't
-double-fire.
-
-Missed fires (scheduler down during a boundary) are NOT caught up —
-when the scheduler comes back, it computes the next boundary after
-now and sleeps. Users who want catch-up semantics can layer that on
-top; an unbounded catch-up after a long outage is usually worse than
-skipping.
+Boundaries that were missed while the leader was down are caught up
+on the next tick — `jl_scheduler_tick` advances `next_fire_at`
+minute-by-minute until it's past `now`. For noisy schedules that
+shouldn't backfill, set `expires=` so stale jobs get swept instead
+of executed.
 
 Usage:
 
@@ -46,10 +47,10 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
 import time
-from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import litenotify
 
@@ -99,24 +100,14 @@ def crontab(expr: str) -> CronSchedule:
     return CronSchedule(expr)
 
 
-@dataclass
-class _ScheduledTask:
-    name: str
-    queue: str
-    schedule: CronSchedule
-    payload: Any = None
-    priority: int = 0
-    expires: Optional[float] = None
-
-
 class Scheduler:
     """Periodic-task dispatcher. Run one process worth of it per app;
     multiple scheduler processes compete for the leader lock and only
     one fires.
 
-    The scheduler enqueues into named queues on cron boundaries. It
-    doesn't run handlers — regular workers consume the enqueued jobs
-    like any other job.
+    Task registration + fire-due logic live in Rust
+    (`jl_scheduler_register` / `jl_scheduler_tick`); this class is
+    ~40 lines of asyncio glue around lock + tick + sleep + heartbeat.
     """
 
     LOCK_NAME = "joblite-scheduler"
@@ -126,7 +117,12 @@ class Scheduler:
     def __init__(self, db, lock_name: Optional[str] = None):
         self.db = db
         self.lock_name = lock_name or self.LOCK_NAME
-        self._tasks: Dict[str, _ScheduledTask] = {}
+        # Names registered via this Scheduler instance. The
+        # authoritative registration lives in
+        # `_joblite_scheduler_tasks` — this set only exists so a
+        # process with no tasks to add doesn't acquire the lock in
+        # `run()`.
+        self._registered: set[str] = set()
 
     def add(
         self,
@@ -137,77 +133,41 @@ class Scheduler:
         priority: int = 0,
         expires: Optional[float] = None,
     ) -> None:
-        """Register a periodic task.
+        """Register a periodic task in `_joblite_scheduler_tasks`.
 
-        - `name`: unique per-scheduler identifier. Used as the key in
-          `_joblite_scheduler_state` to track `last_fire_at`. A
-          second `add` with the same name replaces the first.
+        - `name`: unique per-scheduler identifier. A second `add`
+          with the same name replaces the first registration
+          entirely (including cron expr, queue, payload).
         - `queue`: the queue to enqueue into on each boundary.
         - `schedule`: a `CronSchedule` from `crontab(expr)`.
         - `payload`: the payload for enqueued jobs. Default None.
         - `priority`: enqueue priority for fired jobs.
-        - `expires`: how many seconds a fired job stays claimable. If
-          workers are down longer than this, the job expires and
-          `queue.sweep_expired()` will move it to `_joblite_dead`.
-          Useful to avoid piling up a backlog.
+        - `expires`: how many seconds a fired job stays claimable.
+          `queue.sweep_expired()` moves expired rows into
+          `_joblite_dead`.
         """
-        self._tasks[name] = _ScheduledTask(
-            name=name,
-            queue=queue,
-            schedule=schedule,
-            payload=payload,
-            priority=priority,
-            expires=expires,
-        )
-
-    # --- persistence helpers ------------------------------------------
-
-    def _load_last_fires(self) -> Dict[str, int]:
-        rows = self.db.query(
-            "SELECT name, last_fire_at FROM _joblite_scheduler_state"
-        )
-        return {r["name"]: r["last_fire_at"] for r in rows}
-
-    def _record_fire(self, name: str, fire_at_unix: int) -> None:
         with self.db.transaction() as tx:
             tx.query(
-                "SELECT jl_scheduler_record_fire(?, ?)",
-                [name, fire_at_unix],
+                "SELECT jl_scheduler_register(?, ?, ?, ?, ?, ?)",
+                [
+                    name,
+                    queue,
+                    schedule.expr,
+                    json.dumps(payload),
+                    int(priority),
+                    int(expires) if expires is not None else None,
+                ],
             )
+        self._registered.add(name)
 
-    # --- pure fire logic, testable without sleeps --------------------
-
-    def _fire_due(
-        self,
-        now: datetime,
-        next_fires: Dict[str, datetime],
-        last_fires: Dict[str, int],
-    ) -> int:
-        """Fire all tasks whose next boundary is at or before `now`.
-        Updates `next_fires` and `last_fires` in place. Returns the
-        number of tasks fired.
-
-        Pure function over (now, tasks, state) — no sleeps, no lock.
-        Unit-testable without waiting for real cron boundaries.
-        """
-        fired = 0
-        for name, task in self._tasks.items():
-            nf = next_fires[name]
-            while nf <= now:
-                boundary_ts = int(nf.timestamp())
-                prev = last_fires.get(name, 0)
-                if boundary_ts > prev:
-                    self.db.queue(task.queue).enqueue(
-                        task.payload,
-                        priority=task.priority,
-                        expires=task.expires,
-                    )
-                    self._record_fire(name, boundary_ts)
-                    last_fires[name] = boundary_ts
-                    fired += 1
-                nf = task.schedule.next_after(nf)
-            next_fires[name] = nf
-        return fired
+    def remove(self, name: str) -> bool:
+        """Unregister a task. Returns True iff a row was removed."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT jl_scheduler_unregister(?) AS n", [name]
+            )
+        self._registered.discard(name)
+        return rows[0]["n"] > 0
 
     # --- scheduler main loop -----------------------------------------
 
@@ -220,20 +180,14 @@ class Scheduler:
 
         Raises `joblite.LockHeld` if another scheduler already holds
         the lock. Callers that want hot-standby semantics should wrap
-        in a retry loop:
-
-            while True:
-                try:
-                    await scheduler.run(stop_event)
-                    break
-                except joblite.LockHeld:
-                    await asyncio.sleep(5)
+        in a retry loop.
         """
         stop_event = stop_event or asyncio.Event()
 
-        if not self._tasks:
+        if not self._registered:
             # Nothing to do; return without acquiring the lock so a
-            # misconfigured scheduler doesn't block out other processes.
+            # misconfigured scheduler doesn't block out other
+            # processes.
             return
 
         with self.db.lock(self.lock_name, ttl=self.LOCK_TTL):
@@ -269,21 +223,22 @@ class Scheduler:
                 )
 
     async def _main_loop(self, stop_event: asyncio.Event) -> None:
-        last_fires = self._load_last_fires()
-        now = datetime.now()
-        next_fires = {
-            name: task.schedule.next_after(now)
-            for name, task in self._tasks.items()
-        }
         while not stop_event.is_set():
-            now = datetime.now()
-            self._fire_due(now, next_fires, last_fires)
-            if not next_fires:
+            now = int(time.time())
+            # tick + soonest share a writer transaction: jl_* scalars
+            # are registered on the writer slot only (one copy, lowest
+            # memory), so reads through reader connections wouldn't
+            # find them. The soonest query also serializes behind the
+            # tick, so we can't miss a freshly registered task.
+            with self.db.transaction() as tx:
+                tx.query("SELECT jl_scheduler_tick(?)", [now])
+                rows = tx.query(
+                    "SELECT jl_scheduler_soonest() AS t"
+                )
+            soonest = int(rows[0]["t"])
+            if soonest == 0:
                 return
-            soonest = min(next_fires.values())
-            sleep_s = max(
-                0.1, (soonest - datetime.now()).total_seconds()
-            )
+            sleep_s = max(0.1, soonest - time.time())
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=sleep_s)
                 return  # stop_event set

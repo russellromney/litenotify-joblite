@@ -149,8 +149,12 @@ SELECT jl_lock_acquire('backup', 'me', 60);              -- 1 = got it, 0 = held
 SELECT jl_lock_release('backup', 'me');                  -- 1 = released
 SELECT jl_rate_limit_try('api', 10, 60);                 -- 1 = under, 0 = at limit
 SELECT jl_rate_limit_sweep(3600);                        -- drop windows >1h old
-SELECT jl_scheduler_record_fire('nightly', unixepoch()); -- UPSERT fire-time
-SELECT jl_scheduler_last_fire('nightly');                -- unix_ts or 0
+SELECT jl_cron_next_after('0 3 * * *', unixepoch());     -- unix ts of next fire
+SELECT jl_scheduler_register('nightly', 'backups',
+  '0 3 * * *', '"go"', 0, NULL);                         -- register periodic task
+SELECT jl_scheduler_tick(unixepoch());                   -- JSON: fires due
+SELECT jl_scheduler_soonest();                           -- min next_fire_at
+SELECT jl_scheduler_unregister('nightly');               -- 1 = deleted
 SELECT jl_result_save(42, '{"ok":true}', 3600);          -- save w/ 1h TTL
 SELECT jl_result_get(42);                                -- value or NULL
 SELECT jl_result_sweep();                                -- prune expired

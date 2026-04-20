@@ -348,53 +348,80 @@ def test_extension_rate_limit_sweep(ext_db_path):
     conn.close()
 
 
-# ---------- jl_scheduler_record_fire / jl_scheduler_last_fire ----------
+# ---------- jl_scheduler_register / jl_scheduler_tick / _unregister ----------
 
 
 @pytest.mark.skipif(_EXT_PATH is None, reason=_SKIP_REASON)
-def test_extension_scheduler_state(ext_db_path):
-    """`jl_scheduler_record_fire` + `jl_scheduler_last_fire` are the
-    extension-side equivalents of Python `Scheduler._record_fire` +
-    `_load_last_fires`."""
+def test_extension_scheduler_register_and_tick(ext_db_path):
+    """`jl_scheduler_register` inserts a task row; `jl_scheduler_tick`
+    fires due boundaries and advances `next_fire_at`."""
     conn = _open_ext(ext_db_path)
-    # Never fired.
+    # Install the schema (bootstrap_joblite runs on first register
+    # through bootstrap — but the ext path bootstraps lazily when
+    # joblite.open() is called; for a pure-ext session we call the
+    # bootstrap scalar explicitly).
+    conn.execute("SELECT jl_bootstrap()")
+    conn.execute(
+        "SELECT jl_scheduler_register('nightly', 'backups', '0 3 * * *', "
+        "'\"go\"', 0, NULL)"
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT queue, cron_expr, payload, next_fire_at "
+        "FROM _joblite_scheduler_tasks WHERE name='nightly'"
+    ).fetchone()
+    assert row[0] == "backups"
+    assert row[1] == "0 3 * * *"
+    assert row[2] == '"go"'
+    boundary = int(row[3])
+
+    # Tick one second past the boundary — fires once, advances 24h.
+    fires_json = conn.execute(
+        "SELECT jl_scheduler_tick(?)", (boundary + 1,)
+    ).fetchone()[0]
+    conn.commit()
+    import json as _json
+    fires = _json.loads(fires_json)
+    assert len(fires) == 1
+    assert fires[0]["name"] == "nightly"
+    assert fires[0]["queue"] == "backups"
+    assert fires[0]["fire_at"] == boundary
     assert conn.execute(
-        "SELECT jl_scheduler_last_fire('nightly')"
+        "SELECT COUNT(*) FROM _joblite_live WHERE queue='backups'"
+    ).fetchone()[0] == 1
+    new_next = int(conn.execute(
+        "SELECT next_fire_at FROM _joblite_scheduler_tasks WHERE name='nightly'"
+    ).fetchone()[0])
+    assert new_next == boundary + 86400
+
+    # Unregister: row drops.
+    deleted = conn.execute(
+        "SELECT jl_scheduler_unregister('nightly')"
+    ).fetchone()[0]
+    conn.commit()
+    assert deleted == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM _joblite_scheduler_tasks"
     ).fetchone()[0] == 0
-
-    # Record a fire.
-    conn.execute("SELECT jl_scheduler_record_fire('nightly', 1700000000)")
-    conn.commit()
-
-    assert conn.execute(
-        "SELECT jl_scheduler_last_fire('nightly')"
-    ).fetchone()[0] == 1700000000
-
-    # UPSERT replaces.
-    conn.execute("SELECT jl_scheduler_record_fire('nightly', 1800000000)")
-    conn.commit()
-    assert conn.execute(
-        "SELECT jl_scheduler_last_fire('nightly')"
-    ).fetchone()[0] == 1800000000
-
     conn.close()
 
 
 @pytest.mark.skipif(_EXT_PATH is None, reason=_SKIP_REASON)
 def test_extension_scheduler_interops_with_python(ext_db_path):
-    """Python `Scheduler._record_fire` and extension
-    `jl_scheduler_record_fire` write to the same row."""
+    """Python `Scheduler.add` and the extension's
+    `_joblite_scheduler_tasks` write to the same table — both sides
+    agree on the cron expression and next_fire_at."""
     db = joblite.open(ext_db_path)
     from joblite import Scheduler, crontab
 
     sched = Scheduler(db)
     sched.add(name="t", queue="q", schedule=crontab("0 3 * * *"))
-    sched._record_fire("t", 1700000000)
 
     conn = _open_ext(ext_db_path)
-    assert conn.execute(
-        "SELECT jl_scheduler_last_fire('t')"
-    ).fetchone()[0] == 1700000000
+    row = conn.execute(
+        "SELECT queue, cron_expr FROM _joblite_scheduler_tasks WHERE name='t'"
+    ).fetchone()
+    assert row == ("q", "0 3 * * *")
     conn.close()
 
 

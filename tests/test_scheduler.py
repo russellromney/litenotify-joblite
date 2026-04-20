@@ -12,6 +12,7 @@ Scheduler has two separate concerns:
 """
 
 import asyncio
+import json
 from datetime import datetime, timedelta
 
 import pytest
@@ -89,7 +90,15 @@ def test_scheduler_add_registers_task(db_path):
         queue="backups",
         schedule=crontab("0 3 * * *"),
     )
-    assert "nightly" in sched._tasks
+    # Registration is persisted in _joblite_scheduler_tasks.
+    rows = db.query(
+        "SELECT name, queue, cron_expr FROM _joblite_scheduler_tasks "
+        "WHERE name='nightly'"
+    )
+    assert len(rows) == 1
+    assert rows[0]["queue"] == "backups"
+    assert rows[0]["cron_expr"] == "0 3 * * *"
+    assert "nightly" in sched._registered
 
 
 def test_scheduler_add_replaces_by_name(db_path):
@@ -97,12 +106,16 @@ def test_scheduler_add_replaces_by_name(db_path):
     sched = Scheduler(db)
     sched.add(name="t", queue="a", schedule=crontab("* * * * *"))
     sched.add(name="t", queue="b", schedule=crontab("* * * * *"))
-    assert sched._tasks["t"].queue == "b"
+    rows = db.query(
+        "SELECT queue FROM _joblite_scheduler_tasks WHERE name='t'"
+    )
+    assert len(rows) == 1
+    assert rows[0]["queue"] == "b"
 
 
-def test_scheduler_fire_due_enqueues_on_boundary(db_path):
-    """_fire_due(now, ...) enqueues into the task's named queue when
-    the next boundary has passed, and records last_fire_at."""
+def test_scheduler_tick_enqueues_on_boundary(db_path):
+    """jl_scheduler_tick(now) enqueues one job per registered task
+    whose next_fire_at <= now, and advances next_fire_at."""
     db = joblite.open(db_path)
     db.queue("hourly-q")  # create schema
     sched = Scheduler(db)
@@ -113,26 +126,38 @@ def test_scheduler_fire_due_enqueues_on_boundary(db_path):
         payload={"ping": True},
     )
 
-    # Imagine "now" is 10:00:05 and the next fire was 10:00:00.
-    now = datetime(2025, 1, 1, 10, 0, 5)
-    next_fires = {"hourly": datetime(2025, 1, 1, 10, 0)}
-    last_fires: dict = {}
-
-    fired = sched._fire_due(now, next_fires, last_fires)
-    assert fired == 1
-    assert last_fires["hourly"] == int(datetime(2025, 1, 1, 10, 0).timestamp())
-    # Next boundary advanced.
-    assert next_fires["hourly"] == datetime(2025, 1, 1, 11, 0)
-    # Job made it into the queue.
+    # Fetch the task's next_fire_at (set by register to the next top
+    # of the hour after "now") and tick one second past it.
+    row = db.query(
+        "SELECT next_fire_at FROM _joblite_scheduler_tasks WHERE name='hourly'"
+    )[0]
+    boundary = int(row["next_fire_at"])
+    with db.transaction() as tx:
+        result = tx.query(
+            "SELECT jl_scheduler_tick(?) AS j", [boundary + 1]
+        )
+    fires = json.loads(result[0]["j"])
+    assert len(fires) == 1
+    assert fires[0]["name"] == "hourly"
+    assert fires[0]["queue"] == "hourly-q"
+    assert fires[0]["fire_at"] == boundary
+    # Job landed in the queue.
     rows = db.query(
         "SELECT payload FROM _joblite_live WHERE queue='hourly-q'"
     )
     assert len(rows) == 1
+    # next_fire_at advanced one hour.
+    row = db.query(
+        "SELECT next_fire_at FROM _joblite_scheduler_tasks WHERE name='hourly'"
+    )[0]
+    assert int(row["next_fire_at"]) == boundary + 3600
 
 
-def test_scheduler_fire_due_skips_already_fired(db_path):
-    """If last_fires says we already fired this boundary, _fire_due
-    doesn't fire again — keeps scheduler restart safe."""
+def test_scheduler_tick_skips_already_fired(db_path):
+    """Calling tick twice at the same `now` doesn't re-fire —
+    next_fire_at advances past `now` on the first call, so the
+    second is a no-op. Keeps scheduler restart safe within a
+    boundary window."""
     db = joblite.open(db_path)
     db.queue("no-dup")
     sched = Scheduler(db)
@@ -141,25 +166,29 @@ def test_scheduler_fire_due_skips_already_fired(db_path):
         queue="no-dup",
         schedule=crontab("0 * * * *"),
     )
-
-    now = datetime(2025, 1, 1, 10, 0, 5)
-    boundary = datetime(2025, 1, 1, 10, 0)
-    next_fires = {"t": boundary}
-    last_fires = {"t": int(boundary.timestamp())}  # already fired
-
-    fired = sched._fire_due(now, next_fires, last_fires)
-    assert fired == 0
-    # No rows enqueued.
+    row = db.query(
+        "SELECT next_fire_at FROM _joblite_scheduler_tasks WHERE name='t'"
+    )[0]
+    boundary = int(row["next_fire_at"])
+    with db.transaction() as tx:
+        result_a = tx.query(
+            "SELECT jl_scheduler_tick(?) AS j", [boundary + 1]
+        )
+    with db.transaction() as tx:
+        result_b = tx.query(
+            "SELECT jl_scheduler_tick(?) AS j", [boundary + 1]
+        )
+    assert len(json.loads(result_a[0]["j"])) == 1
+    assert len(json.loads(result_b[0]["j"])) == 0
     rows = db.query("SELECT COUNT(*) AS c FROM _joblite_live WHERE queue='no-dup'")
-    assert rows[0]["c"] == 0
+    assert rows[0]["c"] == 1
 
 
-def test_scheduler_fire_due_catches_up_multiple_boundaries(db_path):
-    """If the scheduler was down for multiple boundaries and now=very
-    late, `_fire_due` walks forward firing each boundary it hasn't
-    already fired. Whether that's desirable is a policy call; current
-    implementation does catch-up, which is fine for low-frequency
-    schedules ("fire at most once per hour in the last N hours").
+def test_scheduler_tick_catches_up_multiple_boundaries(db_path):
+    """If the scheduler was down for multiple boundaries, tick walks
+    forward firing each one. Current behavior is to catch up
+    unbounded — fine for low-frequency schedules; for noisy ones
+    callers can use `expires` to drop stale catch-up jobs.
     """
     db = joblite.open(db_path)
     db.queue("catchup-q")
@@ -169,17 +198,31 @@ def test_scheduler_fire_due_catches_up_multiple_boundaries(db_path):
         queue="catchup-q",
         schedule=crontab("0 * * * *"),  # hourly
     )
-
-    # Scheduler was down from 10:00 to 14:00; now = 14:05:00. Five
-    # boundaries passed (10, 11, 12, 13, 14). Next_fires starts at
-    # the first missed boundary.
-    now = datetime(2025, 1, 1, 14, 5)
-    next_fires = {"h": datetime(2025, 1, 1, 10, 0)}
-    last_fires: dict = {}
-
-    fired = sched._fire_due(now, next_fires, last_fires)
-    assert fired == 5
-    assert next_fires["h"] == datetime(2025, 1, 1, 15, 0)
+    # Rewind next_fire_at to 4 hours ago to simulate downtime
+    # across 4 boundaries (the boundary we're rewinding to + 3
+    # more while we sleep through now).
+    row = db.query(
+        "SELECT next_fire_at FROM _joblite_scheduler_tasks WHERE name='h'"
+    )[0]
+    orig_next = int(row["next_fire_at"])
+    rewound = orig_next - 4 * 3600
+    with db.transaction() as tx:
+        tx.execute(
+            "UPDATE _joblite_scheduler_tasks SET next_fire_at=? WHERE name='h'",
+            [rewound],
+        )
+    # Now tick at a time slightly past the original boundary: 5
+    # boundaries should fire (rewound, rewound+1h, ..., rewound+4h).
+    now = orig_next + 60
+    with db.transaction() as tx:
+        result = tx.query("SELECT jl_scheduler_tick(?) AS j", [now])
+    fires = json.loads(result[0]["j"])
+    assert len(fires) == 5
+    # next_fire_at advanced to the hour after `now`.
+    row = db.query(
+        "SELECT next_fire_at FROM _joblite_scheduler_tasks WHERE name='h'"
+    )[0]
+    assert int(row["next_fire_at"]) == orig_next + 3600
 
 
 async def test_scheduler_run_with_stop_event(db_path):

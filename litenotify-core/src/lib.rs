@@ -201,9 +201,14 @@ pub const BOOTSTRAP_JOBLITE_SQL: &str = "
       count INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (name, window_start)
     );
-    CREATE TABLE IF NOT EXISTS _joblite_scheduler_state (
+    CREATE TABLE IF NOT EXISTS _joblite_scheduler_tasks (
       name TEXT PRIMARY KEY,
-      last_fire_at INTEGER NOT NULL
+      queue TEXT NOT NULL,
+      cron_expr TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      priority INTEGER NOT NULL DEFAULT 0,
+      expires_s INTEGER,
+      next_fire_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS _joblite_results (
       job_id INTEGER PRIMARY KEY,
@@ -705,16 +710,27 @@ mod tests {
             .unwrap();
         assert_eq!(rl_cols, vec!["name", "window_start", "count"]);
 
-        // _joblite_scheduler_state table present for Scheduler's
-        // per-task last-fire-time persistence.
+        // _joblite_scheduler_tasks table present for Scheduler's
+        // per-task registration + next_fire_at persistence.
         let sched_cols: Vec<String> = conn
-            .prepare("SELECT name FROM pragma_table_info('_joblite_scheduler_state')")
+            .prepare("SELECT name FROM pragma_table_info('_joblite_scheduler_tasks')")
             .unwrap()
             .query_map([], |r| r.get::<_, String>(0))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(sched_cols, vec!["name", "last_fire_at"]);
+        assert_eq!(
+            sched_cols,
+            vec![
+                "name",
+                "queue",
+                "cron_expr",
+                "payload",
+                "priority",
+                "expires_s",
+                "next_fire_at",
+            ],
+        );
 
         // _joblite_results table for task result storage.
         let res_cols: Vec<String> = conn

@@ -130,26 +130,70 @@ pub fn attach_joblite_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
+    // jl_scheduler_register(name, queue, cron_expr, payload_json,
+    //                       priority, expires_s_or_null) -> 1.
+    // Upserts the task row. `next_fire_at` is recomputed as the next
+    // cron boundary strictly after `unixepoch()`. Calling twice with
+    // the same name replaces the first registration entirely.
     conn.create_scalar_function(
-        "jl_scheduler_record_fire",
-        2,
+        "jl_scheduler_register",
+        6,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
             let name: String = ctx.get(0)?;
-            let fire_at: i64 = ctx.get(1)?;
+            let queue: String = ctx.get(1)?;
+            let cron_expr: String = ctx.get(2)?;
+            let payload: String = ctx.get(3)?;
+            let priority: i64 = ctx.get(4)?;
+            let expires_s: Option<i64> = ctx.get(5)?;
             let db = unsafe { ctx.get_connection() }?;
-            scheduler_record_fire(&db, &name, fire_at).map_err(to_sql_err)
+            scheduler_register(
+                &db, &name, &queue, &cron_expr, &payload, priority, expires_s,
+            )
+            .map_err(to_sql_err)
         },
     )?;
 
+    // jl_scheduler_unregister(name) -> rows deleted (0 or 1).
     conn.create_scalar_function(
-        "jl_scheduler_last_fire",
+        "jl_scheduler_unregister",
         1,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
             let name: String = ctx.get(0)?;
             let db = unsafe { ctx.get_connection() }?;
-            scheduler_last_fire(&db, &name).map_err(to_sql_err)
+            scheduler_unregister(&db, &name).map_err(to_sql_err)
+        },
+    )?;
+
+    // jl_scheduler_tick(now_unix) -> JSON array of fires. For each
+    // registered task whose `next_fire_at <= now`, enqueues the
+    // payload into the task's queue, advances `next_fire_at` to the
+    // next cron boundary, and appends `{name, queue, fire_at,
+    // job_id}` to the output array. Caller typically holds
+    // `_joblite_locks` entry 'joblite-scheduler' for mutual
+    // exclusion across scheduler processes.
+    conn.create_scalar_function(
+        "jl_scheduler_tick",
+        1,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let now_unix: i64 = ctx.get(0)?;
+            let db = unsafe { ctx.get_connection() }?;
+            scheduler_tick(&db, now_unix).map_err(to_sql_err)
+        },
+    )?;
+
+    // jl_scheduler_soonest() -> unix ts of the earliest next_fire_at
+    // across all registered tasks, or 0 if no tasks. Scheduler main
+    // loop uses this to compute its sleep duration.
+    conn.create_scalar_function(
+        "jl_scheduler_soonest",
+        0,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let db = unsafe { ctx.get_connection() }?;
+            scheduler_soonest(&db).map_err(to_sql_err)
         },
     )?;
 
@@ -705,29 +749,119 @@ pub fn rate_limit_sweep(
 // Scheduler state
 // ---------------------------------------------------------------------
 
-pub fn scheduler_record_fire(
+/// Register (or re-register) a periodic task. `next_fire_at` is
+/// computed as the next cron boundary strictly after
+/// `unixepoch()`. Calling twice with the same name replaces the
+/// first registration entirely.
+pub fn scheduler_register(
     conn: &Connection,
     name: &str,
-    fire_at_unix: i64,
+    queue: &str,
+    cron_expr: &str,
+    payload: &str,
+    priority: i64,
+    expires_s: Option<i64>,
 ) -> rusqlite::Result<i64> {
+    let now = now_unix(conn)?;
+    let next_fire_at = super::cron::next_after_unix(cron_expr, now).map_err(to_sql_err)?;
     conn.execute(
-        "INSERT INTO _joblite_scheduler_state (name, last_fire_at)
-         VALUES (?1, ?2)
-         ON CONFLICT(name) DO UPDATE
-           SET last_fire_at = excluded.last_fire_at",
-        rusqlite::params![name, fire_at_unix],
+        "INSERT INTO _joblite_scheduler_tasks
+           (name, queue, cron_expr, payload, priority, expires_s, next_fire_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(name) DO UPDATE SET
+           queue = excluded.queue,
+           cron_expr = excluded.cron_expr,
+           payload = excluded.payload,
+           priority = excluded.priority,
+           expires_s = excluded.expires_s,
+           next_fire_at = excluded.next_fire_at",
+        rusqlite::params![name, queue, cron_expr, payload, priority, expires_s, next_fire_at],
     )?;
-    Ok(0)
+    Ok(1)
 }
 
-pub fn scheduler_last_fire(
-    conn: &Connection,
-    name: &str,
-) -> rusqlite::Result<i64> {
+pub fn scheduler_unregister(conn: &Connection, name: &str) -> rusqlite::Result<i64> {
+    let n = conn.execute(
+        "DELETE FROM _joblite_scheduler_tasks WHERE name = ?1",
+        rusqlite::params![name],
+    )?;
+    Ok(n as i64)
+}
+
+/// For each registered task whose `next_fire_at <= now_unix`,
+/// enqueue the payload into its queue and advance `next_fire_at`
+/// to the next boundary. Keeps advancing within one tick while
+/// boundaries remain in the past (catches up after a scheduler
+/// outage) — same semantics as the previous Python `_fire_due`.
+/// Returns a JSON array of `{name, queue, fire_at, job_id}` fires.
+pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<String> {
+    #[allow(clippy::type_complexity)]
+    let tasks: Vec<(String, String, String, String, i64, Option<i64>, i64)> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT name, queue, cron_expr, payload, priority, expires_s, next_fire_at
+             FROM _joblite_scheduler_tasks
+             WHERE next_fire_at <= ?1",
+        )?;
+        stmt.query_map(rusqlite::params![now_unix], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<i64>>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut out = String::from("[");
+    let mut first = true;
+    for (name, queue, cron_expr, payload, priority, expires_s, mut next_fire_at) in tasks {
+        while next_fire_at <= now_unix {
+            // Enqueue at this boundary. `run_at` is NULL (claimable
+            // immediately); `expires` is the task's expires_s if set.
+            let job_id = enqueue(
+                conn,
+                &queue,
+                &payload,
+                None,
+                None,
+                priority,
+                3, /* max_attempts default */
+                expires_s,
+            )?;
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            out.push_str(&format!(
+                "{{\"name\":{},\"queue\":{},\"fire_at\":{},\"job_id\":{}}}",
+                json_str(&name),
+                json_str(&queue),
+                next_fire_at,
+                job_id,
+            ));
+            // Advance to the next boundary strictly after this one.
+            next_fire_at =
+                super::cron::next_after_unix(&cron_expr, next_fire_at).map_err(to_sql_err)?;
+        }
+        // Persist the advanced next_fire_at.
+        conn.execute(
+            "UPDATE _joblite_scheduler_tasks
+             SET next_fire_at = ?2 WHERE name = ?1",
+            rusqlite::params![name, next_fire_at],
+        )?;
+    }
+    out.push(']');
+    Ok(out)
+}
+
+pub fn scheduler_soonest(conn: &Connection) -> rusqlite::Result<i64> {
     Ok(conn
         .query_row(
-            "SELECT last_fire_at FROM _joblite_scheduler_state WHERE name = ?1",
-            rusqlite::params![name],
+            "SELECT COALESCE(MIN(next_fire_at), 0) FROM _joblite_scheduler_tasks",
+            [],
             |r| r.get(0),
         )
         .unwrap_or(0))
