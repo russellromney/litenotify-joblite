@@ -15,3 +15,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 parking_lot = "0.12.5"
 rusqlite = { version = "0.39.0", features = ["functions", "hooks"] }
 thiserror = "2.0.18"
+
+[dev-dependencies]
+# chrono-tz only in tests — lets us exercise DST edge cases with a
+# fixed timezone (US/Eastern) regardless of where tests run.
+chrono-tz = "0.10"

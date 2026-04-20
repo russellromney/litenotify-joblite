@@ -23,7 +23,7 @@
 //! calls this once per registered task per boundary, not in a hot
 //! loop.
 
-use chrono::{Datelike, Duration, Local, NaiveDateTime, TimeZone, Timelike, Weekday};
+use chrono::{Datelike, Duration, Local, NaiveDateTime, Timelike, Weekday};
 
 use std::collections::BTreeSet;
 
@@ -128,11 +128,28 @@ fn parse_field(field: &str, lo: u32, hi: u32) -> Result<BTreeSet<u32>, String> {
 /// Return the unix timestamp of the next boundary strictly after
 /// `from_unix`, at minute precision, in the system local time zone.
 pub fn next_after_unix(expr: &str, from_unix: i64) -> Result<i64, String> {
+    next_after_unix_in_tz(expr, from_unix, &Local)
+}
+
+/// TZ-parameterized variant of `next_after_unix`. Production code
+/// uses `Local`; tests use a fixed zone (e.g. `chrono_tz::US::Eastern`)
+/// so DST edge cases are reproducible regardless of the host's
+/// timezone. `pub(crate)` because it's a testing seam, not a stable
+/// API — bindings should call `next_after_unix`.
+pub(crate) fn next_after_unix_in_tz<Tz>(
+    expr: &str,
+    from_unix: i64,
+    tz: &Tz,
+) -> Result<i64, String>
+where
+    Tz: chrono::TimeZone,
+{
     let sched = CronSchedule::parse(expr)?;
-    // Treat `from_unix` as a UTC timestamp, convert to local time,
-    // truncate to minute, then increment minute-by-minute until a
-    // match. Cap at ~5 years of minutes (degenerate schedules raise).
-    let local = match Local.timestamp_opt(from_unix, 0) {
+    // Treat `from_unix` as a unix timestamp, project into `tz`'s
+    // local wall clock, truncate to minute, then increment
+    // minute-by-minute until a match. Cap at ~5 years of minutes
+    // so a degenerate schedule raises instead of looping forever.
+    let local = match tz.timestamp_opt(from_unix, 0) {
         chrono::LocalResult::Single(t) => t,
         chrono::LocalResult::Ambiguous(t, _) => t,
         chrono::LocalResult::None => {
@@ -151,7 +168,7 @@ pub fn next_after_unix(expr: &str, from_unix: i64) -> Result<i64, String> {
             // earlier occurrence (matches chrono's default for
             // Ambiguous); nonexistent (spring-forward gap) → skip
             // forward.
-            match Local.from_local_datetime(&cand) {
+            match tz.from_local_datetime(&cand) {
                 chrono::LocalResult::Single(t) => return Ok(t.timestamp()),
                 chrono::LocalResult::Ambiguous(t, _) => return Ok(t.timestamp()),
                 chrono::LocalResult::None => {}
@@ -256,5 +273,90 @@ mod tests {
     #[test]
     fn zero_step_error() {
         assert!(next_after_unix("*/0 * * * *", 0).is_err());
+    }
+
+    // ---------- DST edge cases (US/Eastern) ----------
+    //
+    // These use a fixed `chrono_tz::US::Eastern` so the behavior is
+    // reproducible regardless of where the test runs. The production
+    // `next_after_unix` uses `Local`, which reads TZ env var +
+    // /etc/localtime — great for users, terrible for portable tests.
+
+    use chrono_tz::US::Eastern;
+
+    /// Spring-forward: on 2024-03-10 in US/Eastern, 2am does not
+    /// exist locally (clock jumps 1:59 EST → 3:00 EDT). A cron like
+    /// `30 2 * * *` has no valid boundary that day. We expect
+    /// `next_after_unix_in_tz` to SKIP it and return 2:30am on the
+    /// next day. Previously, a naive implementation could return a
+    /// bogus timestamp from `from_local_datetime` on a nonexistent
+    /// local time.
+    #[test]
+    fn dst_spring_forward_skips_nonexistent_hour() {
+        // 2024-03-10 00:00 EST (before spring-forward). EST = UTC-5.
+        // 00:00 EST = 05:00 UTC = 1710046800.
+        let from = Eastern
+            .with_ymd_and_hms(2024, 3, 10, 0, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        let got = next_after_unix_in_tz("30 2 * * *", from, &Eastern).unwrap();
+        // Expected: 2024-03-11 02:30 EDT (EDT = UTC-4).
+        let want = Eastern
+            .with_ymd_and_hms(2024, 3, 11, 2, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        assert_eq!(
+            got, want,
+            "spring-forward day's 2:30 should be skipped, next fire is tomorrow's 2:30"
+        );
+    }
+
+    /// Fall-back: on 2024-11-03 in US/Eastern, 1am happens twice
+    /// (once at 1:00 EDT, once at 1:00 EST). A cron like
+    /// `30 1 * * *` should fire exactly ONCE per calendar day — our
+    /// naive-wall-clock walk naturally picks the earlier (EDT)
+    /// occurrence and advances past it without revisiting. The
+    /// second 1:30 EST (same local wall clock, different UTC) is
+    /// skipped.
+    #[test]
+    fn dst_fall_back_fires_once_not_twice() {
+        // 2024-11-03 00:00 EDT (before fall-back). EDT = UTC-4.
+        // 00:00 EDT = 04:00 UTC.
+        let from = Eastern
+            .with_ymd_and_hms(2024, 11, 3, 0, 0, 0)
+            .earliest()
+            .unwrap()
+            .timestamp();
+
+        // First call: next 1:30 is 1:30 EDT (the earlier of the two
+        // ambiguous 1:30s that day).
+        let first = next_after_unix_in_tz("30 1 * * *", from, &Eastern).unwrap();
+        let want_first = Eastern
+            .with_ymd_and_hms(2024, 11, 3, 1, 30, 0)
+            .earliest() // pre-fall-back: 1:30 EDT (UTC-4)
+            .unwrap()
+            .timestamp();
+        assert_eq!(first, want_first, "first 1:30 on fall-back day is EDT");
+
+        // Second call: must NOT return the other 1:30 (EST, one hour
+        // later in UTC). Instead, next day's 1:30 EST.
+        let second = next_after_unix_in_tz("30 1 * * *", first, &Eastern).unwrap();
+        let would_be_duplicate = Eastern
+            .with_ymd_and_hms(2024, 11, 3, 1, 30, 0)
+            .latest() // post-fall-back: 1:30 EST (UTC-5)
+            .unwrap()
+            .timestamp();
+        assert_ne!(
+            second, would_be_duplicate,
+            "second 1:30 (EST) must not re-fire same calendar day"
+        );
+        let want_next = Eastern
+            .with_ymd_and_hms(2024, 11, 4, 1, 30, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        assert_eq!(second, want_next, "next fire is 1:30 the following day");
     }
 }
