@@ -171,6 +171,16 @@ The extension has three primitives that tie it together: ephemeral pub/sub (`not
 
 The explicit goal is to do `NOTIFY`/`LISTEN` semantics without constant polling, to achieve single-digit ms reaction time. If you use your app's existing SQLite file containing business logic, it will notify workers on every WAL commit. This means that most triggers will not result in anything happening - workers just read the message/queue with no result. This "overtriggering" is on purpose and is the tradeoff for push semantics and fast reaction time.
 
+### WAL-only by design
+
+honker requires `journal_mode = WAL` on every database it manages. `honker_bootstrap()` refuses to run on a file-backed DB that isn't in WAL mode, and the language bindings set `PRAGMA journal_mode = WAL` in their default open path. This is not a bug or an oversight — it's baked into the architecture:
+
+- **Concurrent readers while a writer is active.** Workers hold open read views (WAL subscription channels, listener iterators) for their whole lifetime. In DELETE / TRUNCATE modes, writers take an EXCLUSIVE lock; every active reader blocks until release. A single worker actively claiming would serialize every `enqueue()` / `notify()` in the system behind it. WAL removes that serialization.
+- **Stable, observable file.** The `.db-wal` sidecar grows on every commit and only shrinks at checkpoint. Stat-polling it gives a monotonic, unambiguous change signal. The rollback-journal sidecar (`.db-journal`) in DELETE mode is transient — it appears mid-transaction and vanishes on commit, making it a poor stat-poll target.
+- **Checkpoint cost is amortized.** With `wal_autocheckpoint = 10000`, WAL performs one fsync per 10k pages instead of per-commit, which is where most of the throughput win comes from.
+
+If you need a SQLite database that never enters WAL mode (e.g. for a backup target, or to avoid the `.db-wal` / `.db-shm` sidecars in a shared filesystem), honker is not the right tool — use plain SQLite and live without the NOTIFY/LISTEN semantics.
+
 The library/extension is a small coordination layer built on the properties of SQLite and single-server architecture.
 
 - **One `.db` + one `.db-wal`** is the entire system, with all the benefits of SQLite (embedded, local, durable, snapshot-able, etc.) that your app already usees
