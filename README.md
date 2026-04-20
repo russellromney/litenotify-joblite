@@ -47,15 +47,9 @@ Today:
   return value, caller awaits `queue.wait_result(id)`)
 - Durable streams with per-consumer offsets and configurable flush interval
 - SQLite loadable extension so any SQLite client can read the same tables
-- Python and Node.js bindings
+- Bindings: Python, Node.js, Rust, Go, Ruby, Bun, Elixir
 
-Planned:
-
-- Go and Ruby bindings
-- `honker-node` TypeScript port of the higher-level API
-- Framework plugins (FastAPI, Django, Flask, Express, Rails) — cut
-  for now; the core API is small enough that wiring honker into
-  your web framework is ~20 lines. See `examples/` once it lands.
+Framework-specific helpers (FastAPI/Django/Flask/Express/Rails) are intentionally not shipped — honker's API is small enough that wiring it into a web framework is ~20 lines of glue. See `examples/` for patterns.
 
 Deliberately out of scope: task pipelines/chains/groups/chords, multi-writer replication, workflow orchestration with DAGs.
 
@@ -167,7 +161,7 @@ The extension shares `_honker_live`, `_honker_dead`, and `_honker_notifications`
 
 ## Design
 
-This repo includes the `honker` SQLite loadable extension and `honker` language bindings for Python and Node today, with Go/Rust/Ruby planned. Framework-integration plugins (FastAPI/Django/Flask) were cut for now — the core API is small enough that wiring honker into your web framework is ~20 lines per framework, and we prefer to keep that surface as cookbook examples rather than maintained packages until a real user needs something different.
+This repo includes the `honker` SQLite loadable extension and bindings for Python, Node, Rust, Go, Ruby, Bun, and Elixir. Framework-specific plugins are deliberately not shipped — wiring honker into a web framework is ~20 lines of glue, and we'd rather keep that as cookbook examples than maintain one package per framework.
 
 For most applications, [SQLite alone is sufficient](https://www.epicweb.dev/why-you-should-probably-be-using-sqlite). There are already great libraries that leverage SQLite for durable messaging. [Huey](https://github.com/coleifer/huey) is one; [`diskcache`](https://github.com/grantjenks/python-diskcache) is another. This project is inspired by them and seeks to do something similar across languages and frameworks by moving package logic into a SQLite extension.
 
@@ -253,8 +247,7 @@ The caller chooses retention per primitive. `db.prune_notifications(older_than_s
 
 ## Wiring into your web framework
 
-No framework plugins today. The core API is small enough that a
-minimal FastAPI / Django / Flask integration is ~20 lines:
+Honker ships no framework plugins. It doesn't need to — the API is small and the integration is a few lines of glue:
 
 ```python
 # FastAPI: enqueue in a request, run workers via lifespan.
@@ -275,9 +268,7 @@ async def create_order(order: dict):
     return {"ok": True}
 ```
 
-SSE endpoints are ~30 lines of `async def stream(...): yield f"data: ...\n\n"` over `db.listen(channel)` or `db.stream(name).subscribe(...)`. Django/Flask workers live in a dedicated CLI process (same pattern as Celery/RQ) because those frameworks fork per-request and you don't want a worker pool in each fork.
-
-If demand for a packaged version grows we'll bring plugins back as their own repos. Until then: copy the 20 lines into your app.
+SSE endpoints are ~30 lines of `async def stream(...): yield f"data: ...\n\n"` over `db.listen(channel)` or `db.stream(name).subscribe(...)`. For Django/Flask, run the worker as a dedicated CLI process (same pattern as Celery/RQ).
 
 ## Performance
 
