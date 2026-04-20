@@ -62,7 +62,16 @@ def test_bootstrap_rejects_non_wal_connection(ext_db_path):
     conn.enable_load_extension(True)
     conn.load_extension(_EXT_PATH)
     # Explicit — sqlite3 default for file DBs is "delete" unless set.
-    conn.execute("PRAGMA journal_mode=DELETE")
+    # PRAGMA is a query that returns the new mode; we must .fetchone()
+    # to force the statement to actually execute on some stdlib sqlite3
+    # implementations (notably the Linux/Ubuntu builds used on
+    # actions/setup-python runners).
+    mode = conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
+    if mode != "delete":
+        pytest.skip(
+            f"could not set journal_mode=DELETE on this sqlite3 build "
+            f"(got {mode!r}); test-invariant precondition failed"
+        )
     with pytest.raises(sqlite3.OperationalError, match="journal_mode=WAL"):
         conn.execute("SELECT honker_bootstrap()")
     conn.close()
