@@ -10,3 +10,6 @@
 [submodule "packages/honker-bun"]
 	path = packages/honker-bun
 	url = git@github.com:russellromney/honker-bun.git
+[submodule "packages/honker-ex"]
+	path = packages/honker-ex
+	url = git@github.com:russellromney/honker-ex.git
