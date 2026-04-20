@@ -11,6 +11,22 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Swatinem/rust-cache@v2 derives its cache key from Cargo.lock + rustc
+# version by default. That's good for dependency bumps but NOT for edits
+# to .rs files in our own crates — a source-only change produces the same
+# key, which let an older compiled extension stick around under a later
+# commit (caused a real CI false-pass once). Hash the core + extension
+# source trees + their Cargo.toml files into the prefix-key so any
+# source-level change invalidates the cache.
+env:
+  RUST_CACHE_KEY_SOURCES: >-
+    ${{ hashFiles(
+      'honker-core/src/**/*.rs',
+      'honker-core/Cargo.toml',
+      'honker-extension/src/**/*.rs',
+      'honker-extension/Cargo.toml'
+    ) }}
+
 jobs:
   rust-core:
     name: rust · honker-core (lib tests)
@@ -26,6 +42,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
+          prefix-key: "v1-src-${{ env.RUST_CACHE_KEY_SOURCES }}"
       - run: cargo test -p honker-core --release --lib
 
   rust-extension:
@@ -41,6 +58,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
+          prefix-key: "v1-src-${{ env.RUST_CACHE_KEY_SOURCES }}"
       - name: Build loadable extension
         run: cargo build --release -p honker-extension
       - name: Sanity-load via Python sqlite3
@@ -87,6 +105,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
+          prefix-key: "v1-src-${{ env.RUST_CACHE_KEY_SOURCES }}"
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
@@ -130,6 +149,8 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-src-${{ env.RUST_CACHE_KEY_SOURCES }}"
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
