@@ -16,10 +16,10 @@ func findExtension(t *testing.T) string {
 	// thisFile = .../packages/honker-go/honker_test.go
 	repo := filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", ".."))
 	candidates := []string{
+		filepath.Join(repo, "target/release/libhonker_ext.dylib"),
+		filepath.Join(repo, "target/release/libhonker_ext.so"),
 		filepath.Join(repo, "target/release/libhonker_extension.dylib"),
 		filepath.Join(repo, "target/release/libhonker_extension.so"),
-		filepath.Join(repo, "target/release/libhonker.dylib"),
-		filepath.Join(repo, "target/release/libhonker.so"),
 	}
 	for _, p := range candidates {
 		if _, err := os.Stat(p); err == nil {

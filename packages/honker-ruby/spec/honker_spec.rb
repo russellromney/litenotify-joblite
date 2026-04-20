@@ -10,10 +10,10 @@ REPO_ROOT = File.expand_path("../../..", __dir__)
 
 def find_extension
   candidates = %w[
+    target/release/libhonker_ext.dylib
+    target/release/libhonker_ext.so
     target/release/libhonker_extension.dylib
     target/release/libhonker_extension.so
-    target/release/libhonker.dylib
-    target/release/libhonker.so
   ]
   candidates.each do |rel|
     p = File.join(REPO_ROOT, rel)

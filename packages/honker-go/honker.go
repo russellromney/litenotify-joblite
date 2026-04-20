@@ -27,6 +27,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
@@ -43,6 +45,36 @@ type Database struct {
 // multiple databases in the same process can load different extension
 // paths (or different PRAGMA configs) without colliding.
 var driverCounter atomic.Int64
+
+// deriveEntryPoint computes SQLite's default extension entry-point
+// from the library's filename. Matches the logic in
+// sqlite3_load_extension (ext/misc/loadextension.c) when the proc
+// argument is NULL:
+//
+//	/path/to/libhonker_ext.dylib
+//	  → basename: libhonker_ext.dylib
+//	  → strip extension: libhonker_ext
+//	  → strip "lib" prefix: honker_ext
+//	  → strip non-alpha (ASCII): honkerext
+//	  → prefix/suffix: sqlite3_honkerext_init
+//
+// We pass this to go-sqlite3's LoadExtension because that crate
+// doesn't forward NULL for an empty entry-point string.
+func deriveEntryPoint(path string) string {
+	base := filepath.Base(path)
+	// strip .dylib / .so / .dll
+	if i := strings.LastIndex(base, "."); i > 0 {
+		base = base[:i]
+	}
+	base = strings.TrimPrefix(base, "lib")
+	var cleaned strings.Builder
+	for _, r := range base {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			cleaned.WriteRune(r)
+		}
+	}
+	return "sqlite3_" + cleaned.String() + "_init"
+}
 
 const defaultPragmas = `
 PRAGMA journal_mode = WAL;
@@ -61,11 +93,21 @@ PRAGMA wal_autocheckpoint = 10000;
 func Open(path string, extensionPath string) (*Database, error) {
 	n := driverCounter.Add(1)
 	driverName := fmt.Sprintf("sqlite3_honker_%d", n)
+	// go-sqlite3's `LoadExtension(path, "")` passes an empty cstring
+	// as the entry-point name to SQLite's `sqlite3_load_extension`,
+	// not NULL — so SQLite's default "derive sqlite3_<extname>_init
+	// from filename" path doesn't trigger. We replicate the derivation
+	// in Go and pass the explicit name.
+	entryPoint := deriveEntryPoint(extensionPath)
+
 	sql.Register(driverName, &sqlite3.SQLiteDriver{
 		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
 			if extensionPath != "" {
-				if err := conn.LoadExtension(extensionPath, ""); err != nil {
-					return fmt.Errorf("LoadExtension(%q): %w", extensionPath, err)
+				if err := conn.LoadExtension(extensionPath, entryPoint); err != nil {
+					return fmt.Errorf(
+						"LoadExtension(%q, %q): %w",
+						extensionPath, entryPoint, err,
+					)
 				}
 			}
 			if _, err := conn.Exec(defaultPragmas, nil); err != nil {
