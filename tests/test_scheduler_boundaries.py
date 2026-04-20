@@ -1,10 +1,10 @@
 """Real-time cron boundary tests.
 
 The unit tests in `test_scheduler.py` mock `now_unix` and tick
-`jl_scheduler_tick(now)` with fabricated timestamps — fast, but
+`honker_scheduler_tick(now)` with fabricated timestamps — fast, but
 they don't prove the live scheduler loop gets the sleep math right.
 If `_main_loop` sleeps one second too long or
-`jl_scheduler_soonest()` returns a value in the past (causing a
+`honker_scheduler_soonest()` returns a value in the past (causing a
 busy-loop), the unit tests won't catch it.
 
 These tests wait for a real wall-clock cron boundary. Marked
@@ -46,7 +46,7 @@ async def test_scheduler_fires_at_real_minute_boundary(db_path):
     expected_boundary = (int(start_ts) // 60 + 1) * 60
 
     # Timing instrumentation: count wake-ups in `_main_loop` by
-    # monkey-patching `jl_scheduler_tick`. If the scheduler is
+    # monkey-patching `honker_scheduler_tick`. If the scheduler is
     # busy-looping, this counter jumps well past the expected
     # once-per-boundary cadence.
     tick_count = 0
@@ -88,7 +88,7 @@ async def test_scheduler_does_not_busy_loop_between_boundaries(db_path):
     """A scheduler with only a `*/5 * * * *` task (next fire is 1-5
     minutes away) should NOT consume measurable CPU in its wait.
     Rough proxy: we tick the scheduler for 3s, count how many times
-    `jl_scheduler_tick` got called. If the sleep math is wrong
+    `honker_scheduler_tick` got called. If the sleep math is wrong
     (soonest returns a value in the past), we'd see hundreds.
     """
     db = joblite.open(db_path)
@@ -100,7 +100,7 @@ async def test_scheduler_does_not_busy_loop_between_boundaries(db_path):
         schedule=crontab("*/5 * * * *"),  # up to 5 minutes away
     )
 
-    # Wrap jl_scheduler_tick to count calls. We do this by reading
+    # Wrap honker_scheduler_tick to count calls. We do this by reading
     # the task's `next_fire_at` and watching it for unexpected
     # advancement (would indicate a tick fired when it shouldn't).
     row_before = db.query(

@@ -37,7 +37,7 @@ def test_enqueue_throughput_floor_one_tx(db_path):
     elapsed = time.perf_counter() - t0
     assert elapsed < 3.0, (
         f"enqueue 10k in one tx took {elapsed:.3f}s (floor: 3.0s). "
-        f"Likely regression in jl_enqueue or the PyO3 param-marshaling."
+        f"Likely regression in honker_enqueue or the PyO3 param-marshaling."
     )
     # Sanity: rows actually landed.
     rows = db.query(
@@ -70,7 +70,7 @@ def test_claim_batch_throughput_floor(db_path):
     assert elapsed < 3.0, (
         f"claim_batch 10k took {elapsed:.3f}s (floor: 3.0s). "
         f"Likely regression in the _joblite_live_claim partial index "
-        f"or jl_claim_batch."
+        f"or honker_claim_batch."
     )
 
 

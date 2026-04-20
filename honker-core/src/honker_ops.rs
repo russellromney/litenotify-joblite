@@ -34,7 +34,7 @@ fn to_sql_err<E: std::fmt::Display>(e: E) -> rusqlite::Error {
 /// error, so call exactly once per connection.
 pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     conn.create_scalar_function(
-        "jl_bootstrap",
+        "honker_bootstrap",
         0,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -45,7 +45,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     )?;
 
     conn.create_scalar_function(
-        "jl_claim_batch",
+        "honker_claim_batch",
         4,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -59,7 +59,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     )?;
 
     conn.create_scalar_function(
-        "jl_ack_batch",
+        "honker_ack_batch",
         2,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -95,7 +95,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     )?;
 
     conn.create_scalar_function(
-        "jl_lock_release",
+        "honker_lock_release",
         2,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -107,7 +107,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     )?;
 
     conn.create_scalar_function(
-        "jl_rate_limit_try",
+        "honker_rate_limit_try",
         3,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -120,7 +120,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     )?;
 
     conn.create_scalar_function(
-        "jl_rate_limit_sweep",
+        "honker_rate_limit_sweep",
         1,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -130,13 +130,13 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
-    // jl_scheduler_register(name, queue, cron_expr, payload_json,
+    // honker_scheduler_register(name, queue, cron_expr, payload_json,
     //                       priority, expires_s_or_null) -> 1.
     // Upserts the task row. `next_fire_at` is recomputed as the next
     // cron boundary strictly after `unixepoch()`. Calling twice with
     // the same name replaces the first registration entirely.
     conn.create_scalar_function(
-        "jl_scheduler_register",
+        "honker_scheduler_register",
         6,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -154,9 +154,9 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
-    // jl_scheduler_unregister(name) -> rows deleted (0 or 1).
+    // honker_scheduler_unregister(name) -> rows deleted (0 or 1).
     conn.create_scalar_function(
-        "jl_scheduler_unregister",
+        "honker_scheduler_unregister",
         1,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -166,7 +166,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
-    // jl_scheduler_tick(now_unix) -> JSON array of fires. For each
+    // honker_scheduler_tick(now_unix) -> JSON array of fires. For each
     // registered task whose `next_fire_at <= now`, enqueues the
     // payload into the task's queue, advances `next_fire_at` to the
     // next cron boundary, and appends `{name, queue, fire_at,
@@ -174,7 +174,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     // `_joblite_locks` entry 'joblite-scheduler' for mutual
     // exclusion across scheduler processes.
     conn.create_scalar_function(
-        "jl_scheduler_tick",
+        "honker_scheduler_tick",
         1,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -184,11 +184,11 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
-    // jl_scheduler_soonest() -> unix ts of the earliest next_fire_at
+    // honker_scheduler_soonest() -> unix ts of the earliest next_fire_at
     // across all registered tasks, or 0 if no tasks. Scheduler main
     // loop uses this to compute its sleep duration.
     conn.create_scalar_function(
-        "jl_scheduler_soonest",
+        "honker_scheduler_soonest",
         0,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -198,7 +198,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     )?;
 
     conn.create_scalar_function(
-        "jl_result_save",
+        "honker_result_save",
         3,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -211,7 +211,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     )?;
 
     conn.create_scalar_function(
-        "jl_result_get",
+        "honker_result_get",
         1,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -222,7 +222,7 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     )?;
 
     conn.create_scalar_function(
-        "jl_result_sweep",
+        "honker_result_sweep",
         0,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -231,14 +231,14 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
-    // jl_enqueue(queue, payload, run_at_or_null, delay_or_null,
+    // honker_enqueue(queue, payload, run_at_or_null, delay_or_null,
     //            priority, max_attempts, expires_or_null) -> inserted id.
     // Precedence: if `delay` is not NULL, use `unixepoch() + delay`;
     // else if `run_at` is not NULL, use that literal; else use
     // `unixepoch()`. `expires` is `unixepoch() + expires` if non-NULL,
     // else NULL (never expires).
     conn.create_scalar_function(
-        "jl_enqueue",
+        "honker_enqueue",
         7,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -258,10 +258,10 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
-    // jl_ack(job_id, worker_id) -> 1 if ack'd, 0 if claim expired /
+    // honker_ack(job_id, worker_id) -> 1 if ack'd, 0 if claim expired /
     // not ours.
     conn.create_scalar_function(
-        "jl_ack",
+        "honker_ack",
         2,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -272,13 +272,13 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
-    // jl_retry(job_id, worker_id, delay_s, error) -> 1 if retried /
+    // honker_retry(job_id, worker_id, delay_s, error) -> 1 if retried /
     // moved to dead, 0 if not our claim. If attempts >= max_attempts,
     // moves the row to `_joblite_dead` instead of flipping it back
     // to pending. Fires a notify on the queue's channel on successful
     // pending-flip (so waiting workers wake).
     conn.create_scalar_function(
-        "jl_retry",
+        "honker_retry",
         4,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -291,10 +291,10 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
-    // jl_fail(job_id, worker_id, error) -> 1 if failed-to-dead, 0 if
+    // honker_fail(job_id, worker_id, error) -> 1 if failed-to-dead, 0 if
     // not our claim.
     conn.create_scalar_function(
-        "jl_fail",
+        "honker_fail",
         3,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -306,10 +306,10 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
-    // jl_heartbeat(job_id, worker_id, extend_s) -> 1 if extended, 0
+    // honker_heartbeat(job_id, worker_id, extend_s) -> 1 if extended, 0
     // if not our claim.
     conn.create_scalar_function(
-        "jl_heartbeat",
+        "honker_heartbeat",
         3,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -321,12 +321,12 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
-    // jl_cron_next_after(expr, from_unix) -> unix_ts of next boundary
+    // honker_cron_next_after(expr, from_unix) -> unix_ts of next boundary
     // strictly after `from_unix`, minute precision, system local time.
     // Same 5-field grammar as standard Unix cron. Deterministic +
     // pure; marked DETERMINISTIC to let SQLite optimize inside joins.
     conn.create_scalar_function(
-        "jl_cron_next_after",
+        "honker_cron_next_after",
         2,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |ctx| {
@@ -339,10 +339,10 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     // Stream functions. One impl for every binding; _joblite_stream +
     // _joblite_stream_consumers are the shared on-disk layout.
 
-    // jl_stream_publish(topic, key_or_null, payload_json) -> offset.
-    // INSERTs one event and fires a wake on joblite:stream:<topic>.
+    // honker_stream_publish(topic, key_or_null, payload_json) -> offset.
+    // INSERTs one event and fires a wake on honker:stream:<topic>.
     conn.create_scalar_function(
-        "jl_stream_publish",
+        "honker_stream_publish",
         3,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -354,10 +354,10 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
-    // jl_stream_read_since(topic, offset, limit) -> JSON array of
+    // honker_stream_read_since(topic, offset, limit) -> JSON array of
     // {offset, topic, key, payload, created_at}.
     conn.create_scalar_function(
-        "jl_stream_read_since",
+        "honker_stream_read_since",
         3,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -369,12 +369,12 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
-    // jl_stream_save_offset(consumer, topic, offset) -> 1 if row
+    // honker_stream_save_offset(consumer, topic, offset) -> 1 if row
     // advanced (new row or higher offset), 0 if the saved offset is
     // already >= `offset`. Monotonic: never rewinds on duplicate
     // deliveries.
     conn.create_scalar_function(
-        "jl_stream_save_offset",
+        "honker_stream_save_offset",
         3,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -386,9 +386,9 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
-    // jl_stream_get_offset(consumer, topic) -> offset or 0.
+    // honker_stream_get_offset(consumer, topic) -> offset or 0.
     conn.create_scalar_function(
-        "jl_stream_get_offset",
+        "honker_stream_get_offset",
         2,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
@@ -512,7 +512,7 @@ pub fn enqueue(
         (None, None) => now,
     };
     let expires_at: Option<i64> = expires.map(|e| now + e);
-    let channel = format!("joblite:{}", queue);
+    let channel = format!("honker:{}", queue);
 
     let id: i64 = conn.query_row(
         "INSERT INTO _joblite_live
@@ -605,7 +605,7 @@ pub fn retry(
         )?;
         // Fire a wake — the row is now claimable again (after the
         // delay), and waiting workers should re-poll.
-        let channel = format!("joblite:{}", queue);
+        let channel = format!("honker:{}", queue);
         conn.execute(
             "INSERT INTO _litenotify_notifications (channel, payload)
              VALUES (?1, 'retry')",
@@ -1006,7 +1006,7 @@ pub fn stream_publish(
         rusqlite::params![topic, key, payload],
         |r| r.get(0),
     )?;
-    let channel = format!("joblite:stream:{}", topic);
+    let channel = format!("honker:stream:{}", topic);
     conn.execute(
         "INSERT INTO _litenotify_notifications (channel, payload)
          VALUES (?1, 'new')",

@@ -5,8 +5,8 @@ A scheduler process holds a set of named schedules (cron expressions
 into the named queue. Regular workers claim and execute it. The
 scheduler itself doesn't run handlers — it just dispatches.
 
-Registration + fire-due logic live in Rust via `jl_scheduler_register`
-and `jl_scheduler_tick`; this module is a thin asyncio wrapper. Tasks
+Registration + fire-due logic live in Rust via `honker_scheduler_register`
+and `honker_scheduler_tick`; this module is a thin asyncio wrapper. Tasks
 persist in `_joblite_scheduler_tasks`, so any process (Python, a `sqlite3
 .load` session, a future Node/Go binding) sees the same registrations.
 
@@ -16,7 +16,7 @@ heartbeat refreshes the lock's TTL during long sleeps between fires.
 If the leader crashes, the TTL elapses and a standby can take over.
 
 Boundaries that were missed while the leader was down are caught up
-on the next tick — `jl_scheduler_tick` advances `next_fire_at`
+on the next tick — `honker_scheduler_tick` advances `next_fire_at`
 minute-by-minute until it's past `now`. For noisy schedules that
 shouldn't backfill, set `expires=` so stale jobs get swept instead
 of executed.
@@ -58,7 +58,7 @@ import litenotify
 class CronSchedule:
     """Thin marker around a 5-field cron expression. All parsing and
     next-boundary computation lives in Rust (`litenotify.cron_next_after`
-    / `jl_cron_next_after`) so every language binding shares one
+    / `honker_cron_next_after`) so every language binding shares one
     implementation.
 
     Fields (standard Unix cron):
@@ -106,7 +106,7 @@ class Scheduler:
     one fires.
 
     Task registration + fire-due logic live in Rust
-    (`jl_scheduler_register` / `jl_scheduler_tick`); this class is
+    (`honker_scheduler_register` / `honker_scheduler_tick`); this class is
     ~40 lines of asyncio glue around lock + tick + sleep + heartbeat.
     """
 
@@ -148,7 +148,7 @@ class Scheduler:
         """
         with self.db.transaction() as tx:
             tx.query(
-                "SELECT jl_scheduler_register(?, ?, ?, ?, ?, ?)",
+                "SELECT honker_scheduler_register(?, ?, ?, ?, ?, ?)",
                 [
                     name,
                     queue,
@@ -164,7 +164,7 @@ class Scheduler:
         """Unregister a task. Returns True iff a row was removed."""
         with self.db.transaction() as tx:
             rows = tx.query(
-                "SELECT jl_scheduler_unregister(?) AS n", [name]
+                "SELECT honker_scheduler_unregister(?) AS n", [name]
             )
         self._registered.discard(name)
         return rows[0]["n"] > 0
@@ -225,15 +225,15 @@ class Scheduler:
     async def _main_loop(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
             now = int(time.time())
-            # tick + soonest share a writer transaction: jl_* scalars
+            # tick + soonest share a writer transaction: honker_* scalars
             # are registered on the writer slot only (one copy, lowest
             # memory), so reads through reader connections wouldn't
             # find them. The soonest query also serializes behind the
             # tick, so we can't miss a freshly registered task.
             with self.db.transaction() as tx:
-                tx.query("SELECT jl_scheduler_tick(?)", [now])
+                tx.query("SELECT honker_scheduler_tick(?)", [now])
                 rows = tx.query(
-                    "SELECT jl_scheduler_soonest() AS t"
+                    "SELECT honker_scheduler_soonest() AS t"
                 )
             soonest = int(rows[0]["t"])
             if soonest == 0:

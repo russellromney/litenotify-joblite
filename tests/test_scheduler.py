@@ -114,7 +114,7 @@ def test_scheduler_add_replaces_by_name(db_path):
 
 
 def test_scheduler_tick_enqueues_on_boundary(db_path):
-    """jl_scheduler_tick(now) enqueues one job per registered task
+    """honker_scheduler_tick(now) enqueues one job per registered task
     whose next_fire_at <= now, and advances next_fire_at."""
     db = joblite.open(db_path)
     db.queue("hourly-q")  # create schema
@@ -134,7 +134,7 @@ def test_scheduler_tick_enqueues_on_boundary(db_path):
     boundary = int(row["next_fire_at"])
     with db.transaction() as tx:
         result = tx.query(
-            "SELECT jl_scheduler_tick(?) AS j", [boundary + 1]
+            "SELECT honker_scheduler_tick(?) AS j", [boundary + 1]
         )
     fires = json.loads(result[0]["j"])
     assert len(fires) == 1
@@ -172,11 +172,11 @@ def test_scheduler_tick_skips_already_fired(db_path):
     boundary = int(row["next_fire_at"])
     with db.transaction() as tx:
         result_a = tx.query(
-            "SELECT jl_scheduler_tick(?) AS j", [boundary + 1]
+            "SELECT honker_scheduler_tick(?) AS j", [boundary + 1]
         )
     with db.transaction() as tx:
         result_b = tx.query(
-            "SELECT jl_scheduler_tick(?) AS j", [boundary + 1]
+            "SELECT honker_scheduler_tick(?) AS j", [boundary + 1]
         )
     assert len(json.loads(result_a[0]["j"])) == 1
     assert len(json.loads(result_b[0]["j"])) == 0
@@ -215,7 +215,7 @@ def test_scheduler_tick_catches_up_multiple_boundaries(db_path):
     # boundaries should fire (rewound, rewound+1h, ..., rewound+4h).
     now = orig_next + 60
     with db.transaction() as tx:
-        result = tx.query("SELECT jl_scheduler_tick(?) AS j", [now])
+        result = tx.query("SELECT honker_scheduler_tick(?) AS j", [now])
     fires = json.loads(result[0]["j"])
     assert len(fires) == 5
     # next_fire_at advanced to the hour after `now`.
@@ -226,7 +226,7 @@ def test_scheduler_tick_catches_up_multiple_boundaries(db_path):
 
 
 def test_scheduler_tick_racing_writers_produce_no_duplicates(db_path):
-    """Multiple workers calling `jl_scheduler_tick` concurrently
+    """Multiple workers calling `honker_scheduler_tick` concurrently
     must never double-fire a boundary.
 
     In production the `joblite-scheduler` leader lock gates callers —
@@ -239,7 +239,7 @@ def test_scheduler_tick_racing_writers_produce_no_duplicates(db_path):
 
     Strategy: register one task with `next_fire_at = now - 1` (one
     boundary overdue), fire 10 Python threads each running one
-    `SELECT jl_scheduler_tick(now)` through its own writer
+    `SELECT honker_scheduler_tick(now)` through its own writer
     transaction. Exactly one thread should see the fire, nine
     should see `[]`. The job lands in `_joblite_live` exactly once.
     """
@@ -276,7 +276,7 @@ def test_scheduler_tick_racing_writers_produce_no_duplicates(db_path):
         # trivially through Python's GIL + thread scheduling.
         barrier.wait()
         with db.transaction() as tx:
-            rows = tx.query("SELECT jl_scheduler_tick(?) AS j", [now])
+            rows = tx.query("SELECT honker_scheduler_tick(?) AS j", [now])
         fires = json.loads(rows[0]["j"])
         fire_counts[i] = len(fires)
 

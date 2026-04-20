@@ -1,7 +1,7 @@
 """Tests for task result storage: save / get / wait / sweep.
 
 Paired with extension interop tests (`test_extension_interop.py`) that
-verify `jl_result_save` / `jl_result_get` / `jl_result_sweep` operate
+verify `honker_result_save` / `honker_result_get` / `honker_result_sweep` operate
 on the same `_joblite_results` table and produce the same behavior.
 """
 

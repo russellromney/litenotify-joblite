@@ -229,7 +229,7 @@ class Queue:
         expires: Optional[float] = None,
     ) -> int:
         """Insert one job row. Returns the inserted `id` (primary key
-        in `_joblite_live`). Delegates to `jl_enqueue`, which handles
+        in `_joblite_live`). Delegates to `honker_enqueue`, which handles
         run_at / delay precedence + expires computation + firing the
         wake notification atomically in Rust — same SQL path every
         binding uses.
@@ -254,7 +254,7 @@ class Queue:
         run_at_val = int(run_at) if run_at is not None else None
         delay_val = int(delay) if delay is not None else None
         expires_val = int(expires) if expires is not None else None
-        sql = "SELECT jl_enqueue(?, ?, ?, ?, ?, ?, ?) AS id"
+        sql = "SELECT honker_enqueue(?, ?, ?, ?, ?, ?, ?) AS id"
         params = [
             self.name, payload_str, run_at_val, delay_val,
             int(priority), self.max_attempts, expires_val,
@@ -272,7 +272,7 @@ class Queue:
 
     def claim_batch(self, worker_id: str, n: int) -> list:
         """Atomically claim up to `n` jobs. Delegates to
-        `jl_claim_batch`, which does one `UPDATE ... RETURNING` via
+        `honker_claim_batch`, which does one `UPDATE ... RETURNING` via
         the partial claim index in Rust — same SQL every binding uses.
         """
         n = int(n)
@@ -280,21 +280,21 @@ class Queue:
             return []
         with self.db.transaction() as tx:
             rows = tx.query(
-                "SELECT jl_claim_batch(?, ?, ?, ?) AS rows_json",
+                "SELECT honker_claim_batch(?, ?, ?, ?) AS rows_json",
                 [self.name, worker_id, n, self.visibility_timeout_s],
             )
         data = json.loads(rows[0]["rows_json"])
         return [Job(self, row) for row in data]
 
     def ack_batch(self, job_ids, worker_id: str) -> int:
-        """Ack multiple jobs in one tx. Delegates to `jl_ack_batch`.
+        """Ack multiple jobs in one tx. Delegates to `honker_ack_batch`.
         Returns count of jobs whose claim was still valid."""
         ids = [int(i) for i in job_ids]
         if not ids:
             return 0
         with self.db.transaction() as tx:
             rows = tx.query(
-                "SELECT jl_ack_batch(?, ?) AS n",
+                "SELECT honker_ack_batch(?, ?) AS n",
                 [json.dumps(ids), worker_id],
             )
         return rows[0]["n"]
@@ -325,7 +325,7 @@ class Queue:
         """
         with self.db.transaction() as tx:
             rows = tx.query(
-                "SELECT jl_sweep_expired(?) AS n", [self.name]
+                "SELECT honker_sweep_expired(?) AS n", [self.name]
             )
         return rows[0]["n"]
 
@@ -344,7 +344,7 @@ class Queue:
         set a short ttl to auto-reclaim disk; `None` means no expiry
         (you're on the hook for pruning via `sweep_results()`).
 
-        Delegates to `jl_result_save`. UPSERTs — calling twice for
+        Delegates to `honker_result_save`. UPSERTs — calling twice for
         the same `job_id` replaces the first. Typical use is inside
         a worker after handler success, though callers can also call
         it manually.
@@ -353,10 +353,10 @@ class Queue:
         ttl_s = int(ttl) if ttl is not None else 0
         params = [int(job_id), value_str, ttl_s]
         if tx is not None:
-            tx.query("SELECT jl_result_save(?, ?, ?)", params)
+            tx.query("SELECT honker_result_save(?, ?, ?)", params)
             return
         with self.db.transaction() as own_tx:
-            own_tx.query("SELECT jl_result_save(?, ?, ?)", params)
+            own_tx.query("SELECT honker_result_save(?, ?, ?)", params)
 
     def get_result(self, job_id: int) -> tuple:
         """Return `(found: bool, value: Any)` for a saved result.
@@ -366,14 +366,14 @@ class Queue:
         be `None` (task legitimately returned None). Two-tuple
         disambiguates.
 
-        Delegates to `jl_result_get`, which returns SQL NULL for
+        Delegates to `honker_result_get`, which returns SQL NULL for
         "absent or expired" and the stored JSON text otherwise. The
         literal string `'null'` (stored None) is distinguishable from
         SQL NULL (absent) at the rusqlite boundary.
         """
         with self.db.transaction() as tx:
             rows = tx.query(
-                "SELECT jl_result_get(?) AS v", [int(job_id)]
+                "SELECT honker_result_get(?) AS v", [int(job_id)]
             )
         raw = rows[0]["v"]
         if raw is None:
@@ -420,16 +420,16 @@ class Queue:
 
     def sweep_results(self) -> int:
         """Delete all expired result rows. Returns count deleted.
-        Delegates to `jl_result_sweep`."""
+        Delegates to `honker_result_sweep`."""
         with self.db.transaction() as tx:
-            rows = tx.query("SELECT jl_result_sweep() AS n")
+            rows = tx.query("SELECT honker_result_sweep() AS n")
         return rows[0]["n"]
 
     def ack(self, job_id: int, worker_id: str) -> bool:
-        """Delegates to `jl_ack`."""
+        """Delegates to `honker_ack`."""
         with self.db.transaction() as tx:
             rows = tx.query(
-                "SELECT jl_ack(?, ?) AS r",
+                "SELECT honker_ack(?, ?) AS r",
                 [int(job_id), worker_id],
             )
         return bool(rows[0]["r"])
@@ -438,21 +438,21 @@ class Queue:
         """Put a claimed job back into pending with a delayed run_at, or
         move it to dead if attempts have reached max_attempts. Returns
         True iff the caller's claim was still valid. Delegates to
-        `jl_retry`, which handles the attempts-vs-max-attempts branching
+        `honker_retry`, which handles the attempts-vs-max-attempts branching
         + wake-notification atomically."""
         with self.db.transaction() as tx:
             rows = tx.query(
-                "SELECT jl_retry(?, ?, ?, ?) AS r",
+                "SELECT honker_retry(?, ?, ?, ?) AS r",
                 [int(job_id), worker_id, int(delay_s), error],
             )
         return bool(rows[0]["r"])
 
     def fail(self, job_id: int, worker_id: str, error: str) -> bool:
         """Move the claim straight to dead regardless of attempts.
-        Delegates to `jl_fail`."""
+        Delegates to `honker_fail`."""
         with self.db.transaction() as tx:
             rows = tx.query(
-                "SELECT jl_fail(?, ?, ?) AS r",
+                "SELECT honker_fail(?, ?, ?) AS r",
                 [int(job_id), worker_id, error],
             )
         return bool(rows[0]["r"])
@@ -460,11 +460,11 @@ class Queue:
     def heartbeat(
         self, job_id: int, worker_id: str, extend_s: Optional[int] = None
     ) -> bool:
-        """Delegates to `jl_heartbeat`."""
+        """Delegates to `honker_heartbeat`."""
         extend = int(extend_s) if extend_s is not None else self.visibility_timeout_s
         with self.db.transaction() as tx:
             rows = tx.query(
-                "SELECT jl_heartbeat(?, ?, ?) AS r",
+                "SELECT honker_heartbeat(?, ?, ?) AS r",
                 [int(job_id), worker_id, extend],
             )
         return bool(rows[0]["r"])
@@ -518,7 +518,7 @@ class Stream:
     after a disconnect; the iterator replays rows with offset >
     from_offset, then transitions to live WAL-wake delivery.
 
-    All SQL lives in Rust (`jl_stream_publish/read_since/
+    All SQL lives in Rust (`honker_stream_publish/read_since/
     save_offset/get_offset`); this class is a thin wrapper so every
     binding shares one storage layout.
     """
@@ -537,11 +537,11 @@ class Stream:
     def publish(
         self, payload: Any, key: Optional[str] = None, tx=None
     ) -> None:
-        """Append one event. Delegates to `jl_stream_publish`.
+        """Append one event. Delegates to `honker_stream_publish`.
         Pass a shared `tx` to bundle multiple publishes + a business
         write into one commit."""
         payload_str = json.dumps(payload)
-        sql = "SELECT jl_stream_publish(?, ?, ?)"
+        sql = "SELECT honker_stream_publish(?, ?, ?)"
         params = [self.name, key, payload_str]
         if tx is not None:
             tx.query(sql, params)
@@ -552,7 +552,7 @@ class Stream:
     def _read_since(self, offset: int, limit: int = 1000) -> list:
         with self.db.transaction() as tx:
             rows = tx.query(
-                "SELECT jl_stream_read_since(?, ?, ?) AS rows_json",
+                "SELECT honker_stream_read_since(?, ?, ?) AS rows_json",
                 [self.name, int(offset), int(limit)],
             )
         return json.loads(rows[0]["rows_json"])
@@ -560,19 +560,19 @@ class Stream:
     def save_offset(self, consumer: str, offset: int) -> None:
         """Persist a consumer's high-water mark. Monotonic — never
         rewinds on duplicate deliveries. Delegates to
-        `jl_stream_save_offset`."""
+        `honker_stream_save_offset`."""
         with self.db.transaction() as tx:
             tx.query(
-                "SELECT jl_stream_save_offset(?, ?, ?)",
+                "SELECT honker_stream_save_offset(?, ?, ?)",
                 [consumer, self.name, int(offset)],
             )
 
     def get_offset(self, consumer: str) -> int:
         """Read a consumer's saved offset, or 0 if unknown.
-        Delegates to `jl_stream_get_offset`."""
+        Delegates to `honker_stream_get_offset`."""
         with self.db.transaction() as tx:
             rows = tx.query(
-                "SELECT jl_stream_get_offset(?, ?) AS v",
+                "SELECT honker_stream_get_offset(?, ?) AS v",
                 [consumer, self.name],
             )
         return int(rows[0]["v"])
@@ -808,7 +808,7 @@ class _Lock:
     def __enter__(self) -> "_Lock":
         with self.db.transaction() as tx:
             rows = tx.query(
-                "SELECT jl_lock_acquire(?, ?, ?) AS r",
+                "SELECT honker_lock_acquire(?, ?, ?) AS r",
                 [self.name, self.owner, self.ttl],
             )
             if not rows[0]["r"]:
@@ -820,7 +820,7 @@ class _Lock:
         if self.acquired:
             with self.db.transaction() as tx:
                 tx.query(
-                    "SELECT jl_lock_release(?, ?)",
+                    "SELECT honker_lock_release(?, ?)",
                     [self.name, self.owner],
                 )
             self.acquired = False
@@ -882,7 +882,7 @@ class Database:
             raise ValueError("limit and per must be positive")
         with self.transaction() as tx:
             rows = tx.query(
-                "SELECT jl_rate_limit_try(?, ?, ?) AS r",
+                "SELECT honker_rate_limit_try(?, ?, ?) AS r",
                 [name, limit, per],
             )
         return bool(rows[0]["r"])
@@ -892,11 +892,11 @@ class Database:
         `older_than_s` seconds ago. Returns rows deleted. Purely a
         table-space reclaim — old windows are never consulted by
         `try_rate_limit`, so leaving them around is just disk use.
-        Delegates to `jl_rate_limit_sweep`.
+        Delegates to `honker_rate_limit_sweep`.
         """
         with self.transaction() as tx:
             rows = tx.query(
-                "SELECT jl_rate_limit_sweep(?) AS n", [int(older_than_s)]
+                "SELECT honker_rate_limit_sweep(?) AS n", [int(older_than_s)]
             )
         return rows[0]["n"]
 
