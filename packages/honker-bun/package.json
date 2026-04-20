@@ -1,0 +1,25 @@
+{
+  "name": "honker-bun",
+  "version": "0.1.0",
+  "description": "Bun binding for Honker — durable queues, streams, pub/sub, and scheduler on SQLite.",
+  "license": "Apache-2.0",
+  "homepage": "https://honker.dev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/russellromney/honker.git",
+    "directory": "packages/honker-bun"
+  },
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "test": "bun test",
+    "example": "bun run examples/basic.ts"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}
