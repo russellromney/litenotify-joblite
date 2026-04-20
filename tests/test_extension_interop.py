@@ -490,3 +490,247 @@ def test_extension_result_interops_with_python(ext_db_path):
     row = conn.execute("SELECT jl_result_get(200)").fetchone()[0]
     assert row == '{"from": "py"}'
     conn.close()
+
+
+# ---------- jl_enqueue / jl_ack / jl_retry / jl_fail / jl_heartbeat ----------
+
+
+@pytest.mark.skipif(_EXT_PATH is None, reason=_SKIP_REASON)
+def test_extension_enqueue_returns_id_and_fires_notify(ext_db_path):
+    """`jl_enqueue` INSERTs a row, returns its id, and pushes a
+    'new' notification on `joblite:<queue>` so waiting workers wake.
+    """
+    conn = _open_ext(ext_db_path)
+    # Seven args: queue, payload, run_at_or_null, delay_or_null,
+    # priority, max_attempts, expires_or_null.
+    rid = conn.execute(
+        "SELECT jl_enqueue('q', '{\"x\":1}', NULL, NULL, 0, 3, NULL)"
+    ).fetchone()[0]
+    conn.commit()
+    assert isinstance(rid, int) and rid > 0
+
+    # Row landed.
+    row = conn.execute(
+        "SELECT id, queue, payload, state FROM _joblite_live"
+    ).fetchone()
+    assert row == (rid, "q", '{"x":1}', "pending")
+
+    # Notify fired on the queue's channel.
+    notif = conn.execute(
+        "SELECT channel, payload FROM _litenotify_notifications ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert notif == ("joblite:q", "new")
+    conn.close()
+
+
+@pytest.mark.skipif(_EXT_PATH is None, reason=_SKIP_REASON)
+def test_extension_enqueue_delay_overrides_run_at(ext_db_path):
+    """Delay wins over run_at per the documented precedence."""
+    conn = _open_ext(ext_db_path)
+    # delay=60 should produce run_at = now+60, ignoring the literal
+    # run_at=1000.
+    conn.execute(
+        "SELECT jl_enqueue('q', '{}', 1000, 60, 0, 3, NULL)"
+    )
+    conn.commit()
+    ra = conn.execute("SELECT run_at FROM _joblite_live").fetchone()[0]
+    now = conn.execute("SELECT unixepoch()").fetchone()[0]
+    assert 58 <= ra - now <= 62
+    conn.close()
+
+
+@pytest.mark.skipif(_EXT_PATH is None, reason=_SKIP_REASON)
+def test_extension_enqueue_expires_sets_absolute(ext_db_path):
+    """expires=60 → expires_at = now + 60."""
+    conn = _open_ext(ext_db_path)
+    conn.execute(
+        "SELECT jl_enqueue('q', '{}', NULL, NULL, 0, 3, 60)"
+    )
+    conn.commit()
+    exp = conn.execute("SELECT expires_at FROM _joblite_live").fetchone()[0]
+    now = conn.execute("SELECT unixepoch()").fetchone()[0]
+    assert 58 <= exp - now <= 62
+    conn.close()
+
+
+@pytest.mark.skipif(_EXT_PATH is None, reason=_SKIP_REASON)
+def test_extension_ack_singular(ext_db_path):
+    """jl_ack(job_id, worker_id) DELETEs and returns 1 on success,
+    0 if the claim isn't ours."""
+    conn = _open_ext(ext_db_path)
+    conn.execute("SELECT jl_enqueue('q', '{}', NULL, NULL, 0, 3, NULL)")
+    conn.commit()
+    claimed = conn.execute(
+        "SELECT jl_claim_batch('q', 'w1', 1, 300)"
+    ).fetchone()[0]
+    conn.commit()
+    rid = json.loads(claimed)[0]["id"]
+
+    # Wrong worker — 0.
+    assert conn.execute(
+        "SELECT jl_ack(?, 'w2')", [rid]
+    ).fetchone()[0] == 0
+    # Right worker — 1.
+    assert conn.execute(
+        "SELECT jl_ack(?, 'w1')", [rid]
+    ).fetchone()[0] == 1
+    conn.commit()
+    # Row gone.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM _joblite_live"
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+@pytest.mark.skipif(_EXT_PATH is None, reason=_SKIP_REASON)
+def test_extension_retry_flips_back_and_fires_wake(ext_db_path):
+    """jl_retry flips the claim back to pending with run_at pushed,
+    and notifies the queue's channel so waiting workers re-poll."""
+    conn = _open_ext(ext_db_path)
+    conn.execute("SELECT jl_enqueue('rq', '{}', NULL, NULL, 0, 5, NULL)")
+    conn.commit()
+    claimed = conn.execute(
+        "SELECT jl_claim_batch('rq', 'w1', 1, 300)"
+    ).fetchone()[0]
+    conn.commit()
+    rid = json.loads(claimed)[0]["id"]
+
+    # Truncate earlier notifications so we can assert on the retry one.
+    conn.execute("DELETE FROM _litenotify_notifications")
+    conn.commit()
+
+    result = conn.execute(
+        "SELECT jl_retry(?, 'w1', 60, 'transient')", [rid]
+    ).fetchone()[0]
+    conn.commit()
+    assert result == 1
+
+    row = conn.execute(
+        "SELECT state, run_at, worker_id, attempts FROM _joblite_live"
+    ).fetchone()
+    state, ra, wid, attempts = row
+    assert state == "pending"
+    assert wid is None
+    assert attempts == 1  # incremented during claim; not decremented
+    now = conn.execute("SELECT unixepoch()").fetchone()[0]
+    assert 58 <= ra - now <= 62
+
+    notif = conn.execute(
+        "SELECT channel, payload FROM _litenotify_notifications"
+    ).fetchone()
+    assert notif == ("joblite:rq", "retry")
+    conn.close()
+
+
+@pytest.mark.skipif(_EXT_PATH is None, reason=_SKIP_REASON)
+def test_extension_retry_exhausted_moves_to_dead(ext_db_path):
+    """If attempts >= max_attempts at retry time, jl_retry moves the
+    row to _joblite_dead with last_error set, instead of flipping
+    back to pending."""
+    conn = _open_ext(ext_db_path)
+    # max_attempts=1 so first attempt exhausts.
+    conn.execute("SELECT jl_enqueue('fq', '{}', NULL, NULL, 0, 1, NULL)")
+    conn.commit()
+    claimed = conn.execute(
+        "SELECT jl_claim_batch('fq', 'w1', 1, 300)"
+    ).fetchone()[0]
+    conn.commit()
+    rid = json.loads(claimed)[0]["id"]
+
+    assert conn.execute(
+        "SELECT jl_retry(?, 'w1', 60, 'gave up')", [rid]
+    ).fetchone()[0] == 1
+    conn.commit()
+
+    # Moved to dead.
+    dead = conn.execute(
+        "SELECT id, last_error FROM _joblite_dead"
+    ).fetchone()
+    assert dead == (rid, "gave up")
+    assert conn.execute(
+        "SELECT COUNT(*) FROM _joblite_live"
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+@pytest.mark.skipif(_EXT_PATH is None, reason=_SKIP_REASON)
+def test_extension_fail_unconditional(ext_db_path):
+    """jl_fail always moves the claim to dead regardless of
+    attempts vs max_attempts."""
+    conn = _open_ext(ext_db_path)
+    conn.execute("SELECT jl_enqueue('x', '{}', NULL, NULL, 0, 99, NULL)")
+    conn.commit()
+    claimed = conn.execute(
+        "SELECT jl_claim_batch('x', 'w', 1, 300)"
+    ).fetchone()[0]
+    conn.commit()
+    rid = json.loads(claimed)[0]["id"]
+
+    assert conn.execute(
+        "SELECT jl_fail(?, 'w', 'explicit')", [rid]
+    ).fetchone()[0] == 1
+    conn.commit()
+    dead = conn.execute(
+        "SELECT last_error FROM _joblite_dead"
+    ).fetchone()
+    assert dead == ("explicit",)
+    conn.close()
+
+
+@pytest.mark.skipif(_EXT_PATH is None, reason=_SKIP_REASON)
+def test_extension_heartbeat_extends_claim(ext_db_path):
+    """jl_heartbeat pushes claim_expires_at forward by extend_s."""
+    conn = _open_ext(ext_db_path)
+    conn.execute("SELECT jl_enqueue('hb', '{}', NULL, NULL, 0, 3, NULL)")
+    conn.commit()
+    claimed = conn.execute(
+        "SELECT jl_claim_batch('hb', 'w', 1, 60)"
+    ).fetchone()[0]
+    conn.commit()
+    rid = json.loads(claimed)[0]["id"]
+    orig_exp = conn.execute(
+        "SELECT claim_expires_at FROM _joblite_live WHERE id=?", [rid]
+    ).fetchone()[0]
+
+    # extend_s=300 pushes claim_expires_at to unixepoch() + 300.
+    assert conn.execute(
+        "SELECT jl_heartbeat(?, 'w', 300)", [rid]
+    ).fetchone()[0] == 1
+    conn.commit()
+    new_exp = conn.execute(
+        "SELECT claim_expires_at FROM _joblite_live WHERE id=?", [rid]
+    ).fetchone()[0]
+    assert new_exp > orig_exp
+    now = conn.execute("SELECT unixepoch()").fetchone()[0]
+    assert 298 <= new_exp - now <= 302
+
+    # Wrong worker — 0.
+    assert conn.execute(
+        "SELECT jl_heartbeat(?, 'other', 300)", [rid]
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+@pytest.mark.skipif(_EXT_PATH is None, reason=_SKIP_REASON)
+def test_extension_enqueue_interops_with_python(ext_db_path):
+    """Extension jl_enqueue and Python Queue.enqueue hit the same
+    table. IDs are the same PRIMARY KEY sequence. Each side can
+    claim the other's rows."""
+    db = joblite.open(ext_db_path)
+    q = db.queue("mixed")
+
+    # Python enqueues.
+    py_id = q.enqueue({"from": "py"})
+
+    # Extension enqueues.
+    conn = _open_ext(ext_db_path)
+    ext_id = conn.execute(
+        "SELECT jl_enqueue('mixed', '{\"from\":\"ext\"}', NULL, NULL, 0, 3, NULL)"
+    ).fetchone()[0]
+    conn.commit()
+    conn.close()
+
+    assert ext_id > py_id
+    # Python can claim both (they're on the same queue/table).
+    jobs = q.claim_batch("py-w", 10)
+    assert sorted(j.id for j in jobs) == [py_id, ext_id]

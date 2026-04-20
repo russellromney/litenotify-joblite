@@ -187,6 +187,96 @@ pub fn attach_joblite_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
+    // jl_enqueue(queue, payload, run_at_or_null, delay_or_null,
+    //            priority, max_attempts, expires_or_null) -> inserted id.
+    // Precedence: if `delay` is not NULL, use `unixepoch() + delay`;
+    // else if `run_at` is not NULL, use that literal; else use
+    // `unixepoch()`. `expires` is `unixepoch() + expires` if non-NULL,
+    // else NULL (never expires).
+    conn.create_scalar_function(
+        "jl_enqueue",
+        7,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let queue: String = ctx.get(0)?;
+            let payload: String = ctx.get(1)?;
+            let run_at: Option<i64> = ctx.get(2)?;
+            let delay: Option<i64> = ctx.get(3)?;
+            let priority: i64 = ctx.get(4)?;
+            let max_attempts: i64 = ctx.get(5)?;
+            let expires: Option<i64> = ctx.get(6)?;
+            let db = unsafe { ctx.get_connection() }?;
+            enqueue(
+                &db, &queue, &payload, run_at, delay, priority,
+                max_attempts, expires,
+            )
+            .map_err(to_sql_err)
+        },
+    )?;
+
+    // jl_ack(job_id, worker_id) -> 1 if ack'd, 0 if claim expired /
+    // not ours.
+    conn.create_scalar_function(
+        "jl_ack",
+        2,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let job_id: i64 = ctx.get(0)?;
+            let worker_id: String = ctx.get(1)?;
+            let db = unsafe { ctx.get_connection() }?;
+            ack(&db, job_id, &worker_id).map_err(to_sql_err)
+        },
+    )?;
+
+    // jl_retry(job_id, worker_id, delay_s, error) -> 1 if retried /
+    // moved to dead, 0 if not our claim. If attempts >= max_attempts,
+    // moves the row to `_joblite_dead` instead of flipping it back
+    // to pending. Fires a notify on the queue's channel on successful
+    // pending-flip (so waiting workers wake).
+    conn.create_scalar_function(
+        "jl_retry",
+        4,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let job_id: i64 = ctx.get(0)?;
+            let worker_id: String = ctx.get(1)?;
+            let delay_s: i64 = ctx.get(2)?;
+            let error: String = ctx.get(3)?;
+            let db = unsafe { ctx.get_connection() }?;
+            retry(&db, job_id, &worker_id, delay_s, &error).map_err(to_sql_err)
+        },
+    )?;
+
+    // jl_fail(job_id, worker_id, error) -> 1 if failed-to-dead, 0 if
+    // not our claim.
+    conn.create_scalar_function(
+        "jl_fail",
+        3,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let job_id: i64 = ctx.get(0)?;
+            let worker_id: String = ctx.get(1)?;
+            let error: String = ctx.get(2)?;
+            let db = unsafe { ctx.get_connection() }?;
+            fail(&db, job_id, &worker_id, &error).map_err(to_sql_err)
+        },
+    )?;
+
+    // jl_heartbeat(job_id, worker_id, extend_s) -> 1 if extended, 0
+    // if not our claim.
+    conn.create_scalar_function(
+        "jl_heartbeat",
+        3,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let job_id: i64 = ctx.get(0)?;
+            let worker_id: String = ctx.get(1)?;
+            let extend_s: i64 = ctx.get(2)?;
+            let db = unsafe { ctx.get_connection() }?;
+            heartbeat(&db, job_id, &worker_id, extend_s).map_err(to_sql_err)
+        },
+    )?;
+
     Ok(())
 }
 
@@ -269,6 +359,196 @@ pub fn ack_batch(
         count += 1;
     }
     Ok(count)
+}
+
+// ---------------------------------------------------------------------
+// Enqueue / single-job ack / retry / fail / heartbeat
+// ---------------------------------------------------------------------
+
+/// INSERT a job. Returns the new row's id.
+///
+/// Scheduling (lowest-to-highest precedence):
+///   - no run_at, no delay → `unixepoch()` (claimable immediately)
+///   - run_at set           → that literal unix timestamp
+///   - delay set            → `unixepoch() + delay` (wins over run_at)
+///
+/// Expiration: NULL = never; `Some(s)` = `unixepoch() + s`.
+pub fn enqueue(
+    conn: &Connection,
+    queue: &str,
+    payload: &str,
+    run_at: Option<i64>,
+    delay: Option<i64>,
+    priority: i64,
+    max_attempts: i64,
+    expires: Option<i64>,
+) -> rusqlite::Result<i64> {
+    let now: i64 = conn.query_row("SELECT unixepoch()", [], |r| r.get(0))?;
+    let run_at_val: i64 = match (delay, run_at) {
+        (Some(d), _) => now + d,
+        (None, Some(r)) => r,
+        (None, None) => now,
+    };
+    let expires_at: Option<i64> = expires.map(|e| now + e);
+    let channel = format!("joblite:{}", queue);
+
+    let id: i64 = conn.query_row(
+        "INSERT INTO _joblite_live
+           (queue, payload, run_at, priority, max_attempts, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         RETURNING id",
+        rusqlite::params![queue, payload, run_at_val, priority, max_attempts, expires_at],
+        |r| r.get(0),
+    )?;
+    // Fire a wake so workers parked on this queue's channel re-poll.
+    conn.execute(
+        "INSERT INTO _litenotify_notifications (channel, payload)
+         VALUES (?1, 'new')",
+        rusqlite::params![channel],
+    )?;
+    Ok(id)
+}
+
+/// Single-job ack. DELETEs the row if the caller's claim is still
+/// valid. Returns 1 on success, 0 if the claim expired or the row
+/// isn't ours.
+pub fn ack(conn: &Connection, job_id: i64, worker_id: &str) -> rusqlite::Result<i64> {
+    let deleted = conn.execute(
+        "DELETE FROM _joblite_live
+         WHERE id = ?1 AND worker_id = ?2 AND claim_expires_at >= unixepoch()",
+        rusqlite::params![job_id, worker_id],
+    )?;
+    Ok(deleted as i64)
+}
+
+/// Retry or fail based on `attempts` vs `max_attempts`. If another
+/// attempt is allowed, flips the row back to `'pending'` with
+/// `run_at = unixepoch() + delay_s` and fires a wake. Otherwise
+/// DELETEs from `_joblite_live` and INSERTs into `_joblite_dead`
+/// with `last_error=error`.
+///
+/// Returns 1 if either branch ran, 0 if the claim is no longer valid
+/// (expired / not our worker / row moved on).
+pub fn retry(
+    conn: &Connection,
+    job_id: i64,
+    worker_id: &str,
+    delay_s: i64,
+    error: &str,
+) -> rusqlite::Result<i64> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(i64, String, String, i64, i64, i64, i64, i64)> = conn
+        .query_row(
+            "SELECT id, queue, payload, priority, run_at, max_attempts,
+                    attempts, created_at
+             FROM _joblite_live
+             WHERE id = ?1 AND worker_id = ?2
+               AND claim_expires_at >= unixepoch()
+               AND state = 'processing'",
+            rusqlite::params![job_id, worker_id],
+            |r| Ok((
+                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?,
+                r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
+            )),
+        )
+        .ok();
+    let Some((id, queue, payload, priority, run_at, max_attempts, attempts, created_at)) = row
+    else {
+        return Ok(0);
+    };
+    if attempts >= max_attempts {
+        conn.execute(
+            "DELETE FROM _joblite_live WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+        conn.execute(
+            "INSERT INTO _joblite_dead
+               (id, queue, payload, priority, run_at, max_attempts,
+                attempts, last_error, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                id, queue, payload, priority, run_at, max_attempts,
+                attempts, error, created_at
+            ],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE _joblite_live
+             SET state = 'pending',
+                 run_at = unixepoch() + ?2,
+                 worker_id = NULL,
+                 claim_expires_at = NULL
+             WHERE id = ?1",
+            rusqlite::params![id, delay_s],
+        )?;
+        // Fire a wake — the row is now claimable again (after the
+        // delay), and waiting workers should re-poll.
+        let channel = format!("joblite:{}", queue);
+        conn.execute(
+            "INSERT INTO _litenotify_notifications (channel, payload)
+             VALUES (?1, 'retry')",
+            rusqlite::params![channel],
+        )?;
+    }
+    Ok(1)
+}
+
+/// Unconditionally move the claim to `_joblite_dead` with the given
+/// error. Returns 1 if moved, 0 if not our claim.
+pub fn fail(
+    conn: &Connection,
+    job_id: i64,
+    worker_id: &str,
+    error: &str,
+) -> rusqlite::Result<i64> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(i64, String, String, i64, i64, i64, i64, i64)> = conn
+        .query_row(
+            "DELETE FROM _joblite_live
+             WHERE id = ?1 AND worker_id = ?2
+               AND claim_expires_at >= unixepoch()
+             RETURNING id, queue, payload, priority, run_at, max_attempts,
+                       attempts, created_at",
+            rusqlite::params![job_id, worker_id],
+            |r| Ok((
+                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?,
+                r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
+            )),
+        )
+        .ok();
+    let Some((id, queue, payload, priority, run_at, max_attempts, attempts, created_at)) = row
+    else {
+        return Ok(0);
+    };
+    conn.execute(
+        "INSERT INTO _joblite_dead
+           (id, queue, payload, priority, run_at, max_attempts,
+            attempts, last_error, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            id, queue, payload, priority, run_at, max_attempts,
+            attempts, error, created_at
+        ],
+    )?;
+    Ok(1)
+}
+
+/// Extend the current claim by `extend_s` seconds. Returns 1 if the
+/// heartbeat landed, 0 if we're not the holder (either the row is
+/// in a different state or worker_id doesn't match).
+pub fn heartbeat(
+    conn: &Connection,
+    job_id: i64,
+    worker_id: &str,
+    extend_s: i64,
+) -> rusqlite::Result<i64> {
+    let updated = conn.execute(
+        "UPDATE _joblite_live
+         SET claim_expires_at = unixepoch() + ?3
+         WHERE id = ?1 AND worker_id = ?2 AND state = 'processing'",
+        rusqlite::params![job_id, worker_id, extend_s],
+    )?;
+    Ok(updated as i64)
 }
 
 // ---------------------------------------------------------------------
