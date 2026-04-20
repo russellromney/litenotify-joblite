@@ -3,6 +3,12 @@ members = [
     "honker-core",
     "honker-extension",
     "packages/honker",
+]
+# packages/honker-node and packages/honker-rs live in their own
+# submodule repos; they opt out of this workspace via their own
+# `[workspace]` tables and pull `honker-core` via a relative path.
+exclude = [
     "packages/honker-node",
+    "packages/honker-rs",
 ]
 resolver = "2"

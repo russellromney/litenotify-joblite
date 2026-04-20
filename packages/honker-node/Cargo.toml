@@ -3,11 +3,19 @@ name = "honker-node"
 version = "0.1.0"
 edition = "2024"
 
+# Not part of the root workspace — lives on its own so it can be
+# split into a submodule repo without disturbing the core build.
+[workspace]
+
 [lib]
 name = "honker_node"
 crate-type = ["cdylib"]
 
 [dependencies]
+# Relative path works when this crate sits at packages/honker-node
+# inside the main honker repo (whether directly or as a submodule).
+# Standalone hacking on this repo alone requires honker-core on
+# crates.io (future) or a manual path override in .cargo/config.toml.
 honker-core = { path = "../../honker-core" }
 napi = { version = "3.2", features = ["async", "serde-json", "tokio_rt"] }
 napi-derive = "3.2"
