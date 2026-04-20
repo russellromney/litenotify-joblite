@@ -336,6 +336,69 @@ pub fn attach_joblite_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
+    // Stream functions. One impl for every binding; _joblite_stream +
+    // _joblite_stream_consumers are the shared on-disk layout.
+
+    // jl_stream_publish(topic, key_or_null, payload_json) -> offset.
+    // INSERTs one event and fires a wake on joblite:stream:<topic>.
+    conn.create_scalar_function(
+        "jl_stream_publish",
+        3,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let topic: String = ctx.get(0)?;
+            let key: Option<String> = ctx.get(1)?;
+            let payload: String = ctx.get(2)?;
+            let db = unsafe { ctx.get_connection() }?;
+            stream_publish(&db, &topic, key.as_deref(), &payload).map_err(to_sql_err)
+        },
+    )?;
+
+    // jl_stream_read_since(topic, offset, limit) -> JSON array of
+    // {offset, topic, key, payload, created_at}.
+    conn.create_scalar_function(
+        "jl_stream_read_since",
+        3,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let topic: String = ctx.get(0)?;
+            let offset: i64 = ctx.get(1)?;
+            let limit: i64 = ctx.get(2)?;
+            let db = unsafe { ctx.get_connection() }?;
+            stream_read_since(&db, &topic, offset, limit).map_err(to_sql_err)
+        },
+    )?;
+
+    // jl_stream_save_offset(consumer, topic, offset) -> 1 if row
+    // advanced (new row or higher offset), 0 if the saved offset is
+    // already >= `offset`. Monotonic: never rewinds on duplicate
+    // deliveries.
+    conn.create_scalar_function(
+        "jl_stream_save_offset",
+        3,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let consumer: String = ctx.get(0)?;
+            let topic: String = ctx.get(1)?;
+            let offset: i64 = ctx.get(2)?;
+            let db = unsafe { ctx.get_connection() }?;
+            stream_save_offset(&db, &consumer, &topic, offset).map_err(to_sql_err)
+        },
+    )?;
+
+    // jl_stream_get_offset(consumer, topic) -> offset or 0.
+    conn.create_scalar_function(
+        "jl_stream_get_offset",
+        2,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let consumer: String = ctx.get(0)?;
+            let topic: String = ctx.get(1)?;
+            let db = unsafe { ctx.get_connection() }?;
+            stream_get_offset(&db, &consumer, &topic).map_err(to_sql_err)
+        },
+    )?;
+
     Ok(())
 }
 
@@ -924,6 +987,118 @@ pub fn result_sweep(conn: &Connection) -> rusqlite::Result<i64> {
         [],
     )?;
     Ok(deleted as i64)
+}
+
+// ---------------------------------------------------------------------
+// Streams
+// ---------------------------------------------------------------------
+
+pub fn stream_publish(
+    conn: &Connection,
+    topic: &str,
+    key: Option<&str>,
+    payload: &str,
+) -> rusqlite::Result<i64> {
+    let offset: i64 = conn.query_row(
+        "INSERT INTO _joblite_stream (topic, key, payload)
+         VALUES (?1, ?2, ?3)
+         RETURNING offset",
+        rusqlite::params![topic, key, payload],
+        |r| r.get(0),
+    )?;
+    let channel = format!("joblite:stream:{}", topic);
+    conn.execute(
+        "INSERT INTO _litenotify_notifications (channel, payload)
+         VALUES (?1, 'new')",
+        rusqlite::params![channel],
+    )?;
+    Ok(offset)
+}
+
+/// Returns JSON: `[{"offset":N,"topic":"t","key":"k_or_null","payload":"...","created_at":T}, ...]`.
+/// `key` is a raw JSON token — `null` for SQL NULL, otherwise a JSON
+/// string literal.
+pub fn stream_read_since(
+    conn: &Connection,
+    topic: &str,
+    offset: i64,
+    limit: i64,
+) -> rusqlite::Result<String> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT offset, topic, key, payload, created_at
+         FROM _joblite_stream
+         WHERE topic = ?1 AND offset > ?2
+         ORDER BY offset ASC
+         LIMIT ?3",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![topic, offset, limit],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        },
+    )?;
+    let mut out = String::from("[");
+    let mut first = true;
+    for row in rows {
+        let (off, top, key, payload, created_at) = row?;
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        let key_tok = match key {
+            Some(s) => json_str(&s),
+            None => "null".to_string(),
+        };
+        out.push_str(&format!(
+            "{{\"offset\":{},\"topic\":{},\"key\":{},\"payload\":{},\"created_at\":{}}}",
+            off,
+            json_str(&top),
+            key_tok,
+            json_str(&payload),
+            created_at,
+        ));
+    }
+    out.push(']');
+    Ok(out)
+}
+
+pub fn stream_save_offset(
+    conn: &Connection,
+    consumer: &str,
+    topic: &str,
+    offset: i64,
+) -> rusqlite::Result<i64> {
+    // Monotonic upsert: WHERE excluded.offset > existing. The CHANGES
+    // pragma reports affected rows, which we translate to 1/0.
+    let changed = conn.execute(
+        "INSERT INTO _joblite_stream_consumers (name, topic, offset)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(name, topic) DO UPDATE SET offset = excluded.offset
+           WHERE excluded.offset > _joblite_stream_consumers.offset",
+        rusqlite::params![consumer, topic, offset],
+    )?;
+    Ok(if changed > 0 { 1 } else { 0 })
+}
+
+pub fn stream_get_offset(
+    conn: &Connection,
+    consumer: &str,
+    topic: &str,
+) -> rusqlite::Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT offset FROM _joblite_stream_consumers
+             WHERE name = ?1 AND topic = ?2",
+            rusqlite::params![consumer, topic],
+            |r| r.get(0),
+        )
+        .unwrap_or(0))
 }
 
 // ---------------------------------------------------------------------

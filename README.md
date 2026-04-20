@@ -155,6 +155,10 @@ SELECT jl_scheduler_register('nightly', 'backups',
 SELECT jl_scheduler_tick(unixepoch());                   -- JSON: fires due
 SELECT jl_scheduler_soonest();                           -- min next_fire_at
 SELECT jl_scheduler_unregister('nightly');               -- 1 = deleted
+SELECT jl_stream_publish('orders', 'k', '{"id":42}');    -- returns offset
+SELECT jl_stream_read_since('orders', 0, 1000);          -- JSON array
+SELECT jl_stream_save_offset('worker', 'orders', 42);    -- monotonic upsert
+SELECT jl_stream_get_offset('worker', 'orders');         -- offset or 0
 SELECT jl_result_save(42, '{"ok":true}', 3600);          -- save w/ 1h TTL
 SELECT jl_result_get(42);                                -- value or NULL
 SELECT jl_result_sweep();                                -- prune expired

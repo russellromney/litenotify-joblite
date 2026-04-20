@@ -47,13 +47,16 @@ pub unsafe extern "C" fn sqlite3_litenotifyext_init(
                     e.to_string(),
                 )))
             })?;
-            // jl_bootstrap, jl_claim_batch, jl_ack_batch, jl_sweep_expired,
-            // jl_lock_acquire, jl_lock_release, jl_rate_limit_try,
-            // jl_rate_limit_sweep, jl_cron_next_after,
-            // jl_scheduler_register, jl_scheduler_unregister,
-            // jl_scheduler_tick, jl_scheduler_soonest, jl_result_save,
-            // jl_result_get, jl_result_sweep, jl_enqueue, jl_ack,
-            // jl_retry, jl_fail, jl_heartbeat.
+            // Queue + lifecycle: jl_bootstrap, jl_enqueue, jl_claim_batch,
+            // jl_ack, jl_ack_batch, jl_retry, jl_fail, jl_heartbeat,
+            // jl_sweep_expired. Locks: jl_lock_acquire, jl_lock_release.
+            // Rate limiting: jl_rate_limit_try, jl_rate_limit_sweep.
+            // Cron + scheduler: jl_cron_next_after, jl_scheduler_register,
+            // jl_scheduler_unregister, jl_scheduler_tick,
+            // jl_scheduler_soonest. Results: jl_result_save,
+            // jl_result_get, jl_result_sweep. Streams: jl_stream_publish,
+            // jl_stream_read_since, jl_stream_save_offset,
+            // jl_stream_get_offset.
             litenotify_core::attach_joblite_functions(&conn)?;
             // Persistent load: extension stays registered across
             // connection close in the same process.

@@ -513,46 +513,23 @@ class Event:
 class Stream:
     """Durable pub/sub. Events are rows; consumers track offsets.
 
-    Publish inside a transaction to couple the event atomically to your
-    business write. Subscribe with a `from_offset` to catch up after a
-    disconnect; the iterator replays rows with offset > from_offset, then
-    transitions to live NOTIFY delivery.
+    Publish inside a transaction to couple the event atomically to
+    your business write. Subscribe with a `from_offset` to catch up
+    after a disconnect; the iterator replays rows with offset >
+    from_offset, then transitions to live WAL-wake delivery.
+
+    All SQL lives in Rust (`jl_stream_publish/read_since/
+    save_offset/get_offset`); this class is a thin wrapper so every
+    binding shares one storage layout.
     """
 
     def __init__(self, db, name: str):
         self.db = db
         self.name = name
-        self._init_schema()
-
-    def _init_schema(self):
-        with self.db.transaction() as tx:
-            tx.execute(
-                """
-                CREATE TABLE IF NOT EXISTS _joblite_stream (
-                  offset INTEGER PRIMARY KEY AUTOINCREMENT,
-                  topic TEXT NOT NULL,
-                  key TEXT,
-                  payload TEXT NOT NULL,
-                  created_at INTEGER NOT NULL DEFAULT (unixepoch())
-                )
-                """
-            )
-            tx.execute(
-                """
-                CREATE INDEX IF NOT EXISTS _joblite_stream_topic
-                  ON _joblite_stream(topic, offset)
-                """
-            )
-            tx.execute(
-                """
-                CREATE TABLE IF NOT EXISTS _joblite_stream_consumers (
-                  name TEXT NOT NULL,
-                  topic TEXT NOT NULL,
-                  offset INTEGER NOT NULL DEFAULT 0,
-                  PRIMARY KEY (name, topic)
-                )
-                """
-            )
+        # _joblite_stream + _joblite_stream_consumers ship in
+        # BOOTSTRAP_JOBLITE_SQL, so no per-Stream DDL needed — the
+        # tables already exist by the time Database wraps the
+        # connection.
 
     def _channel(self) -> str:
         return f"joblite:stream:{self.name}"
@@ -560,62 +537,45 @@ class Stream:
     def publish(
         self, payload: Any, key: Optional[str] = None, tx=None
     ) -> None:
+        """Append one event. Delegates to `jl_stream_publish`.
+        Pass a shared `tx` to bundle multiple publishes + a business
+        write into one commit."""
         payload_str = json.dumps(payload)
+        sql = "SELECT jl_stream_publish(?, ?, ?)"
         params = [self.name, key, payload_str]
         if tx is not None:
-            tx.execute(
-                """
-                INSERT INTO _joblite_stream (topic, key, payload)
-                VALUES (?, ?, ?)
-                """,
-                params,
-            )
-            tx.notify(self._channel(), "new")
+            tx.query(sql, params)
             return
         with self.db.transaction() as own_tx:
-            own_tx.execute(
-                """
-                INSERT INTO _joblite_stream (topic, key, payload)
-                VALUES (?, ?, ?)
-                """,
-                params,
-            )
-            own_tx.notify(self._channel(), "new")
+            own_tx.query(sql, params)
 
     def _read_since(self, offset: int, limit: int = 1000) -> list:
-        rows = self.db.query(
-            """
-            SELECT offset, topic, key, payload, created_at
-            FROM _joblite_stream
-            WHERE topic=? AND offset > ?
-            ORDER BY offset ASC
-            LIMIT ?
-            """,
-            [self.name, int(offset), int(limit)],
-        )
-        return rows
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT jl_stream_read_since(?, ?, ?) AS rows_json",
+                [self.name, int(offset), int(limit)],
+            )
+        return json.loads(rows[0]["rows_json"])
 
     def save_offset(self, consumer: str, offset: int) -> None:
+        """Persist a consumer's high-water mark. Monotonic — never
+        rewinds on duplicate deliveries. Delegates to
+        `jl_stream_save_offset`."""
         with self.db.transaction() as tx:
-            tx.execute(
-                """
-                INSERT INTO _joblite_stream_consumers (name, topic, offset)
-                VALUES (?, ?, ?)
-                ON CONFLICT(name, topic) DO UPDATE SET offset=excluded.offset
-                WHERE excluded.offset > _joblite_stream_consumers.offset
-                """,
+            tx.query(
+                "SELECT jl_stream_save_offset(?, ?, ?)",
                 [consumer, self.name, int(offset)],
             )
 
     def get_offset(self, consumer: str) -> int:
-        rows = self.db.query(
-            """
-            SELECT offset FROM _joblite_stream_consumers
-            WHERE name=? AND topic=?
-            """,
-            [consumer, self.name],
-        )
-        return rows[0]["offset"] if rows else 0
+        """Read a consumer's saved offset, or 0 if unknown.
+        Delegates to `jl_stream_get_offset`."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT jl_stream_get_offset(?, ?) AS v",
+                [consumer, self.name],
+            )
+        return int(rows[0]["v"])
 
     def subscribe(
         self,

@@ -216,6 +216,21 @@ pub const BOOTSTRAP_JOBLITE_SQL: &str = "
       created_at INTEGER NOT NULL DEFAULT (unixepoch()),
       expires_at INTEGER
     );
+    CREATE TABLE IF NOT EXISTS _joblite_stream (
+      offset INTEGER PRIMARY KEY AUTOINCREMENT,
+      topic TEXT NOT NULL,
+      key TEXT,
+      payload TEXT NOT NULL,
+      created_at INTEGER NOT NULL DEFAULT (unixepoch())
+    );
+    CREATE INDEX IF NOT EXISTS _joblite_stream_topic
+      ON _joblite_stream(topic, offset);
+    CREATE TABLE IF NOT EXISTS _joblite_stream_consumers (
+      name TEXT NOT NULL,
+      topic TEXT NOT NULL,
+      offset INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (name, topic)
+    );
 ";
 
 /// Install the joblite queue schema on `conn`. Idempotent. See
@@ -744,5 +759,27 @@ mod tests {
             res_cols,
             vec!["job_id", "value", "created_at", "expires_at"]
         );
+
+        // _joblite_stream + _joblite_stream_consumers tables for
+        // durable pub/sub streams.
+        let stream_cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('_joblite_stream')")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            stream_cols,
+            vec!["offset", "topic", "key", "payload", "created_at"]
+        );
+        let sc_cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('_joblite_stream_consumers')")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(sc_cols, vec!["name", "topic", "offset"]);
     }
 }

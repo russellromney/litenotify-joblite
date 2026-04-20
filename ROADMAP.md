@@ -129,7 +129,7 @@ each new binding is. Six-commit refactor:
   `Scheduler.run()` collapses to ~40 lines of asyncio glue around
   lock + tick + enqueue + sleep + heartbeat. Tasks stored in DB,
   not in a Python dict.
-- [ ] **6. Stream ops to Rust.** `jl_stream_publish`,
+- [x] **6. Stream ops to Rust.** `jl_stream_publish`,
   `jl_stream_read_since`, `jl_stream_save_offset`,
   `jl_stream_get_offset`. `_StreamIter` becomes a thin iterator
   around `SELECT jl_stream_read_since(...)`. Auto-save threshold
