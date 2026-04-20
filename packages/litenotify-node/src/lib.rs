@@ -27,7 +27,7 @@
 //! file watcher all come from the shared `litenotify-core` rlib so the
 //! PyO3, SQLite-extension, and Node bindings can't drift apart.
 
-use litenotify_core::{Readers, SharedWalWatcher, Writer, open_conn};
+use honker_core::{Readers, SharedWalWatcher, Writer, open_conn};
 use napi::Result;
 use napi_derive::napi;
 use parking_lot::Mutex;

@@ -1,0 +1,137 @@
+---
+title: Honker
+description: Durable queues, streams, pub/sub, and scheduler on SQLite. One file, zero servers.
+template: splash
+hero:
+  tagline: Durable queues, streams, pub/sub, and scheduler — on SQLite. One file, zero servers.
+  actions:
+    - text: Get started
+      link: /getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/russellromney/honker
+      icon: external
+---
+
+import { Card, CardGrid, Code, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## What you get
+
+<CardGrid>
+  <Card title="Queues" icon="list-format">
+    Durable FIFO / priority job queues with visibility timeouts, retries, dead-letter, and exactly-once batch claim.
+  </Card>
+  <Card title="Streams" icon="random">
+    Durable pub/sub with per-consumer offsets. Replay after disconnect; amortized offset saves.
+  </Card>
+  <Card title="Pub/Sub" icon="comment">
+    `pg_notify`-style LISTEN/NOTIFY with 1–2 ms cross-process wake latency.
+  </Card>
+  <Card title="Scheduler" icon="forward-slash">
+    Cron-style periodic tasks with leader election, missed-boundary catch-up, and persistent state.
+  </Card>
+  <Card title="Results, Locks, Rate limits" icon="approve-check">
+    Typed task results, named advisory locks with TTL, and fixed-window rate limiting — all one SQL call away.
+  </Card>
+  <Card title="Any language" icon="seti:default">
+    Load the extension in any SQLite client. First-class bindings for Python and Node; Go, Ruby, Rust on the way.
+  </Card>
+</CardGrid>
+
+## 20 seconds of code
+
+<Tabs syncKey="language">
+  <TabItem label="Python">
+```python
+import honker
+
+db = honker.open("app.db")
+q = db.queue("emails")
+
+# Enqueue (atomic with your business write)
+with db.transaction() as tx:
+    tx.execute("INSERT INTO orders (id, total) VALUES (?, ?)", [42, 99])
+    q.enqueue({"to": "alice@example.com", "order_id": 42}, tx=tx)
+
+# Worker in another process
+import asyncio
+
+async def main():
+    async for job in q.claim("worker-1"):
+        await send_email(job.payload)
+        job.ack()
+
+asyncio.run(main())
+```
+  </TabItem>
+  <TabItem label="Node">
+```js
+import * as honker from '@honker/node';
+
+const db = honker.open('app.db');
+const q = db.queue('emails');
+
+// Enqueue
+const tx = db.transaction();
+tx.execute('INSERT INTO orders (id, total) VALUES (?, ?)', [42, 99]);
+q.enqueue({ to: 'alice@example.com', order_id: 42 }, { tx });
+tx.commit();
+
+// Worker
+for await (const job of q.claim('worker-1')) {
+  await sendEmail(job.payload);
+  job.ack();
+}
+```
+  </TabItem>
+  <TabItem label="SQL (any language)">
+```sql
+.load ./libhonker
+SELECT honker_bootstrap();
+
+-- Enqueue
+SELECT honker_enqueue('emails', '{"to":"alice"}', NULL, NULL, 0, 3, NULL);
+
+-- Claim
+SELECT honker_claim_batch('emails', 'worker-1', 32, 300);
+
+-- Ack
+SELECT honker_ack_batch('[1,2,3]', 'worker-1');
+```
+  </TabItem>
+</Tabs>
+
+## Why Honker?
+
+**One file.** Your queue, your streams, your cron, your app data — same SQLite file. No Redis, no RabbitMQ, no Postgres, no service mesh. Copy the file, you've got a backup.
+
+**Cross-process, cross-language.** A FastAPI worker, a Node cron process, and a Go backfill script can all push and claim from the same queue on disk. The SQLite loadable extension ships every `honker_*` function to any client that can `.load` a shared library.
+
+**Fast enough.** Cross-process wake latency 1–2 ms p50 on M-series. Tens of thousands of enqueues per second. Pinned floor tests in CI catch 10× regressions.
+
+**Durable enough.** `BEGIN IMMEDIATE` serializes writers; `PRAGMA journal_mode=WAL` keeps readers non-blocking. SIGKILL mid-transaction leaves the DB clean — pinned by a subprocess crash-recovery test.
+
+## Install
+
+<Tabs syncKey="language">
+  <TabItem label="Python">
+```bash
+pip install honker
+```
+  </TabItem>
+  <TabItem label="Node">
+```bash
+npm install @honker/node
+```
+  </TabItem>
+  <TabItem label="SQLite extension (any client)">
+```bash
+# macOS / Linux prebuilds
+curl -LO https://github.com/russellromney/honker/releases/latest/download/libhonker-$(uname -sm | tr 'A-Z ' 'a-z-').dylib
+
+# Or build from source
+cargo build --release -p honker-extension
+```
+  </TabItem>
+</Tabs>

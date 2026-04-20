@@ -33,9 +33,9 @@
 //! objects — stays in the respective binding crate.
 
 pub mod cron;
-mod joblite_ops;
+mod honker_ops;
 
-pub use joblite_ops::attach_joblite_functions;
+pub use honker_ops::attach_honker_functions;
 
 use parking_lot::{Condvar, Mutex};
 use rusqlite::functions::FunctionFlags;

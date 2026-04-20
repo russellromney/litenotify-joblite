@@ -249,6 +249,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "honker-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "parking_lot",
+ "rusqlite",
+ "thiserror",
+]
+
+[[package]]
+name = "honker-extension"
+version = "0.1.0"
+dependencies = [
+ "honker-core",
+ "rusqlite",
+]
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -321,28 +340,9 @@ dependencies = [
 name = "litenotify"
 version = "0.1.0"
 dependencies = [
- "litenotify-core",
+ "honker-core",
  "parking_lot",
  "pyo3",
- "rusqlite",
-]
-
-[[package]]
-name = "litenotify-core"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "chrono-tz",
- "parking_lot",
- "rusqlite",
- "thiserror",
-]
-
-[[package]]
-name = "litenotify-extension"
-version = "0.1.0"
-dependencies = [
- "litenotify-core",
  "rusqlite",
 ]
 
@@ -350,7 +350,7 @@ dependencies = [
 name = "litenotify-node"
 version = "0.1.0"
 dependencies = [
- "litenotify-core",
+ "honker-core",
  "napi",
  "napi-build",
  "napi-derive",

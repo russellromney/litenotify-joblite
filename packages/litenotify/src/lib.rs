@@ -8,7 +8,7 @@
 //! WAL-file watcher thread — lives in [`litenotify_core`] and is
 //! shared with the other bindings (cdylib extension, napi-rs Node).
 
-use litenotify_core::{Readers, SharedWalWatcher, Writer, open_conn};
+use honker_core::{Readers, SharedWalWatcher, Writer, open_conn};
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
@@ -160,7 +160,7 @@ impl Database {
         // connection so Python can call `SELECT jl_foo(...)` inside
         // its own transactions — same implementations the loadable
         // extension registers, no `.dylib` load needed at runtime.
-        litenotify_core::attach_joblite_functions(&writer_conn)
+        honker_core::attach_honker_functions(&writer_conn)
             .map_err(core_err)?;
         let wal_path: std::path::PathBuf = format!("{}-wal", path).into();
         Ok(Self {
@@ -381,7 +381,7 @@ impl Transaction {
             .conn
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Transaction not started"))?;
-        litenotify_core::bootstrap_joblite_schema(conn).map_err(core_err)
+        honker_core::bootstrap_joblite_schema(conn).map_err(core_err)
     }
 }
 
@@ -501,7 +501,7 @@ fn open(path: String, max_readers: usize) -> PyResult<Database> {
 /// parser + next-boundary math lives once in Rust.
 #[pyfunction]
 fn cron_next_after(expr: String, from_unix: i64) -> PyResult<i64> {
-    litenotify_core::cron::next_after_unix(&expr, from_unix)
+    honker_core::cron::next_after_unix(&expr, from_unix)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
 }
 

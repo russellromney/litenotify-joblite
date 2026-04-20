@@ -1,0 +1,61 @@
+---
+title: Scheduler
+description: Cron-style periodic tasks with leader election and catch-up.
+---
+
+The scheduler dispatches periodic jobs at cron boundaries. It doesn't run handlers — it enqueues into named queues that regular workers consume. This separation means scheduling is lightweight and handler failures don't affect firing.
+
+## Register a task
+
+```python
+from honker import Scheduler, crontab
+
+scheduler = Scheduler(db)
+
+scheduler.add(
+    name="nightly-backup",
+    queue="backups",
+    schedule=crontab("0 3 * * *"),       # every day at 3am local time
+    payload={"target": "s3"},
+    expires=3600,                          # auto-drop if unclaimed after 1h
+)
+
+scheduler.add(
+    name="heartbeat",
+    queue="health",
+    schedule=crontab("*/5 * * * *"),       # every 5 minutes
+)
+
+# Run forever. Multiple processes can call this — only one will hold
+# the leader lock and actually fire.
+import asyncio
+asyncio.run(scheduler.run())
+```
+
+## Leader election
+
+The scheduler acquires an advisory lock named `honker-scheduler` with a 60-second TTL. A periodic heartbeat extends the TTL during long idle waits. If the leader crashes, the TTL elapses and a standby can take over. Two schedulers running simultaneously never double-fire — the lock is the sole gate, backed by `BEGIN IMMEDIATE` serialization.
+
+## Missed-boundary catch-up
+
+If the scheduler was down across multiple boundaries, the next tick walks forward firing each missed boundary. Good for low-frequency schedules ("fire once per hour for the last 6 hours"). For high-frequency schedules where catch-up is unwanted, set `expires=` so stale jobs drop out of the claim window.
+
+## Cron syntax
+
+Standard 5-field Unix cron: `minute hour day-of-month month day-of-week`. Fields support:
+
+- `*` — any value
+- `N` — literal value
+- `N-M` — inclusive range
+- `*/K` — every K starting at the low end
+- `N-M/K` — range with step
+- `N,M,P` — list
+
+All calendar arithmetic runs in the system local timezone. Set `TZ=UTC` if you want UTC boundaries.
+
+DST is handled correctly: spring-forward skips nonexistent local times, fall-back fires once at the earlier (EDT in US/Eastern) instance. Pinned by tests in the Rust cron module.
+
+## Where it lives
+
+- `_honker_scheduler_tasks` — one row per registered task: `(name, queue, cron_expr, payload, priority, expires_s, next_fire_at)`.
+- Scheduler state is on disk, not in a Python dict — every binding (Python, Node, extension) sees the same registrations.

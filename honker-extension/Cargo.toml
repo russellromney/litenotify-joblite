@@ -1,0 +1,19 @@
+[package]
+name = "honker-extension"
+version = "0.1.0"
+edition = "2024"
+
+# Output file is `libhonker_ext.dylib` / `.so`. Users load with:
+#     SELECT load_extension('/path/to/libhonker_ext');
+# The crate name differs from the PyO3 `honker` cdylib because both
+# would otherwise try to write `target/release/libhonker.dylib` and
+# clobber each other.
+[lib]
+name = "honker_ext"
+crate-type = ["cdylib"]
+
+[dependencies]
+honker-core = { path = "../honker-core" }
+# "loadable_extension" feature makes rusqlite usable from inside a
+# sqlite3_extension_init entry point.
+rusqlite = { version = "0.39.0", features = ["functions", "hooks", "loadable_extension"] }

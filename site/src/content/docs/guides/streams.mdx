@@ -1,0 +1,56 @@
+---
+title: Streams
+description: Durable pub/sub with per-consumer offsets.
+---
+
+Streams are the durable cousin of pub/sub: every event is a row in `_honker_stream`, consumers track offsets, and replay-on-reconnect is built in. Use streams when you need exactly-once-ish delivery or catch-up after a disconnect; use [pub/sub](/guides/pubsub/) when you only care about live signals.
+
+## Publish
+
+```python
+s = db.stream("orders")
+
+# One-off publish
+s.publish({"id": 42, "amount": 9900})
+
+# Atomic with a business write
+with db.transaction() as tx:
+    tx.execute("INSERT INTO orders VALUES (?, ?)", [42, 9900])
+    s.publish({"id": 42, "amount": 9900}, tx=tx)
+```
+
+## Subscribe with auto-offset-save
+
+A named consumer resumes where it left off. The iterator amortizes offset saves across events so the single-writer slot doesn't thrash.
+
+```python
+async for event in s.subscribe(consumer="email-worker"):
+    await send_order_email(event.payload)
+    # offset auto-saves on a cadence (default: every 1000 events or 1 second)
+```
+
+## Manual offset control
+
+For exactly-once-within-a-business-transaction semantics, save the offset inside the same transaction as your business write:
+
+```python
+async for event in s.subscribe(
+    consumer="invariant-writer",
+    save_every_n=0,  # disable auto-save
+    save_every_s=0,
+):
+    with db.transaction() as tx:
+        apply_to_read_model(event.payload, tx=tx)
+        s.save_offset("invariant-writer", event.offset, tx=tx)
+```
+
+## Replay semantics
+
+- `subscribe(consumer=name)` — start from the saved offset for this consumer (0 if never saved).
+- `subscribe(from_offset=N)` — start after offset N, regardless of any saved offset.
+- `subscribe()` — start from the current `MAX(offset)` (live-tail, no replay).
+
+## Where it lives
+
+- `_honker_stream` — append-only event log. `(topic, offset)` partial index for O(log n) reads.
+- `_honker_stream_consumers` — `(name, topic) -> offset`. One row per consumer per topic.

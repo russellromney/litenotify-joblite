@@ -1,0 +1,97 @@
+---
+title: SQL function reference
+description: The honker_* SQL scalar functions exposed by the SQLite loadable extension.
+---
+
+The Honker loadable extension (`libhonker.dylib` / `.so` / `.dll`) registers every `honker_*` SQL scalar function on the connection that loads it. Every language binding (Python, Node, future Go/Ruby) calls these same functions under the hood — this is the canonical surface.
+
+## Loading
+
+```sql
+.load ./libhonker
+SELECT honker_bootstrap();
+```
+
+`honker_bootstrap()` is idempotent and creates every `_honker_*` table if not already present. Call it once per database.
+
+## Queue
+
+| Function | Arguments | Returns |
+|---|---|---|
+| `honker_enqueue(queue, payload, run_at_or_null, delay_or_null, priority, max_attempts, expires_or_null)` | 7 args | inserted row id |
+| `honker_claim_batch(queue, worker_id, n, visibility_timeout_s)` | 4 args | JSON array of claimed jobs |
+| `honker_ack(job_id, worker_id)` | 2 args | 1 if ack'd, 0 if claim expired |
+| `honker_ack_batch(ids_json, worker_id)` | 2 args | count ack'd |
+| `honker_retry(job_id, worker_id, delay_s, error)` | 4 args | 1 if retried or moved to dead |
+| `honker_fail(job_id, worker_id, error)` | 3 args | 1 if moved to dead |
+| `honker_heartbeat(job_id, worker_id, extend_s)` | 3 args | 1 if extended |
+| `honker_sweep_expired(queue)` | 1 arg | count moved to dead |
+
+## Streams
+
+| Function | Arguments | Returns |
+|---|---|---|
+| `honker_stream_publish(topic, key_or_null, payload)` | 3 args | new offset |
+| `honker_stream_read_since(topic, offset, limit)` | 3 args | JSON array of events |
+| `honker_stream_save_offset(consumer, topic, offset)` | 3 args | 1 if advanced |
+| `honker_stream_get_offset(consumer, topic)` | 2 args | offset or 0 |
+
+## Pub/Sub
+
+| Function | Arguments | Returns |
+|---|---|---|
+| `notify(channel, payload)` | 2 args | inserted notification id |
+
+The function name stays `notify()` (not `honker_notify`) to match `pg_notify`'s signature for drop-in familiarity.
+
+## Scheduler
+
+| Function | Arguments | Returns |
+|---|---|---|
+| `honker_scheduler_register(name, queue, cron_expr, payload, priority, expires_s)` | 6 args | 1 |
+| `honker_scheduler_unregister(name)` | 1 arg | rows deleted |
+| `honker_scheduler_tick(now_unix)` | 1 arg | JSON array of fires |
+| `honker_scheduler_soonest()` | 0 args | min `next_fire_at` (unix ts) |
+| `honker_cron_next_after(expr, from_unix)` | 2 args | next unix ts |
+
+## Locks
+
+| Function | Arguments | Returns |
+|---|---|---|
+| `honker_lock_acquire(name, owner, ttl_s)` | 3 args | 1 if got it, 0 if held |
+| `honker_lock_release(name, owner)` | 2 args | 1 if released |
+
+## Rate limits
+
+| Function | Arguments | Returns |
+|---|---|---|
+| `honker_rate_limit_try(name, limit, per)` | 3 args | 1 if under, 0 if at cap |
+| `honker_rate_limit_sweep(older_than_s)` | 1 arg | rows deleted |
+
+## Results
+
+| Function | Arguments | Returns |
+|---|---|---|
+| `honker_result_save(job_id, value, ttl_s)` | 3 args | 1 |
+| `honker_result_get(job_id)` | 1 arg | value or NULL |
+| `honker_result_sweep()` | 0 args | rows deleted |
+
+## Example: full loop from raw SQLite
+
+```sql
+.load ./libhonker
+SELECT honker_bootstrap();
+
+-- Producer
+SELECT honker_enqueue('emails', '{"to":"alice"}', NULL, NULL, 0, 3, NULL);
+SELECT honker_enqueue('emails', '{"to":"bob"}', NULL, 30, 0, 3, NULL);
+
+-- Consumer
+SELECT honker_claim_batch('emails', 'worker-1', 32, 300);
+-- → [{"id":1,"queue":"emails","payload":"{\"to\":\"alice\"}","worker_id":"worker-1","attempts":1,"claim_expires_at":1700000300}]
+
+-- Ack
+SELECT honker_ack(1, 'worker-1');  -- 1
+```
+
+Under the hood, each language binding calls these same functions — which is why `tests/test_extension_interop.py` can verify that Python and the raw extension see identical on-disk state.

@@ -1,12 +1,12 @@
 [package]
-name = "litenotify-core"
+name = "honker-core"
 version = "0.1.0"
 edition = "2024"
-description = "Shared Rust core for litenotify bindings (PyO3, SQLite loadable extension, napi-rs). Not intended for direct use."
+description = "Shared Rust core for honker bindings (PyO3, SQLite loadable extension, napi-rs). Not intended for direct use."
 license = "Apache-2.0"
 
 [lib]
-name = "litenotify_core"
+name = "honker_core"
 # Plain rlib — no cdylib, no Python/Node/C ABI here. Consumed as a
 # regular Cargo dependency by the three binding crates.
 

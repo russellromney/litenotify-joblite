@@ -8,7 +8,7 @@ help:
 	@echo ""
 	@echo "Tests:"
 	@echo "  make test           - default test run: rust + python + node (fast)"
-	@echo "  make test-rust      - cargo test on litenotify-core"
+	@echo "  make test-rust      - cargo test on honker-core"
 	@echo "  make test-python    - pytest tests/ (excludes slow/linux_only)"
 	@echo "  make test-python-slow - pytest -m slow (soak, real-time cron)"
 	@echo "  make test-node      - npm test in packages/litenotify-node"
@@ -17,7 +17,7 @@ help:
 	@echo "Builds:"
 	@echo "  make build          - build both PyO3 + loadable extension"
 	@echo "  make build-pyo3     - maturin develop --release"
-	@echo "  make build-ext      - cargo build -p litenotify-extension --release"
+	@echo "  make build-ext      - cargo build -p honker-extension --release"
 	@echo ""
 	@echo "Coverage (run 'make install-coverage-deps' once):"
 	@echo "  make coverage       - both rust + python HTML reports into coverage/"
@@ -30,7 +30,7 @@ test: test-rust test-python test-node
 	@echo "all fast tests passed"
 
 test-rust:
-	cargo test -p litenotify-core --release
+	cargo test -p honker-core --release
 
 test-python:
 	.venv/bin/python -m pytest tests/
@@ -53,7 +53,7 @@ build-pyo3:
 		$(CURDIR)/.venv/bin/python -m maturin develop --release
 
 build-ext:
-	cargo build --release -p litenotify-extension
+	cargo build --release -p honker-extension
 
 # ---- coverage ----
 
@@ -68,8 +68,8 @@ coverage: coverage-rust coverage-python
 	@echo "  python: coverage/python/index.html"
 
 coverage-rust:
-	cargo llvm-cov --release -p litenotify-core --html --output-dir coverage/rust
-	cargo llvm-cov --release -p litenotify-core --summary-only
+	cargo llvm-cov --release -p honker-core --html --output-dir coverage/rust
+	cargo llvm-cov --release -p honker-core --summary-only
 
 coverage-python:
 	.venv/bin/python -m coverage erase

@@ -1,0 +1,154 @@
+---
+title: Getting started
+description: Install Honker and run your first queue-backed worker in 5 minutes.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+## Install
+
+<Tabs syncKey="language">
+  <TabItem label="Python">
+```bash
+pip install honker
+```
+
+Requires Python 3.10+. The wheel ships prebuilt SQLite + Rust binaries for macOS (arm64/x86_64) and Linux (x86_64/aarch64).
+  </TabItem>
+  <TabItem label="Node">
+```bash
+npm install @honker/node
+```
+
+Requires Node 18+. The `.node` binary ships prebuilt for the same four platforms.
+  </TabItem>
+  <TabItem label="SQLite extension">
+```bash
+# Prebuild for your platform from GitHub releases:
+curl -LO https://github.com/russellromney/honker/releases/latest/download/libhonker.dylib  # macOS
+curl -LO https://github.com/russellromney/honker/releases/latest/download/libhonker.so      # Linux
+```
+
+Works with any SQLite client: `sqlite3` CLI, `better-sqlite3`, `rusqlite`, Go's `mattn/go-sqlite3`, Ruby's `sqlite3` gem.
+  </TabItem>
+</Tabs>
+
+## Your first queue
+
+Open a database, create a queue, enqueue a job, and claim it — all in one script.
+
+<Tabs syncKey="language">
+  <TabItem label="Python">
+```python
+import honker
+
+# Opens or creates the DB file. Everything lives in one .db file.
+db = honker.open("app.db")
+q = db.queue("greetings")
+
+# Enqueue a job
+q.enqueue({"name": "world"})
+
+# Claim + ack
+job = q.claim_one("worker-1")
+print(f"hello, {job.payload['name']}!")
+job.ack()
+```
+  </TabItem>
+  <TabItem label="Node">
+```js
+import * as honker from '@honker/node';
+
+const db = honker.open('app.db');
+const q = db.queue('greetings');
+
+q.enqueue({ name: 'world' });
+
+const job = q.claimOne('worker-1');
+console.log(`hello, ${job.payload.name}!`);
+job.ack();
+```
+  </TabItem>
+</Tabs>
+
+## A proper worker
+
+The worker loop waits on the DB's write-ahead log and wakes within 1–2 ms when a new job lands. No polling.
+
+<Tabs syncKey="language">
+  <TabItem label="Python">
+```python
+import asyncio
+import honker
+
+async def main():
+    db = honker.open("app.db")
+    q = db.queue("emails")
+
+    async for job in q.claim("worker-1"):
+        try:
+            await send_email(job.payload)
+            job.ack()
+        except Exception as e:
+            # Scheduled retry with backoff. After max_attempts (default 3),
+            # the job moves to _honker_dead with last_error set.
+            job.retry(delay_s=60, error=str(e))
+
+asyncio.run(main())
+```
+  </TabItem>
+  <TabItem label="Node">
+```js
+import * as honker from '@honker/node';
+
+const db = honker.open('app.db');
+const q = db.queue('emails');
+
+for await (const job of q.claim('worker-1')) {
+  try {
+    await sendEmail(job.payload);
+    job.ack();
+  } catch (e) {
+    job.retry({ delaySeconds: 60, error: String(e) });
+  }
+}
+```
+  </TabItem>
+</Tabs>
+
+## Atomic enqueue with business writes
+
+The killer feature of a SQLite-native queue: the enqueue is in the same transaction as your business write. No dual-write problem, no outbox pattern to bolt on (though Honker has one for external systems).
+
+<Tabs syncKey="language">
+  <TabItem label="Python">
+```python
+with db.transaction() as tx:
+    tx.execute(
+        "INSERT INTO orders (id, total, customer_id) VALUES (?, ?, ?)",
+        [42, 9900, "alice"],
+    )
+    q.enqueue({"order_id": 42, "email_type": "confirmation"}, tx=tx)
+    # One COMMIT. Either both or neither lands.
+```
+  </TabItem>
+  <TabItem label="Node">
+```js
+const tx = db.transaction();
+tx.execute(
+  'INSERT INTO orders (id, total, customer_id) VALUES (?, ?, ?)',
+  [42, 9900, 'alice'],
+);
+q.enqueue({ order_id: 42, email_type: 'confirmation' }, { tx });
+tx.commit();
+```
+  </TabItem>
+</Tabs>
+
+## What's next
+
+- [Queues](/guides/queues/) — priority, delays, retries, dead-letter
+- [Streams](/guides/streams/) — durable pub/sub with per-consumer offsets
+- [Pub/Sub](/guides/pubsub/) — `pg_notify`-style ephemeral signals
+- [Scheduler](/guides/scheduler/) — cron-style periodic tasks
+- [Extension reference](/reference/extension/) — the full `honker_*` SQL function family

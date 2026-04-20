@@ -1,13 +1,13 @@
 //! Rust implementations of the `jl_*` SQL scalar functions, plus a
-//! single `attach_joblite_functions` helper that registers them on a
+//! single `attach_honker_functions` helper that registers them on a
 //! [`rusqlite::Connection`].
 //!
 //! Consumers:
 //!   * `litenotify-extension` — the loadable SQLite extension. Calls
-//!     `attach_joblite_functions` so `.load ./liblitenotify_ext` in any
+//!     `attach_honker_functions` so `.load ./liblitenotify_ext` in any
 //!     SQLite client exposes the full function set.
 //!   * `packages/litenotify` — the PyO3 binding. Calls
-//!     `attach_joblite_functions` on its writer connection so Python
+//!     `attach_honker_functions` on its writer connection so Python
 //!     can invoke `SELECT jl_*(...)` inside its own transactions
 //!     without loading the `.dylib` at runtime.
 //!   * Future bindings (Go, Ruby, napi-rs) — load the extension via
@@ -32,7 +32,7 @@ fn to_sql_err<E: std::fmt::Display>(e: E) -> rusqlite::Error {
 /// Register all `jl_*` joblite scalar functions on `conn`. Idempotent
 /// per-connection: creating the same function twice is a rusqlite
 /// error, so call exactly once per connection.
-pub fn attach_joblite_functions(conn: &Connection) -> rusqlite::Result<()> {
+pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     conn.create_scalar_function(
         "jl_bootstrap",
         0,

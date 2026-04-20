@@ -1,0 +1,54 @@
+---
+title: Pub/Sub
+description: pg_notify-style ephemeral LISTEN/NOTIFY with 1–2 ms cross-process wake latency.
+---
+
+Honker's pub/sub is a direct analog of Postgres's `pg_notify` / `LISTEN`: fire-and-forget signals between processes that share a SQLite file. 1–2 ms cross-process wake latency on M-series laptops. No replay, no delivery guarantees — for that use [Streams](/guides/streams/).
+
+## Fire a signal
+
+```python
+with db.transaction() as tx:
+    tx.notify("orders", {"id": 42, "event": "placed"})
+```
+
+The notification commits with the surrounding transaction. If the tx rolls back, no one receives the notification.
+
+## Listen
+
+```python
+async for notif in db.listen("orders"):
+    print(notif.channel, notif.payload)
+```
+
+The listener:
+- Starts from `MAX(id)` at attach time. Historical notifications are not replayed.
+- Wakes on every `.db-wal` change via a shared stat-poll thread (1 ms cadence).
+- Filters by channel at the SELECT level — a busy unrelated channel doesn't slow you down.
+
+## Cross-process
+
+The WAL watcher fires on commits from *any* process. A FastAPI app, a CLI worker, and a cron job can all `notify()` the same channel and a separate listener receives them all within a few milliseconds.
+
+## From raw SQLite
+
+Load the extension from any SQLite client and the `notify()` function is there:
+
+```sql
+.load ./libhonker
+SELECT notify('orders', '{"id":42}');
+```
+
+The extension keeps the function name `notify(channel, payload)` — matching `pg_notify`'s signature for drop-in familiarity.
+
+## Pruning
+
+Notifications accumulate in `_litenotify_notifications` until you prune them. There's no auto-prune because "how much history do you want" is a product decision.
+
+```python
+# Delete rows older than 1 hour
+db.prune_notifications(older_than_s=3600)
+
+# Keep only the most recent 10k rows
+db.prune_notifications(max_keep=10_000)
+```

@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "litenotify-core",
-    "litenotify-extension",
+    "honker-core",
+    "honker-extension",
     "packages/litenotify",
     "packages/litenotify-node",
 ]

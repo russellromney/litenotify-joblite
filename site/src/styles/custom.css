@@ -1,0 +1,25 @@
+/* Honker brand colors — warm amber/orange to evoke a goose honk */
+:root {
+  --sl-color-accent-low: #3a2512;
+  --sl-color-accent: #d68c3e;
+  --sl-color-accent-high: #f0c296;
+  --sl-color-white: #ffffff;
+  --sl-color-gray-1: #eceeef;
+  --sl-color-gray-2: #c0c2c4;
+  --sl-color-gray-3: #888b8e;
+  --sl-color-gray-4: #545659;
+  --sl-color-gray-5: #353739;
+  --sl-color-gray-6: #232425;
+  --sl-color-black: #17181c;
+}
+
+/* Tighter body copy */
+:root {
+  --sl-text-base: 15px;
+  --sl-text-h1: 2.2rem;
+}
+
+/* Subtle honker accent on code blocks */
+.expressive-code .frame {
+  border-color: var(--sl-color-accent-low);
+}

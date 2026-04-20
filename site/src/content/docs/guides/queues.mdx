@@ -1,0 +1,88 @@
+---
+title: Queues
+description: Durable FIFO / priority job queues backed by SQLite.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+A Honker queue is a named row group in the `_honker_live` table. Jobs have a payload, a priority, a `run_at` time, an attempts counter, and (optionally) an expiration. The worker loop claims jobs atomically via an indexed `UPDATE ... RETURNING`, runs them, and acks.
+
+## Enqueue
+
+<Tabs syncKey="language">
+  <TabItem label="Python">
+```python
+q = db.queue("emails")
+
+# Simple enqueue
+q.enqueue({"to": "alice@example.com"})
+
+# Delayed enqueue
+q.enqueue({"to": "bob@example.com"}, delay=60)  # claimable in 60s
+
+# Priority (higher = picked first within a queue)
+q.enqueue({"to": "urgent@example.com"}, priority=10)
+
+# Auto-expire uncaimed jobs after 1 hour
+q.enqueue({"to": "timely@example.com"}, expires=3600)
+```
+  </TabItem>
+  <TabItem label="Node">
+```js
+const q = db.queue('emails');
+
+q.enqueue({ to: 'alice@example.com' });
+q.enqueue({ to: 'bob@example.com' }, { delay: 60 });
+q.enqueue({ to: 'urgent@example.com' }, { priority: 10 });
+q.enqueue({ to: 'timely@example.com' }, { expires: 3600 });
+```
+  </TabItem>
+</Tabs>
+
+## Claim in a worker
+
+The async iterator wakes on every DB commit via the WAL watcher — 1–2 ms cross-process wake latency. No polling.
+
+```python
+async for job in q.claim("worker-1"):
+    try:
+        await do_work(job.payload)
+        job.ack()
+    except Retryable as e:
+        job.retry(delay_s=e.delay_s, error=str(e))
+    except Exception as e:
+        job.fail(error=str(e))  # straight to dead
+```
+
+## Batch claim
+
+If your handler benefits from batching (DB writes, HTTP calls), claim N jobs at once:
+
+```python
+jobs = q.claim_batch("worker-1", n=100)
+for j in jobs:
+    process(j.payload)
+q.ack_batch([j.id for j in jobs], "worker-1")
+```
+
+## Visibility timeout & heartbeat
+
+Every claim has a `claim_expires_at` (default 300s). If the worker doesn't ack or extend the claim in time, another worker can reclaim. For long-running jobs, heartbeat:
+
+```python
+async for job in q.claim("worker-1"):
+    async with heartbeat(job, every_s=60):
+        await long_running(job.payload)
+    job.ack()
+```
+
+## Retry, fail, dead-letter
+
+- `job.retry(delay_s, error)` — put back in `_honker_live` with a delay. After `max_attempts`, auto-moves to `_honker_dead`.
+- `job.fail(error)` — unconditional move to `_honker_dead`.
+- Dead jobs have `last_error` set. Inspect via `SELECT * FROM _honker_dead WHERE queue = 'emails'`.
+
+## Where it lives
+
+- `_honker_live` — all currently-claimable or in-flight jobs. Partial index on `(queue, priority DESC, run_at, id)` for O(log n) claims.
+- `_honker_dead` — exhausted or manually-failed jobs. Never auto-pruned; DELETE when you want.
