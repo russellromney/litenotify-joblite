@@ -11,4 +11,12 @@ dependencies = []
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = "-n auto"
+# Default run excludes slow / platform-gated tests. Run them explicitly:
+#   pytest -m slow              # only slow (e.g. real cron boundary)
+#   pytest -m linux_only        # only Linux-gated (e.g. ENOSPC via tmpfs)
+#   pytest -m "slow or linux_only or not (slow or linux_only)"   # everything
+addopts = "-n auto -m 'not slow and not linux_only'"
+markers = [
+    "slow: long-running (>5s) — real-time waits, soak tests. Run nightly.",
+    "linux_only: requires Linux-specific infra (tmpfs mounts, etc).",
+]
