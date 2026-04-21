@@ -22,3 +22,6 @@
 [submodule "packages/honker"]
 	path = packages/honker
 	url = git@github.com:russellromney/honker-py.git
+[submodule "packages/honker-cpp"]
+	path = packages/honker-cpp
+	url = git@github.com:russellromney/honker-cpp.git
