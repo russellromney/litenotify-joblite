@@ -2,15 +2,13 @@
   <img src="assets/honker-logo.png" width="120" alt="" /><br/>honker
 </h1>
 
-`honker` is a SQLite extension + language bindings that add Postgres-style `NOTIFY`/`LISTEN` semantics to SQLite, with built-in durable pub/sub, task queue, and event streams, without client polling or a daemon/broker.
+`honker` is a SQLite extension + language bindings that add Postgres-style `NOTIFY`/`LISTEN` semantics to SQLite, with built-in durable pub/sub, task queue, and event streams, without client polling or a daemon/broker. Any language that can `SELECT load_extension('honker')` gets the same features.
 
 `honker` works by adding messages/tasks to tables in SQLite, and takes advantage of event notifications on SQLite's WAL file to replace a polling interval with push semantics, enabling cross-process notifications with single-digit millisecond delivery.
 
-Its basic form is a plain SQLite loadable extension, so any language that can `SELECT load_extension('honker')` gets the same queue, streams, and notifications on the same file.
-
 > Experimental. API may change.
 
-SQLite is backing real work which inevitably requires pubsub and a queue. The usual answer is "add Redis + Celery." That works, but it introduces a second datastore with its own backup story, a dual-write problem between your business table and the queue, and the operational overhead of running a broker.
+SQLite is increasingly backing real projects. Those inevitably require pubsub and a task queue. The usual answer is "add Redis + Celery." That works, but it introduces a second datastore with its own backup story, a dual-write problem between your business table and the queue, and the operational overhead of running a broker.
 
 honker takes the approach that if SQLite is the primary datastore, the queue should live in the same file. That means `INSERT INTO orders` and `queue.enqueue(...)` commit in the same transaction. Rollback drops both. The queue is just rows in a table with a partial index.
 
@@ -60,13 +58,11 @@ Today:
 - SQLite loadable extension so any SQLite client can read the same tables
 - Bindings: Python, Node.js, Rust, Go, Ruby, Bun, Elixir
 
-Framework-specific helpers (FastAPI/Django/Flask/Express/Rails) are intentionally not shipped — honker's API is small enough that wiring it into a web framework is ~20 lines of glue. See `examples/` for patterns.
-
 Deliberately not built: task pipelines/chains/groups/chords, multi-writer replication, workflow orchestration with DAGs.
 
 ## Quick start 
 
-### Python — queue (durable at-least-once work)
+### Python: queue (durable at-least-once work)
 
 ```bash
 pip install honker
@@ -89,9 +85,32 @@ async for job in emails.claim("worker-1"):               # wakes on any WAL comm
         job.retry(delay_s=60, error=str(e))
 ```
 
-`claim()` is an async iterator. Each iteration is one `claim_batch(worker_id, 1)` — one row, one write transaction. Wakes on any WAL commit, falls back to a 5 s paranoia poll only if the WAL watcher can't fire. For batched work, call `claim_batch(worker_id, n)` explicitly and ack with `queue.ack_batch(ids, worker_id)`. Defaults: visibility 300 s.
+`claim()` is an async iterator. Each iteration is one `claim_batch(worker_id, 1)`. Wakes on any WAL commit, falls back to a 5 s paranoia poll only if the WAL watcher can't fire. For batched work, call `claim_batch(worker_id, n)` explicitly and ack with `queue.ack_batch(ids, worker_id)`. Defaults: visibility 300 s.
 
-### Python — stream (durable pub/sub)
+### Python: tasks (Huey-style decorators)
+
+If you want a function call to turn into an enqueued job without wrapping `queue.enqueue` by hand:
+
+```python
+@emails.task(retries=3, timeout_s=30)
+def send_email(to: str, subject: str) -> dict:
+    ...
+    return {"sent_at": time.time()}
+
+# Caller
+r = send_email("alice@example.com", "Hi")   # enqueues, returns a TaskResult
+print(r.get(timeout=10))                    # blocks until worker runs it
+```
+
+Worker side, either in-process or as its own process:
+
+```bash
+python -m honker worker myapp.tasks:db --queue=emails --concurrency=4
+```
+
+Auto-name is `{module}.{qualname}` (Huey/Celery convention). Explicit names with `@emails.task(name="...")` are recommended in prod so renames don't orphan pending jobs. Periodic tasks use `@emails.periodic_task(crontab("0 3 * * *"))`. Full details in [`packages/honker/examples/tasks.py`](packages/honker/examples/tasks.py).
+
+### Python: stream (durable pub/sub)
 
 ```python
 stream = db.stream("user-events")
@@ -104,9 +123,9 @@ async for event in stream.subscribe(consumer="dashboard"):
     await push_to_browser(event)
 ```
 
-Each named consumer tracks its own offset in the `_honker_stream_consumers` table. `subscribe` replays rows past the saved offset, then transitions to live delivery on WAL wake. The iterator auto-saves offset at most every 1000 events or every 1 second (whichever first) — one UPSERT per window, not per event — so a high-throughput stream doesn't hammer the single-writer slot. Override with `save_every_n=` / `save_every_s=`, or set both to 0 to disable auto-save and call `stream.save_offset(consumer, offset, tx=tx)` yourself (atomic with whatever you just did in that tx). At-least-once: a crash re-delivers in-flight events up to the last flushed offset.
+Each named consumer tracks its own offset in the `_honker_stream_consumers` table. `subscribe` replays rows past the saved offset, then transitions to live delivery on WAL wake. The iterator auto-saves offset at most every 1000 events or every 1 second (whichever first) so a high-throughput stream doesn't hammer the single-writer slot. Override with `save_every_n=` / `save_every_s=`, or set both to 0 to disable auto-save and call `stream.save_offset(consumer, offset, tx=tx)` yourself (atomic with whatever you just did in that tx). At-least-once: a crash re-delivers in-flight events up to the last flushed offset.
 
-### Python — notify (ephemeral pub/sub)
+### Python: notify (ephemeral pub/sub)
 
 ```python
 async for n in db.listen("orders"):
@@ -117,7 +136,7 @@ with db.transaction() as tx:
     tx.notify("orders", {"id": 42})
 ```
 
-Listeners attach at current `MAX(id)`; history is not replayed. Use `db.stream()` if you need durable replay. The notifications table is not auto-pruned - call `db.prune_notifications(older_than_s=…, max_keep=…)` from a scheduled task. Task payloads have to be valid JSON so a Python writer and Node reader can share a channel.
+Listeners attach at current `MAX(id)`; history is not replayed. Use `db.stream()` if you need durable replay. The notifications table is not auto-pruned. Call `db.prune_notifications(older_than_s=…, max_keep=…)` from a scheduled task. Task payloads have to be valid JSON so a Python writer and Node reader can share a channel.
 
 ### Node.js
 
@@ -174,33 +193,33 @@ The extension shares `_honker_live`, `_honker_dead`, and `_honker_notifications`
 
 This repo includes the `honker` SQLite loadable extension and bindings for Python, Node, Rust, Go, Ruby, Bun, and Elixir. 
 
-For most applications, [SQLite alone is sufficient](https://www.epicweb.dev/why-you-should-probably-be-using-sqlite). There are already great libraries that leverage SQLite for durable messaging — [Huey](https://github.com/coleifer/huey) is the one honker draws the most from. This project is inspired by it and seeks to do something similar across languages and frameworks by moving package logic into a SQLite extension.
+For most applications, [SQLite alone is sufficient](https://www.epicweb.dev/why-you-should-probably-be-using-sqlite). There are already great libraries that leverage SQLite for durable messaging. [Huey](https://github.com/coleifer/huey) is the one honker draws the most from. This project is inspired by it and seeks to do something similar across languages and frameworks by moving package logic into a SQLite extension.
 
 For Postgres-backed apps, [`pg_notify`](https://www.postgresql.org/docs/current/sql-notify.html) + [pg-boss](https://github.com/timgit/pg-boss) or [Oban](https://hexdocs.pm/oban/) is the equivalent. This library is for apps where SQLite is the primary datastore.
 
 The extension has three primitives that tie it together: ephemeral pub/sub (`notify()`), durable pub/sub with per-consumer offsets (`stream()`), at-least-once work queue (`queue()`). All three are INSERTs inside your transaction, which lets a task "send" be atomic with your business write, and rollback drops everything.
 
-The explicit goal is to do `NOTIFY`/`LISTEN` semantics without constant polling, to achieve single-digit ms reaction time. If you use your app's existing SQLite file containing business logic, it will notify workers on every WAL commit. This means that most triggers will not result in anything happening - workers just read the message/queue with no result. This "overtriggering" is on purpose and is the tradeoff for push semantics and fast reaction time.
+The explicit goal is to do `NOTIFY`/`LISTEN` semantics without constant polling, to achieve single-digit ms reaction time. If you use your app's existing SQLite file containing business logic, it will notify workers on every WAL commit. This means that most triggers will not result in anything happening: instead, workers just read the message/queue with no result. This "overtriggering" is on purpose and is the tradeoff for push semantics and fast reaction time.
 
 ### WAL-only by design
 
-honker requires `journal_mode = WAL` on every database it manages. `honker_bootstrap()` refuses to run on a file-backed DB that isn't in WAL mode, and the language bindings set `PRAGMA journal_mode = WAL` in their default open path. This is not a bug or an oversight — it's baked into the architecture:
+honker requires `journal_mode = WAL` on every database it manages. `honker_bootstrap()` refuses to run on a file-backed DB that isn't in WAL mode, and the language bindings set `PRAGMA journal_mode = WAL` in their default open path.
 
-- **Concurrent readers while a writer is active.** Workers hold open read views (WAL subscription channels, listener iterators) for their whole lifetime. In DELETE / TRUNCATE modes, writers take an EXCLUSIVE lock; every active reader blocks until release. A single worker actively claiming would serialize every `enqueue()` / `notify()` in the system behind it. WAL removes that serialization.
-- **Stable, observable file.** The `.db-wal` sidecar grows on every commit and only shrinks at checkpoint. Stat-polling it gives a monotonic, unambiguous change signal. The rollback-journal sidecar (`.db-journal`) in DELETE mode is transient — it appears mid-transaction and vanishes on commit, making it a poor stat-poll target.
-- **Checkpoint cost is amortized.** With `wal_autocheckpoint = 10000`, WAL performs one fsync per 10k pages instead of per-commit, which is where most of the throughput win comes from.
+- Workers hold open read views (WAL subscription channels, listener iterators) for their whole lifetime. In DELETE / TRUNCATE modes, writers take an EXCLUSIVE lock; every active reader blocks until release. A single worker actively claiming would serialize every `enqueue()` / `notify()` in the system behind it. WAL lets readers and writers coexist.
+- The `.db-wal` sidecar grows on every commit and only shrinks at checkpoint. Stat-polling it gives a monotonic, unambiguous change signal. The rollback-journal sidecar (`.db-journal`) in DELETE mode appears mid-transaction and vanishes on commit, making it a poor stat-poll target.
+- With `wal_autocheckpoint = 10000`, WAL performs one fsync per 10k pages instead of per-commit. Most of the throughput win comes from that.
 
-If you need a SQLite database that never enters WAL mode (e.g. for a backup target, or to avoid the `.db-wal` / `.db-shm` sidecars in a shared filesystem), honker is not the right tool — use plain SQLite and live without the NOTIFY/LISTEN semantics.
+If you need a SQLite database that never enters WAL mode (e.g. for a backup target, or to avoid the `.db-wal` / `.db-shm` sidecars in a shared filesystem), honker is not the right tool. Use plain SQLite and live without the NOTIFY/LISTEN semantics.
 
 The library/extension is a small coordination layer built on the properties of SQLite and single-server architecture.
 
-- **One `.db` + one `.db-wal`** is the entire system, with all the benefits of SQLite (embedded, local, durable, snapshot-able, etc.) that your app already usees
-- **WAL mode: one writer, concurrent readers.** Claim = `UPDATE … RETURNING` via a partial index. Ack = `DELETE`.
-- **WAL file grows on every commit.** `(size, mtime)` is the cross-process commit signal.
-- **SQLite has no wire protocol.** Consumers must initiate reads; server-push is impossible. Wake signal = file change → `SELECT`.
-- **Transactions are cheap.** Jobs, events, and notifications are rows in the caller's open `with db.transaction()` block in an "outbox"-type pattern.
-- **Cross-platform via `stat(2)`, not `FSEvents`/`inotify`/`kqueue`.** FSEvents drops same-process writes on macOS — a listener and enqueuer in the same Python process would never see each other. `stat(2)` works identically on Linux/macOS/Windows at ~1 ms granularity for negligible CPU. Cost: ~0.5 ms of latency vs kernel notifications.
-- **Single machine, single writer.** SQLite's locking is designed for a single host. Two servers writing one `.db` over NFS will corrupt it. Shard by file, or switch to Postgres.
+- One `.db` + one `.db-wal` is the entire system. You get every benefit of SQLite (embedded, local, durable, snapshot-able) that your app already uses.
+- WAL mode gives one writer and concurrent readers. Claim is one `UPDATE … RETURNING` via a partial index, ack is one `DELETE`.
+- The WAL file grows on every commit, so `(size, mtime)` is the cross-process commit signal.
+- SQLite has no wire protocol. Consumers must initiate reads; server-push is impossible. Wake signal = file change → `SELECT`.
+- Transactions are cheap, so jobs, events, and notifications are rows in the caller's open `with db.transaction()` block in an "outbox"-type pattern.
+- We use `stat(2)` cross-platform instead of the technically better `FSEvents`/`inotify`/`kqueue`. FSEvents drops same-process writes on macOS, meaning a listener and enqueuer in the same Python process would never see each other. `stat(2)` works identically on Linux/macOS/Windows at ~1 ms granularity for negligible CPU. Cost: ~0.5 ms of latency vs kernel notifications.
+- Single machine, single writer. SQLite's locking is designed for a single host. Two servers writing one `.db` over NFS will corrupt it. Shard by file, or switch to Postgres.
 
 ## Architecture
 
@@ -209,10 +228,10 @@ The library/extension is a small coordination layer built on the properties of S
 - One `stat(2)` thread per `Database`, polls `.db-wal` every 1 ms
 - `(size, mtime)` change → fan out a tick to each subscriber's bounded channel
 - Each subscriber runs `SELECT … WHERE id > last_seen` against a partial index, yields rows, returns to wait
-- 100 subscribers = 1 stat thread (not 100)
+- 100 subscribers = 1 stat thread
 - Idle listeners run zero SQL queries
 
-Idle cost is a single `stat(2)` per millisecond per database — no SQL, no page-cache pressure, no writer-lock contention. Listener count scales for free because the wake signal is a file stat, not a query.
+Idle cost is a single `stat(2)` per millisecond per database. Listener count scales for free because the wake signal is a file stat instead of a polling query.
 
 `SharedWalWatcher` (in `honker-core`) owns the poll thread and fans out to N subscribers via bounded `SyncSender<()>` channels keyed by subscriber id. Each `db.wal_events()` call registers a subscriber and returns a handle whose `Drop` auto-unsubscribes, so a dropped listener causes the bridge thread's `rx.recv() -> Err` and exits cleanly.
 
@@ -224,15 +243,15 @@ Idle cost is a single `stat(2)` per millisecond per database — no SQL, no page
 - Ack = one `DELETE`
 - Retry-exhausted → `_honker_dead` (never scanned by claim path)
 
-Partial-index on state means the claim hot path is bounded by the *working-set* size, not the *history* size. A queue with 100k dead rows claims as fast as a queue with zero.
+Partial-index on state means the claim hot path is bounded by the *working-set* size rather than the *history* size. A queue with 100k dead rows claims as fast as a queue with zero.
 
 ### Claim iterator
 
-- `async for job in q.claim(id)` yields one job at a time via `claim_batch(id, 1)` — one write transaction per job.
+- `async for job in q.claim(id)` yields one job at a time via `claim_batch(id, 1)`
 - `Job.ack()` is one `DELETE` in its own transaction. Return is an honest bool: `True` iff the claim was still valid, `False` if the visibility window elapsed and another worker reclaimed.
 - Wakes on WAL commit from any process; a 5 s paranoia poll is the only fallback.
 
-For batched work, call `claim_batch(worker_id, n)` directly and ack with `queue.ack_batch(ids, worker_id)`. The library doesn't hide batching behind the iterator — the per-tx cost and the at-most-once visibility semantics are easier to reason about when the API doesn't try to be clever.
+For batched work, call `claim_batch(worker_id, n)` directly and ack with `queue.ack_batch(ids, worker_id)`. The library doesn't hide batching behind the iterator. The per-tx cost and the at-most-once visibility semantics are easier to reason about when the API doesn't try to be clever.
 
 ### Transactional coupling
 
@@ -241,15 +260,15 @@ For batched work, call `claim_batch(worker_id, n)` directly and ack with `queue.
 - `queue.enqueue(…, tx=tx)` and `stream.publish(…, tx=tx)` do the same
 - Rollback drops the job/event/notification with the rest of the tx
 
-This is the transactional outbox pattern, by default, without a library to install. Business write and side-effect enqueue commit or roll back together. There is no separate dispatch table and no separate dispatcher process — the side-effect row *is* the committed row, and any process watching the WAL picks it up within ~1 ms.
+This is the transactional outbox pattern, by default, without a library to install. Business write and side-effect enqueue commit or roll back together. There is no separate dispatch table and no separate dispatcher process: the side-effect row *is* the committed row, and any process watching the WAL picks it up within ~1 ms.
 
-### Over-trigger, don't under-trigger
+### Over-triggering quickly is better than over-triggering from polling
 
 - A WAL change wakes *every* subscriber on that `Database`, not just the ones whose channel committed
 - Each wasted wake = one indexed SELECT (microseconds)
 - A missed wake = a silent correctness bug
 
-The library prefers waking ten listeners that don't care over missing one that does. Channel filtering happens in the SELECT, not in the wake path.
+The library prefers waking ten listeners that don't care over missing one that does. Channel filtering happens in the `SELECT` path instead of the trigger notification. [Many small queries are efficient in SQLite](https://www.sqlite.org/np1queryprob.html).
 
 ### Retention
 
@@ -257,14 +276,14 @@ The library prefers waking ten listeners that don't care over missing one that d
 - Stream events persist; each named consumer tracks its own offset
 - Notify is fire-and-forget and not auto-pruned
 
-The caller chooses retention per primitive. `db.prune_notifications(older_than_s=…, max_keep=…)` is a tool you invoke, not a background timer inside the library. This keeps retention policy visible in the caller's code instead of inherited from a library default.
+The caller chooses retention per primitive. `db.prune_notifications(older_than_s=…, max_keep=…)` is a tool you invoke. This keeps retention policy visible in the caller's code instead of inherited from a library default.
 
 ## Crash recovery
 
-- **Rollback** drops jobs/events/notifications with your business write (SQLite ACID).
-- **SIGKILL mid-tx**: safe. WAL rollback on next open leaves no stale state. Verified in `tests/test_crash_recovery.py` (subprocess killed pre-COMMIT, `PRAGMA integrity_check == 'ok'`, fresh notifies still flow).
-- **Worker crash mid-job**: the claim expires after `visibility_timeout_s` (default 300 s). Another worker reclaims; `attempts` increments. After `max_attempts` (default 3), the row moves to `_honker_dead`.
-- **Listener offline during prune**: pruned events are lost. For durable replay, use `db.stream()`, which tracks per-consumer offsets.
+- Rollback drops jobs/events/notifications with your business write (SQLite ACID).
+- SIGKILL mid-tx is safe. WAL rollback on next open leaves no stale state. Verified in `tests/test_crash_recovery.py` (subprocess killed pre-COMMIT, `PRAGMA integrity_check == 'ok'`, fresh notifies still flow).
+- If a worker crashes mid-job, the claim expires after `visibility_timeout_s` (default 300 s) and another worker reclaims. `attempts` increments. After `max_attempts` (default 3), the row moves to `_honker_dead`.
+- Listeners offline during a prune miss the pruned events. For durable replay, use `db.stream()`, which tracks per-consumer offsets.
 
 ## Wiring into your web framework
 
@@ -339,7 +358,7 @@ make coverage-python        # honker python paths
 make coverage-rust          # honker-core Rust unit tests
 ```
 
-Python coverage reflects the full honker test suite (~92% of `packages/honker/`). Rust coverage reflects only `cargo test` — many `honker_ops.rs` paths (`honker_enqueue`, `honker_claim_batch`, etc.) are only exercised via the Python test suite and won't show up in the Rust report. Combined cross-language coverage is non-trivial (LLVM profile-data merging across PyO3 boundaries) and is deferred.
+Python coverage reflects the full honker test suite (~92% of `packages/honker/`). Rust coverage reflects only `cargo test`. Many `honker_ops.rs` paths (`honker_enqueue`, `honker_claim_batch`, etc.) are only exercised via the Python test suite and won't show up in the Rust report. Combined cross-language coverage is non-trivial (LLVM profile-data merging across PyO3 boundaries) and is deferred.
 
 ## License
 
