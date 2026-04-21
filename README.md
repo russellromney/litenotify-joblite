@@ -141,20 +141,18 @@ Listeners attach at current `MAX(id)`; history is not replayed. Use `db.stream()
 ### Node.js
 
 ```js
-const lit = require('@russellthehippo/honker-node');
-const db = lit.open('app.db');
+const { open } = require('@russellthehippo/honker-node');
+const db = open('app.db');
+
+// Atomic: business write + notify commit together
 const tx = db.transaction();
 tx.execute('INSERT INTO orders (id) VALUES (?)', [42]);
 tx.notify('orders', { id: 42 });
 tx.commit();
 
-const ev = db.walEvents();
-let last = 0;
-while (running) {
-  await ev.next();
-  const rows = db.query(
-    'SELECT id, payload FROM _honker_notifications WHERE id > ? ORDER BY id', [last]);
-  for (const r of rows) { handle(JSON.parse(r.payload)); last = r.id; }
+// Listen wakes on WAL commits, filters by channel
+for await (const n of db.listen('orders')) {
+  handle(n.payload);
 }
 ```
 
