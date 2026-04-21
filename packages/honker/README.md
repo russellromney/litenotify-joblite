@@ -4,7 +4,7 @@
 
 `honker` is a SQLite extension + language bindings that add Postgres-style `NOTIFY`/`LISTEN` semantics to SQLite, with built-in durable pub/sub, task queue, and event streams, without client polling or a daemon/broker. Any language that can `SELECT load_extension('honker')` gets the same features.
 
-honker ships as a [Rust crate](https://crates.io/crates/honker) (`honker`, plus `honker-core`/`honker-extension`), a [SQLite loadable extension](#sqlite-extension-any-sqlite-39-client), and language packages: Python (`honker`), Node (`@russellthehippo/honker-node`), Bun (`@russellthehippo/honker-bun`), Ruby (`honker`), Go, Elixir. The on-disk layout is defined once in Rust; every binding is a thin wrapper around the loadable extension.
+honker ships as a [Rust crate](https://crates.io/crates/honker) (`honker`, plus `honker-core`/`honker-extension`), a [SQLite loadable extension](#sqlite-extension-any-sqlite-39-client), and language packages: Python (`honker`), Node (`@honker/node`), Ruby (`honker`), Go, Bun, Elixir. The on-disk layout is defined once in Rust; every binding is a thin wrapper around the loadable extension.
 
 `honker` works by replacing a polling interval with event notifications on SQLite's WAL file, achieving push semantics and enabling cross-process notifications with single-digit millisecond delivery.
 
@@ -141,7 +141,7 @@ Listeners attach at current `MAX(id)`; history is not replayed. Use `db.stream()
 ### Node.js
 
 ```js
-const lit = require('@russellthehippo/honker-node');
+const lit = require('@honker/node');
 const db = lit.open('app.db');
 const tx = db.transaction();
 tx.execute('INSERT INTO orders (id) VALUES (?)', [42]);

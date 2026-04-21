@@ -8,7 +8,7 @@ from typing import Any, AsyncIterator, Callable, Optional
 
 
 def _core_open(path, max_readers):
-    from _honker_native import open as _open
+    from honker._honker_native import open as _open
     return _open(path, max_readers=max_readers)
 
 

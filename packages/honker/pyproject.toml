@@ -1,11 +1,12 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
 
 [project]
 name = "honker"
 version = "0.1.0"
-description = "Durable queue, stream, and cross-process pub/sub for SQLite. Built on honker."
+description = "Durable queues, streams, pub/sub, and cron scheduler on SQLite. One file, zero servers."
+readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Russell Romney" }]
@@ -16,18 +17,19 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Rust",
   "Topic :: Database",
   "Topic :: System :: Distributed Computing",
 ]
-dependencies = [
-  # honker-core is loaded as a dynamic library; no pip dep needed.
-  # The Rust cdylib (built via maturin) IS the honker package.
-]
+dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/russellromney/honker"
+Homepage = "https://honker.dev"
 Repository = "https://github.com/russellromney/honker"
+Documentation = "https://honker.dev/docs/"
 
-[tool.setuptools]
-packages = ["honker"]
-package-dir = { "honker" = "." }
+[tool.maturin]
+python-source = "python"
+module-name = "honker._honker_native"
+features = ["pyo3/extension-module"]
