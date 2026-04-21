@@ -1,14 +1,23 @@
 [package]
-name = "honker"
+name = "honker-py"
 version = "0.1.0"
 edition = "2024"
+description = "PyO3 bindings for honker — the Rust cdylib behind the `honker` PyPI package. Not published to crates.io; built by maturin."
+license = "Apache-2.0"
+publish = false
+
+# Opt out of the root workspace so this crate can live in its own
+# submodule repo without dragging workspace members along. `path`
+# resolves when this repo is submoduled inside the main honker repo;
+# `version` is the crates.io fallback for standalone builds.
+[workspace]
 
 [lib]
 name = "_honker_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-honker-core = { path = "../../honker-core" }
+honker-core = { path = "../../honker-core", version = "0.1" }
 parking_lot = "0.12.5"
 pyo3 = { version = "0.28.3", features = ["extension-module"] }
 rusqlite = { version = "0.39.0", features = ["functions", "hooks"] }

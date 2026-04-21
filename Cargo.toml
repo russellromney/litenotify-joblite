@@ -2,12 +2,15 @@
 members = [
     "honker-core",
     "honker-extension",
-    "packages/honker",
 ]
-# packages/honker-node and packages/honker-rs live in their own
-# submodule repos; they opt out of this workspace via their own
-# `[workspace]` tables and pull `honker-core` via a relative path.
+# Every language binding lives in its own submodule repo and opts
+# out of this workspace via its own `[workspace]` table. Each pulls
+# `honker-core` via `path = "../../honker-core", version = "0.1"` so
+# the path resolves when submoduled and the version falls back when
+# the binding is consumed standalone from its registry (PyPI, npm,
+# crates.io, etc.).
 exclude = [
+    "packages/honker",
     "packages/honker-node",
     "packages/honker-rs",
 ]
