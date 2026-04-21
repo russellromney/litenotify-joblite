@@ -478,6 +478,66 @@ class Queue:
             )
         return bool(rows[0]["r"])
 
+    # --- Huey-style task decorators ----------------------------------
+    #
+    # `@queue.task()` wraps a function so calling it enqueues a job
+    # under an auto-derived name (module.qualname, overridable via
+    # name=). The worker loop (see `Database.run_workers`) resolves
+    # that name back to the original function via a process-wide
+    # registry (`honker._tasks._GLOBAL_REGISTRY`).
+    #
+    # See `honker._tasks` module docstring for the full design.
+
+    def task(
+        self,
+        name=None,
+        *,
+        retries=None,
+        retry_delay_s=60,
+        timeout_s=None,
+        priority=0,
+        expires_s=None,
+        store_result=True,
+        result_ttl_s=3600,
+    ):
+        """Decorator. Register a function as a task on this queue."""
+        from ._tasks import task_decorator
+        return task_decorator(
+            self,
+            name=name,
+            retries=retries,
+            retry_delay_s=retry_delay_s,
+            timeout_s=timeout_s,
+            priority=priority,
+            expires_s=expires_s,
+            store_result=store_result,
+            result_ttl_s=result_ttl_s,
+        )
+
+    def periodic_task(
+        self,
+        schedule,
+        *,
+        name=None,
+        scheduler_name=None,
+        expires_s=None,
+        priority=0,
+        store_result=False,
+        result_ttl_s=3600,
+    ):
+        """Decorator. Register a function as a periodic (cron) task."""
+        from ._tasks import periodic_task_decorator
+        return periodic_task_decorator(
+            self,
+            schedule,
+            name=name,
+            scheduler_name=scheduler_name,
+            expires_s=expires_s,
+            priority=priority,
+            store_result=store_result,
+            result_ttl_s=result_ttl_s,
+        )
+
 
 class Retryable(Exception):
     """Raise from a task handler to request a scheduled retry with a specific
@@ -1044,6 +1104,47 @@ class Database:
         )
         self._outboxes[name] = o
         return o
+
+    # --- Task decorator shortcuts ------------------------------------
+    #
+    # `@db.task(queue="emails")` is equivalent to
+    # `@db.queue("emails").task()` — convenience for the common case
+    # where users have a single Database and want a single import for
+    # their task definitions.
+
+    def task(self, queue: str = "default", **kwargs):
+        """Shortcut: `@db.task(queue="emails")` → `@db.queue("emails").task(...)`."""
+        return self.queue(queue).task(**kwargs)
+
+    def periodic_task(self, schedule, queue: str = "default", **kwargs):
+        """Shortcut: `@db.periodic_task(crontab, queue="emails")`."""
+        return self.queue(queue).periodic_task(schedule, **kwargs)
+
+    async def run_workers(
+        self,
+        queue: Optional[str] = None,
+        concurrency: Optional[int] = None,
+        stop_event=None,
+    ):
+        """Run async workers for every queue with registered tasks
+        (or just one queue if specified). Blocks until `stop_event`
+        is set or the task is cancelled.
+
+        Typical shape in a long-lived process:
+
+            db = honker.open("app.db")
+            # ... decorated tasks import-registered here ...
+            asyncio.run(db.run_workers(concurrency=4))
+
+        CLI equivalent: `python -m honker worker app.tasks:db`.
+        """
+        from ._tasks import run_workers
+        await run_workers(
+            self,
+            queue=queue,
+            concurrency=concurrency,
+            stop_event=stop_event,
+        )
 
 
 def open(path: str, max_readers: int = 8) -> Database:
