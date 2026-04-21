@@ -292,14 +292,11 @@ def periodic_task_decorator(
         _GLOBAL_REGISTRY.register(spec)
         wrapper = _TaskWrapper(spec, queue)
 
-        # Register the scheduler side with a fixed payload that the
-        # worker dispatcher will recognize as this task with no args.
+        # Register the scheduler side. `Scheduler.add()` is a thin
+        # wrapper over `honker_scheduler_register`, which UPSERTs,
+        # so creating a fresh Scheduler each time is harmless.
         from ._scheduler import Scheduler  # lazy to avoid cycle
-        scheduler = getattr(queue.db, "_auto_scheduler", None)
-        if scheduler is None:
-            scheduler = Scheduler(queue.db)
-            queue.db._auto_scheduler = scheduler
-        scheduler.add(
+        Scheduler(queue.db).add(
             name=scheduler_name or resolved_name,
             queue=queue.name,
             schedule=schedule,
@@ -327,6 +324,12 @@ async def _run_one(job: "Job", spec: TaskSpec) -> None:
     """Core worker-side dispatch: extract args, call the function,
     save the result (if configured), ack on success. On failure,
     bump retry with the task's configured delay.
+
+    Sync tasks are dispatched onto a background thread via
+    `asyncio.to_thread` so a blocking def doesn't freeze the event
+    loop (and every other worker sharing it). Async tasks run on
+    the event loop directly. Timeouts wrap either uniformly via
+    `asyncio.wait_for`.
     """
     from ._honker import Retryable  # lazy cycle break
 
@@ -343,11 +346,19 @@ async def _run_one(job: "Job", spec: TaskSpec) -> None:
     kwargs = envelope.get("kwargs", {})
 
     try:
+        if inspect.iscoroutinefunction(spec.fn):
+            coro = spec.fn(*args, **kwargs)
+        else:
+            # Push the sync call off the event loop onto a thread so
+            # it doesn't block peer workers. asyncio can't interrupt
+            # the thread on timeout — the task is marked timed-out
+            # but the thread runs to completion — accept that tradeoff.
+            coro = asyncio.to_thread(spec.fn, *args, **kwargs)
+
         if spec.timeout_s is not None:
-            coro = _maybe_coroutine(spec.fn(*args, **kwargs))
             result = await asyncio.wait_for(coro, timeout=spec.timeout_s)
         else:
-            result = await _maybe_coroutine(spec.fn(*args, **kwargs))
+            result = await coro
     except Retryable as e:
         job.retry(delay_s=e.delay_s, error=str(e))
         return
@@ -372,14 +383,6 @@ async def _run_one(job: "Job", spec: TaskSpec) -> None:
             # Result save failure shouldn't retry the task; log.
             traceback.print_exc()
     job.ack()
-
-
-async def _maybe_coroutine(value: Any) -> Any:
-    """If `value` is a coroutine (from an async def task), await it.
-    Otherwise return it as-is."""
-    if inspect.iscoroutine(value):
-        return await value
-    return value
 
 
 async def run_workers(

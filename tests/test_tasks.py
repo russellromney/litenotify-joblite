@@ -280,3 +280,164 @@ def test_db_task_shortcut(db_path):
     spec = honker.registry().get(send.name)
     assert spec is not None
     assert spec.queue_name == "emails"
+
+
+# ---------- timeout semantics ----------
+
+
+async def test_async_timeout_message_is_specific(db_path):
+    """Timed-out async tasks retry with a 'timeout after Xs' error
+    string — distinguishable from generic exceptions in the
+    dead-letter table."""
+    db = honker.open(db_path)
+    q = db.queue("default", max_attempts=1)
+
+    @q.task(timeout_s=0.05, retries=1, retry_delay_s=0)
+    async def slow():
+        await asyncio.sleep(5.0)
+        return "unreached"
+
+    r = slow()
+
+    stop = asyncio.Event()
+    run = asyncio.create_task(
+        db.run_workers(queue="default", concurrency=1, stop_event=stop),
+    )
+
+    deadline = asyncio.get_event_loop().time() + 3.0
+    while asyncio.get_event_loop().time() < deadline:
+        rows = db.query(
+            "SELECT last_error FROM _honker_dead WHERE id=?", [r.id]
+        )
+        if rows:
+            break
+        await asyncio.sleep(0.05)
+
+    stop.set()
+    await asyncio.wait_for(run, timeout=3.0)
+
+    rows = db.query("SELECT last_error FROM _honker_dead WHERE id=?", [r.id])
+    assert len(rows) == 1
+    assert "timeout after 0.05s" in rows[0]["last_error"]
+
+
+async def test_sync_task_does_not_block_peer_workers(db_path):
+    """Regression guard: a sync task that calls time.sleep(1) must
+    not prevent a peer worker on the same event loop from handling
+    another job concurrently. Before the asyncio.to_thread fix, a
+    single sync task pinned the whole worker pool."""
+    import time as _time
+    db = honker.open(db_path)
+    q = db.queue("default")
+
+    @q.task()
+    def slow_sync():
+        _time.sleep(0.5)
+        return "done-slow"
+
+    @q.task()
+    def fast_sync():
+        return "done-fast"
+
+    r_slow = slow_sync()
+    r_fast = fast_sync()
+
+    stop = asyncio.Event()
+    start = asyncio.get_event_loop().time()
+    run = asyncio.create_task(
+        db.run_workers(queue="default", concurrency=2, stop_event=stop),
+    )
+
+    fast_value = await asyncio.wait_for(r_fast.aget(timeout=5.0), timeout=5.0)
+    fast_elapsed = asyncio.get_event_loop().time() - start
+    assert fast_value == "done-fast"
+    # If the sync task were blocking the event loop, fast would wait
+    # for slow to finish (~0.5s). With to_thread it should complete
+    # in well under 0.4s.
+    assert fast_elapsed < 0.4, (
+        f"fast_sync took {fast_elapsed:.2f}s — slow_sync blocked the "
+        f"event loop. asyncio.to_thread dispatch likely regressed."
+    )
+
+    # Still wait for slow to finish so teardown is clean.
+    await asyncio.wait_for(r_slow.aget(timeout=5.0), timeout=5.0)
+    stop.set()
+    await asyncio.wait_for(run, timeout=3.0)
+
+
+# ---------- argument serialization ----------
+
+
+def test_unserializable_args_raise_at_enqueue_time(db_path):
+    """datetime (and other non-JSON-native types) aren't serializable
+    by default. Raise at enqueue time rather than silently storing
+    garbage the worker can't decode."""
+    import datetime
+    db = honker.open(db_path)
+    q = db.queue("default")
+
+    @q.task()
+    def needs_json(x):
+        return x
+
+    with pytest.raises((TypeError, ValueError)):
+        needs_json(datetime.datetime.now())
+
+
+# ---------- periodic tasks ----------
+
+
+def test_periodic_task_registers_in_registry_and_scheduler(db_path):
+    """@periodic_task does two things: register the function in the
+    task registry (so workers can dispatch when it fires) AND
+    register a scheduler task (so the cron boundary fires it)."""
+    from honker import crontab
+    db = honker.open(db_path)
+    q = db.queue("default")
+
+    @q.periodic_task(crontab("0 3 * * *"), name="nightly.backup")
+    def nightly():
+        return "did backup"
+
+    # Registry.
+    spec = honker.registry().get("nightly.backup")
+    assert spec is not None
+    assert spec.fn is nightly.fn
+
+    # Scheduler side — row landed.
+    rows = db.query(
+        "SELECT name, queue, cron_expr, payload FROM "
+        "_honker_scheduler_tasks WHERE name='nightly.backup'"
+    )
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["queue"] == "default"
+    assert row["cron_expr"] == "0 3 * * *"
+    # Payload has the envelope with empty args/kwargs.
+    import json
+    payload = json.loads(row["payload"])
+    assert "__honker_task__" in payload
+    assert payload["__honker_task__"]["task"] == "nightly.backup"
+    assert payload["__honker_task__"]["args"] == []
+
+
+# ---------- registration edge cases ----------
+
+
+def test_re_register_same_function_is_idempotent(db_path):
+    """Re-importing the same module (hot reload) should re-register
+    the same function without raising — the function object is the
+    same, so it's a no-op overwrite."""
+    db = honker.open(db_path)
+    q = db.queue("default")
+
+    def handler():
+        return 1
+
+    deco = q.task(name="idem")
+    deco(handler)
+    # Same fn object, same name: must not raise.
+    deco(handler)
+
+    spec = honker.registry().get("idem")
+    assert spec.fn is handler
