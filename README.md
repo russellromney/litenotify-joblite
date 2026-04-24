@@ -6,7 +6,7 @@
 
 honker ships as a [Rust crate](https://crates.io/crates/honker) (`honker`, plus `honker-core`/`honker-extension`), a [SQLite loadable extension](#sqlite-extension-any-sqlite-39-client), and language packages: Python (`honker`), Node (`@russellthehippo/honker-node`), Bun (`@russellthehippo/honker-bun`), Ruby (`honker`), Go, Elixir, C++. The on-disk layout is defined once in Rust; every binding is a thin wrapper around the loadable extension.
 
-`honker` works by replacing a polling interval with event notifications on SQLite's WAL file, achieving push semantics and enabling cross-process notifications with single-digit millisecond delivery.
+`honker` works by replacing application-level polling with a shared 1 ms `PRAGMA data_version` read on the database, achieving push-like semantics and cross-process notifications with single-digit millisecond delivery — in any journal mode.
 
 > Experimental. API may change.
 
@@ -79,14 +79,14 @@ with db.transaction() as tx:
     emails.enqueue({"to": "alice@example.com"}, tx=tx)   # atomic with order
 
 # Then in a worker, do: 
-async for job in emails.claim("worker-1"):               # wakes on any WAL commit
+async for job in emails.claim("worker-1"):               # wakes on any commit to the db
     try:
         send(job.payload); job.ack()
     except Exception as e:
         job.retry(delay_s=60, error=str(e))
 ```
 
-`claim()` is an async iterator. Each iteration is one `claim_batch(worker_id, 1)`. Wakes on any WAL commit, falls back to a 5 s paranoia poll only if the WAL watcher can't fire. For batched work, call `claim_batch(worker_id, n)` explicitly and ack with `queue.ack_batch(ids, worker_id)`. Defaults: visibility 300 s.
+`claim()` is an async iterator. Each iteration is one `claim_batch(worker_id, 1)`. Wakes on any commit to the db, falls back to a 5 s paranoia poll only if the commit watcher can't fire. For batched work, call `claim_batch(worker_id, n)` explicitly and ack with `queue.ack_batch(ids, worker_id)`. Defaults: visibility 300 s.
 
 ### Python: tasks (Huey-style decorators)
 
@@ -124,7 +124,7 @@ async for event in stream.subscribe(consumer="dashboard"):
     await push_to_browser(event)
 ```
 
-Each named consumer tracks its own offset in the `_honker_stream_consumers` table. `subscribe` replays rows past the saved offset, then transitions to live delivery on WAL wake. The iterator auto-saves offset at most every 1000 events or every 1 second (whichever first) so a high-throughput stream doesn't hammer the single-writer slot. Override with `save_every_n=` / `save_every_s=`, or set both to 0 to disable auto-save and call `stream.save_offset(consumer, offset, tx=tx)` yourself (atomic with whatever you just did in that tx). At-least-once: a crash re-delivers in-flight events up to the last flushed offset.
+Each named consumer tracks its own offset in the `_honker_stream_consumers` table. `subscribe` replays rows past the saved offset, then transitions to live delivery on commit wake. The iterator auto-saves offset at most every 1000 events or every 1 second (whichever first) so a high-throughput stream doesn't hammer the single-writer slot. Override with `save_every_n=` / `save_every_s=`, or set both to 0 to disable auto-save and call `stream.save_offset(consumer, offset, tx=tx)` yourself (atomic with whatever you just did in that tx). At-least-once: a crash re-delivers in-flight events up to the last flushed offset.
 
 ### Python: notify (ephemeral pub/sub)
 
@@ -151,7 +151,7 @@ tx.execute('INSERT INTO orders (id) VALUES (?)', [42]);
 tx.notify('orders', { id: 42 });
 tx.commit();
 
-// Listen wakes on WAL commits, filters by channel
+// Listen wakes on any commit to the db, filters by channel
 for await (const n of db.listen('orders')) {
   handle(n.payload);
 }
@@ -198,16 +198,16 @@ For Postgres-backed apps, [`pg_notify`](https://www.postgresql.org/docs/current/
 
 The extension has three primitives that tie it together: ephemeral pub/sub (`notify()`), durable pub/sub with per-consumer offsets (`stream()`), at-least-once work queue (`queue()`). All three are INSERTs inside your transaction, which lets a task "send" be atomic with your business write, and rollback drops everything.
 
-The explicit goal is to do `NOTIFY`/`LISTEN` semantics without constant polling, to achieve single-digit ms reaction time. If you use your app's existing SQLite file containing business logic, it will notify workers on every WAL commit. This means that most triggers will not result in anything happening: instead, workers just read the message/queue with no result. This "overtriggering" is on purpose and is the tradeoff for push semantics and fast reaction time.
+The explicit goal is to do `NOTIFY`/`LISTEN` semantics without application-level polling, to achieve single-digit ms reaction time. If you use your app's existing SQLite file containing business logic, it will notify workers on every commit to the database. This means that most triggers will not result in anything happening: instead, workers just read the message/queue with no result. This "overtriggering" is on purpose and is the tradeoff for push-like semantics and fast reaction time.
 
 ### WAL is the recommended default
 
 The language bindings default to `journal_mode = WAL` because it gives concurrent readers with one writer, efficient fsync batching (`wal_autocheckpoint = 10000`), and a natural commit signal via `PRAGMA data_version`. If you prefer DELETE, TRUNCATE, or MEMORY mode, honker tables still work — you just lose cross-process wake (workers would need their own polling strategy).
 
-- One `.db` + one `.db-wal` is the entire system. You get every benefit of SQLite (embedded, local, durable, snapshot-able) that your app already uses.
-- WAL mode gives one writer and concurrent readers. Claim is one `UPDATE … RETURNING` via a partial index, ack is one `DELETE`.
-- We poll `PRAGMA data_version` every 1 ms to detect commits from any connection. The counter increments on every commit and on checkpoint, so WAL truncation and exact-size collisions are handled correctly.
-- SQLite has no wire protocol. Consumers must initiate reads; server-push is impossible. Wake signal = file change → `SELECT`.
+- One `.db` is the entire system (plus `.db-wal` / `.db-shm` sidecars if you've opted into WAL). You get every benefit of SQLite (embedded, local, durable, snapshot-able) that your app already uses.
+- Claim is one `UPDATE … RETURNING` via a partial index; ack is one `DELETE`. One writer at a time no matter the journal mode; concurrent readers come with WAL.
+- We poll `PRAGMA data_version` every 1 ms to detect commits from any connection in any journal mode. The counter increments on every commit and on checkpoint, so WAL truncation, journal-file comings-and-goings, and exact-size collisions are all handled correctly.
+- SQLite has no wire protocol. Consumers must initiate reads; server-push is impossible. Wake signal = counter increment → `SELECT`.
 - Transactions are cheap, so jobs, events, and notifications are rows in the caller's open `with db.transaction()` block in an "outbox"-type pattern.
 - We use `PRAGMA data_version` instead of `stat(2)` on the WAL file or kernel watchers (`FSEvents`/`inotify`/`kqueue`). `data_version` is a monotonic counter incremented by SQLite on every commit by any connection — it handles WAL truncation, clock skew, and rolled-back transactions correctly. Kernel watchers drop same-process writes on macOS, and `stat(2)` on `(size, mtime)` misses commits when the WAL is truncated then grows back to the same size. `PRAGMA data_version` works identically on Linux/macOS/Windows at ~1 ms granularity for negligible CPU. Cost: ~3.5 µs per query, ~3.5 ms/sec total at 1 kHz.
 - Single machine, single writer. SQLite's locking is designed for a single host. Two servers writing one `.db` over NFS will corrupt it. Shard by file, or switch to Postgres.
@@ -240,7 +240,7 @@ Partial-index on state means the claim hot path is bounded by the *working-set* 
 
 - `async for job in q.claim(id)` yields one job at a time via `claim_batch(id, 1)`
 - `Job.ack()` is one `DELETE` in its own transaction. Return is an honest bool: `True` iff the claim was still valid, `False` if the visibility window elapsed and another worker reclaimed.
-- Wakes on WAL commit from any process; a 5 s paranoia poll is the only fallback.
+- Wakes on any commit to the db from any process; a 5 s paranoia poll is the only fallback.
 
 For batched work, call `claim_batch(worker_id, n)` directly and ack with `queue.ack_batch(ids, worker_id)`. The library doesn't hide batching behind the iterator. The per-tx cost and the at-most-once visibility semantics are easier to reason about when the API doesn't try to be clever.
 
@@ -251,11 +251,11 @@ For batched work, call `claim_batch(worker_id, n)` directly and ack with `queue.
 - `queue.enqueue(…, tx=tx)` and `stream.publish(…, tx=tx)` do the same
 - Rollback drops the job/event/notification with the rest of the tx
 
-This is the transactional outbox pattern, by default, without a library to install. Business write and side-effect enqueue commit or roll back together. There is no separate dispatch table and no separate dispatcher process: the side-effect row *is* the committed row, and any process watching the WAL picks it up within ~1 ms.
+This is the transactional outbox pattern, by default, without a library to install. Business write and side-effect enqueue commit or roll back together. There is no separate dispatch table and no separate dispatcher process: the side-effect row *is* the committed row, and any process watching the db picks it up within ~1 ms.
 
 ### Over-triggering quickly is better than over-triggering from polling
 
-- A WAL change wakes *every* subscriber on that `Database`, not just the ones whose channel committed
+- A `data_version` change wakes *every* subscriber on that `Database`, not just the ones whose channel committed
 - Each wasted wake = one indexed SELECT (microseconds)
 - A missed wake = a silent correctness bug
 
@@ -272,7 +272,7 @@ The caller chooses retention per primitive. `db.prune_notifications(older_than_s
 ## Crash recovery
 
 - Rollback drops jobs/events/notifications with your business write (SQLite ACID).
-- SIGKILL mid-tx is safe. WAL rollback on next open leaves no stale state. Verified in `tests/test_crash_recovery.py` (subprocess killed pre-COMMIT, `PRAGMA integrity_check == 'ok'`, fresh notifies still flow).
+- SIGKILL mid-tx is safe. SQLite's atomic-commit rollback on next open leaves no stale state (WAL or rollback journal, depending on mode). Verified in `tests/test_crash_recovery.py` (subprocess killed pre-COMMIT, `PRAGMA integrity_check == 'ok'`, fresh notifies still flow).
 - If a worker crashes mid-job, the claim expires after `visibility_timeout_s` (default 300 s) and another worker reclaims. `attempts` increments. After `max_attempts` (default 3), the row moves to `_honker_dead`.
 - Listeners offline during a prune miss the pruned events. For durable replay, use `db.stream()`, which tracks per-consumer offsets.
 
