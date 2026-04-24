@@ -21,7 +21,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Using both `path` and `version` lets Cargo publish this crate to
-# crates.io referencing the real honker-core = "0.1" while still
+# crates.io referencing the real honker-core = "0.2" while still
 # using the in-tree source for local builds.
 honker-core = { path = "../honker-core", version = "0.2" }
 # "loadable_extension" feature makes rusqlite usable from inside a

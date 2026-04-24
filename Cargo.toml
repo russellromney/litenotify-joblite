@@ -5,7 +5,7 @@ members = [
 ]
 # Every language binding lives in its own submodule repo and opts
 # out of this workspace via its own `[workspace]` table. Each pulls
-# `honker-core` via `path = "../../honker-core", version = "0.1"` so
+# `honker-core` via `path = "../../honker-core", version = "0.2"` so
 # the path resolves when submoduled and the version falls back when
 # the binding is consumed standalone from its registry (PyPI, npm,
 # crates.io, etc.).

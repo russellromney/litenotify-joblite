@@ -57,6 +57,7 @@ Today:
 - Durable streams with per-consumer offsets and configurable flush interval
 - SQLite loadable extension so any SQLite client can read the same tables
 - Bindings: Python, Node.js, Rust, Go, Ruby, Bun, Elixir
+- Works inside your existing ORM's connection — SQLAlchemy, SQLModel, Django, Drizzle, Kysely, sqlx, GORM, ActiveRecord, Ecto ([guide](https://honker.dev/guides/orm/))
 
 Deliberately not built: task pipelines/chains/groups/chords, multi-writer replication, workflow orchestration with DAGs.
 
@@ -307,6 +308,27 @@ async def create_order(order: dict):
 ```
 
 SSE endpoints are ~30 lines of `async def stream(...): yield f"data: ...\n\n"` over `db.listen(channel)` or `db.stream(name).subscribe(...)`. For Django/Flask, run the worker as a dedicated CLI process (same pattern as Celery/RQ).
+
+### Using an ORM (SQLAlchemy, Django, Drizzle, ActiveRecord, Ecto, …)
+
+Load `libhonker_ext` on your ORM's connection and call the SQL functions inside the ORM's own transaction — the enqueue commits atomically with your business write.
+
+```python
+# SQLAlchemy
+@event.listens_for(engine, "connect")
+def _load_honker(conn, _):
+    conn.enable_load_extension(True)
+    conn.load_extension("/path/to/libhonker_ext")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("SELECT honker_bootstrap()")
+
+with Session(engine) as s, s.begin():
+    s.add(Order(user_id=42))
+    s.execute(text("SELECT honker_enqueue(:q, :p, NULL, NULL, 0, 3, NULL)"),
+              {"q": "emails", "p": '{"to":"alice@example.com"}'})
+```
+
+Workers run as a separate process using `honker.open("app.db")` — the WAL watcher wakes on commits from any connection to the file. See [Using with an ORM](https://honker.dev/guides/orm/) for Django, SQLModel, Drizzle, Kysely, sqlx, GORM, ActiveRecord, Ecto, a typed-payload `TypedQueue[T]` wrapper pattern for SQLModel/Pydantic, and the Prisma caveat.
 
 ## Performance
 
