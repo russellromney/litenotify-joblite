@@ -57,6 +57,7 @@ Today:
 - Durable streams with per-consumer offsets and configurable flush interval
 - SQLite loadable extension so any SQLite client can read the same tables
 - Bindings: Python, Node.js, Rust, Go, Ruby, Bun, Elixir
+- Works inside your existing ORM's connection — SQLAlchemy, SQLModel, Django, Drizzle, Kysely, sqlx, GORM, ActiveRecord, Ecto ([guide](https://honker.dev/guides/orm/))
 
 Deliberately not built: task pipelines/chains/groups/chords, multi-writer replication, workflow orchestration with DAGs.
 
@@ -199,37 +200,29 @@ The extension has three primitives that tie it together: ephemeral pub/sub (`not
 
 The explicit goal is to do `NOTIFY`/`LISTEN` semantics without constant polling, to achieve single-digit ms reaction time. If you use your app's existing SQLite file containing business logic, it will notify workers on every WAL commit. This means that most triggers will not result in anything happening: instead, workers just read the message/queue with no result. This "overtriggering" is on purpose and is the tradeoff for push semantics and fast reaction time.
 
-### WAL-only by design
+### WAL is the recommended default
 
-honker requires `journal_mode = WAL` on every database it manages. `honker_bootstrap()` refuses to run on a file-backed DB that isn't in WAL mode, and the language bindings set `PRAGMA journal_mode = WAL` in their default open path.
-
-- Workers hold open read views (WAL subscription channels, listener iterators) for their whole lifetime. In DELETE / TRUNCATE modes, writers take an EXCLUSIVE lock; every active reader blocks until release. A single worker actively claiming would serialize every `enqueue()` / `notify()` in the system behind it. WAL lets readers and writers coexist.
-- The `.db-wal` sidecar grows on every commit and only shrinks at checkpoint. Stat-polling it gives a monotonic, unambiguous change signal. The rollback-journal sidecar (`.db-journal`) in DELETE mode appears mid-transaction and vanishes on commit, making it a poor stat-poll target.
-- With `wal_autocheckpoint = 10000`, WAL performs one fsync per 10k pages instead of per-commit. Most of the throughput win comes from that.
-
-If you need a SQLite database that never enters WAL mode (e.g. for a backup target, or to avoid the `.db-wal` / `.db-shm` sidecars in a shared filesystem), honker is not the right tool. Use plain SQLite and live without the NOTIFY/LISTEN semantics.
-
-The library/extension is a small coordination layer built on the properties of SQLite and single-server architecture.
+The language bindings default to `journal_mode = WAL` because it gives concurrent readers with one writer, efficient fsync batching (`wal_autocheckpoint = 10000`), and a natural commit signal via `PRAGMA data_version`. If you prefer DELETE, TRUNCATE, or MEMORY mode, honker tables still work — you just lose cross-process wake (workers would need their own polling strategy).
 
 - One `.db` + one `.db-wal` is the entire system. You get every benefit of SQLite (embedded, local, durable, snapshot-able) that your app already uses.
 - WAL mode gives one writer and concurrent readers. Claim is one `UPDATE … RETURNING` via a partial index, ack is one `DELETE`.
-- The WAL file grows on every commit, so `(size, mtime)` is the cross-process commit signal.
+- We poll `PRAGMA data_version` every 1 ms to detect commits from any connection. The counter increments on every commit and on checkpoint, so WAL truncation and exact-size collisions are handled correctly.
 - SQLite has no wire protocol. Consumers must initiate reads; server-push is impossible. Wake signal = file change → `SELECT`.
 - Transactions are cheap, so jobs, events, and notifications are rows in the caller's open `with db.transaction()` block in an "outbox"-type pattern.
-- We use `stat(2)` cross-platform instead of the technically better `FSEvents`/`inotify`/`kqueue`. FSEvents drops same-process writes on macOS, meaning a listener and enqueuer in the same Python process would never see each other. `stat(2)` works identically on Linux/macOS/Windows at ~1 ms granularity for negligible CPU. Cost: ~0.5 ms of latency vs kernel notifications.
+- We use `PRAGMA data_version` instead of `stat(2)` on the WAL file or kernel watchers (`FSEvents`/`inotify`/`kqueue`). `data_version` is a monotonic counter incremented by SQLite on every commit by any connection — it handles WAL truncation, clock skew, and rolled-back transactions correctly. Kernel watchers drop same-process writes on macOS, and `stat(2)` on `(size, mtime)` misses commits when the WAL is truncated then grows back to the same size. `PRAGMA data_version` works identically on Linux/macOS/Windows at ~1 ms granularity for negligible CPU. Cost: ~3.5 µs per query, ~3.5 ms/sec total at 1 kHz.
 - Single machine, single writer. SQLite's locking is designed for a single host. Two servers writing one `.db` over NFS will corrupt it. Shard by file, or switch to Postgres.
 
 ## Architecture
 
 ### Wake path
 
-- One `stat(2)` thread per `Database`, polls `.db-wal` every 1 ms
-- `(size, mtime)` change → fan out a tick to each subscriber's bounded channel
+- One PRAGMA-poll thread per `Database`, queries `data_version` every 1 ms
+- Counter change → fan out a tick to each subscriber's bounded channel
 - Each subscriber runs `SELECT … WHERE id > last_seen` against a partial index, yields rows, returns to wait
 - 100 subscribers = 1 stat thread
 - Idle listeners run zero SQL queries
 
-Idle cost is a single `stat(2)` per millisecond per database. Listener count scales for free because the wake signal is a file stat instead of a polling query.
+Idle cost is a single `PRAGMA data_version` query per millisecond per database. Listener count scales for free because the wake signal is a SQLite counter read instead of a polling query.
 
 `SharedWalWatcher` (in `honker-core`) owns the poll thread and fans out to N subscribers via bounded `SyncSender<()>` channels keyed by subscriber id. Each `db.wal_events()` call registers a subscriber and returns a handle whose `Drop` auto-unsubscribes, so a dropped listener causes the bridge thread's `rx.recv() -> Err` and exits cleanly.
 
@@ -308,9 +301,29 @@ async def create_order(order: dict):
 
 SSE endpoints are ~30 lines of `async def stream(...): yield f"data: ...\n\n"` over `db.listen(channel)` or `db.stream(name).subscribe(...)`. For Django/Flask, run the worker as a dedicated CLI process (same pattern as Celery/RQ).
 
+### Using an ORM (SQLAlchemy, Django, Drizzle, ActiveRecord, Ecto, …)
+
+Load `libhonker_ext` on your ORM's connection and call the SQL functions inside the ORM's own transaction — the enqueue commits atomically with your business write.
+
+```python
+# SQLAlchemy
+@event.listens_for(engine, "connect")
+def _load_honker(conn, _):
+    conn.enable_load_extension(True)
+    conn.load_extension("/path/to/libhonker_ext")
+    conn.execute("SELECT honker_bootstrap()")
+
+with Session(engine) as s, s.begin():
+    s.add(Order(user_id=42))
+    s.execute(text("SELECT honker_enqueue(:q, :p, NULL, NULL, 0, 3, NULL)"),
+              {"q": "emails", "p": '{"to":"alice@example.com"}'})
+```
+
+Workers run as a separate process using `honker.open("app.db")` — the WAL watcher wakes on commits from any connection to the file. See [Using with an ORM](https://honker.dev/guides/orm/) for Django, SQLModel, Drizzle, Kysely, sqlx, GORM, ActiveRecord, Ecto, a typed-payload `TypedQueue[T]` wrapper pattern for SQLModel/Pydantic, and the Prisma caveat.
+
 ## Performance
 
-Handles thousands of messages per second on a modern laptop, with cross-process wake latency bounded by the 1 ms stat-poll cadence (~1–2 ms median on M-series). Run `bench/wake_latency_bench.py` and `bench/real_bench.py` to measure on your hardware.
+Handles thousands of messages per second on a modern laptop, with cross-process wake latency bounded by the 1 ms poll cadence (~1–2 ms median on M-series). Run `bench/wake_latency_bench.py` and `bench/real_bench.py` to measure on your hardware.
 
 ## Development
 

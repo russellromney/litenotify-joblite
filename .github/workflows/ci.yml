@@ -30,7 +30,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-        # Shallow checkout; the submodules aren't needed for rust-core.
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -94,6 +95,8 @@ jobs:
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -125,7 +128,13 @@ jobs:
       - name: Run pytest
         run: |
           . .venv/bin/activate
-          python -m pytest tests/ -q
+          # macOS runners deadlock under pytest-xdist with the WAL watcher
+          # thread (sqlite3 + PyO3 + process forking). Force single-process.
+          if [ "${{ matrix.os }}" = "macos-latest" ]; then
+            python -m pytest tests/ -q -n 1 --tb=short
+          else
+            python -m pytest tests/ -q --tb=short
+          fi
 
   node:
     name: node · honker-node

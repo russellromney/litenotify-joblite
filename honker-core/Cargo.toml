@@ -1,6 +1,6 @@
 [package]
 name = "honker-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Shared Rust foundation for Honker bindings (SQLite loadable extension, PyO3, napi-rs, and friends). Not intended for direct use."
 license = "Apache-2.0"
