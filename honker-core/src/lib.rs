@@ -24,9 +24,11 @@
 //!     acquire, non-blocking try_acquire, and release.
 //!   - [`Readers`] — bounded pool of reader connections that open
 //!     lazily up to a max.
-//!   - [`stat_pair`] / [`WalWatcher`] — 1 ms stat-polling thread that
-//!     fires a callback on every `.db-wal` change. Bindings wrap this
-//!     to surface wake events to their language's async primitive.
+//!   - [`WalWatcher`] — 1 ms FCNTL-polling thread that fires a
+//!     callback on every database commit. Uses `SQLITE_FCNTL_DATA_VERSION`
+//!     for precise change detection, with a periodic stat identity check
+//!     to detect file replacement. Bindings wrap this to surface wake
+//!     events to their language's async primitive.
 //!
 //! Anything language-specific — PyO3 classes, napi classes, SQLite
 //! entry-point symbols, row-materialization into Python dicts or JS
@@ -246,11 +248,12 @@ pub const BOOTSTRAP_HONKER_SQL: &str = "
 /// [`BOOTSTRAP_HONKER_SQL`] for the DDL and rationale.
 ///
 /// Requires the connection to be in `journal_mode=WAL`. Cross-process
-/// wake works by stat-polling `.db-wal`; a connection in any other
-/// journal mode would happily insert into `_honker_*` tables, but
-/// other processes would never observe those commits because there'd
-/// be no WAL to watch. Bootstrap fails loudly rather than silently
-/// setting the user up for "why don't my workers fire" later.
+/// wake works by polling `SQLITE_FCNTL_DATA_VERSION` on the database
+/// file; a connection in any other journal mode would happily insert
+/// into `_honker_*` tables, but other processes would never observe
+/// those commits because the change-detection mechanism is WAL-only.
+/// Bootstrap fails loudly rather than silently setting the user up
+/// for "why don't my workers fire" later.
 ///
 /// In-memory databases are exempt (SQLite rejects WAL mode for them)
 /// and only used by unit tests; nothing watches them anyway.
@@ -397,51 +400,71 @@ impl Readers {
 }
 
 // ---------------------------------------------------------------------
-// WAL file watcher
+// Database file watcher
 // ---------------------------------------------------------------------
 
-/// Snapshot of the WAL file's `(size, mtime_ns)`. Both 0 if the file
-/// does not exist. Compared as a tuple across polls to detect change.
-/// The WAL grows on every commit in WAL mode and is truncated on
-/// checkpoint; either direction produces a visible delta.
-pub fn stat_pair(path: &Path) -> (u64, i128) {
-    match std::fs::metadata(path) {
-        Ok(m) => {
-            let len = m.len();
-            let mt = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as i128)
-                .unwrap_or(0);
-            (len, mt)
-        }
-        Err(_) => (0, 0),
-    }
+/// Platform-specific file identity: `(dev, ino)` on Unix,
+/// `(volume_serial, file_index)` on Windows. Used to detect when the
+/// database file has been replaced underneath us (atomic rename,
+/// litestream restore, volume remount).
+#[cfg(unix)]
+fn stat_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(path)?;
+    Ok((m.dev(), m.ino()))
 }
 
-/// Background thread that stat()s a `.db-wal` file every 1 ms and
-/// fires a callback on every observed change.
+#[cfg(windows)]
+fn stat_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+    use std::os::windows::fs::MetadataExt;
+    let m = std::fs::metadata(path)?;
+    Ok((
+        m.volume_serial_number().unwrap_or(0) as u64,
+        m.file_index().unwrap_or(0),
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stat_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+    let _ = path;
+    Ok((0, 0))
+}
+
+/// Read the pager's `data_version` counter via `PRAGMA data_version`.
+/// Returns a monotonic u32 incremented on every commit by any
+/// connection (and on checkpoint). Empirically, `SQLITE_FCNTL_DATA_VERSION`
+/// does NOT detect cross-connection WAL commits — only PRAGMA does.
+/// Cost: ~3.5 µs/call = ~3.5 ms/sec at 1 kHz.
+fn poll_data_version(conn: &Connection) -> Result<u32, String> {
+    conn.pragma_query_value(None, "data_version", |row| row.get(0))
+        .map_err(|e| e.to_string())
+}
+
+/// Background thread that polls a SQLite database file for changes.
 ///
-/// Bindings construct this and wire the callback to whatever async
-/// primitive their language uses (Python `asyncio.Queue`, Node
-/// mpsc channel drained into a Promise, etc). The watcher thread
-/// itself is language-agnostic.
+/// Three-layer defensive architecture:
 ///
-/// Why stat-polling over `inotify` / `kqueue` / `FSEvents`? macOS
-/// FSEvents (the default on darwin via the `notify` crate) silently
-/// drops same-process writes, which means a listener and an enqueuer
-/// in the same Python process would never see each other. A dedicated
-/// 1 ms stat loop works identically on every platform at ~0 CPU cost.
+/// 1. **Fast path (every 1 ms):** `PRAGMA data_version`. Compare the
+///    integer to last seen value. Notify on change. (~3.5 µs/call.)
+/// 2. **Error recovery (every 1 ms on failure):** If the query fails,
+///    reconnect the SQLite connection and force one wake.
+/// 3. **Identity check (every 100 ms):** `stat(db_path)` to compare
+///    `(dev, ino)`. If the file was replaced, panic with a clear
+///    message — continuing would silently watch stale data.
+///
+/// Why PRAGMA data_version instead of stat on the WAL? It is a
+/// counter, not a timestamp — immune to clock skew, WAL truncation,
+/// and exact-size collisions. It also ignores rolled-back transactions
+/// that touch the WAL but never commit.
 pub struct WalWatcher {
     stop: Arc<AtomicBool>,
 }
 
 impl WalWatcher {
-    /// Spawn a watcher thread on `wal_path`. `on_change` is called
-    /// once per observed change. The thread runs until [`WalWatcher`]
+    /// Spawn a watcher thread on `db_path`. `on_change` is called
+    /// once per observed commit. The thread runs until [`WalWatcher`]
     /// is dropped or [`stop`](Self::stop) is called.
-    pub fn spawn<F>(wal_path: PathBuf, on_change: F) -> Self
+    pub fn spawn<F>(db_path: PathBuf, on_change: F) -> Self
     where
         F: Fn() + Send + 'static,
     {
@@ -450,13 +473,101 @@ impl WalWatcher {
         std::thread::Builder::new()
             .name("honker-wal-poll".into())
             .spawn(move || {
-                let mut last = stat_pair(&wal_path);
+                let mut conn = match Connection::open_with_flags(
+                    &db_path,
+                    OpenFlags::SQLITE_OPEN_READ_WRITE
+                        | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                ) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        eprintln!(
+                            "honker: failed to open watcher connection: {e}"
+                        );
+                        None
+                    }
+                };
+                let mut last_version = conn
+                    .as_ref()
+                    .and_then(|c| poll_data_version(c).ok())
+                    .unwrap_or(0);
+                let initial_identity = match stat_identity(&db_path) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        eprintln!(
+                            "honker: failed to stat database for identity check: {e}"
+                        );
+                        (0, 0)
+                    }
+                };
+                let mut tick: u64 = 0;
+
                 while !stop_t.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(1));
-                    let cur = stat_pair(&wal_path);
-                    if cur != last {
-                        last = cur;
-                        on_change();
+
+                    // Path 1: PRAGMA data_version (fast path)
+                    if let Some(ref c) = conn {
+                        match poll_data_version(c) {
+                            Ok(version) => {
+                                if version != last_version {
+                                    last_version = version;
+                                    on_change();
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "honker: data_version poll failed: {e}"
+                                );
+                                conn = None;
+                                on_change(); // conservative wake
+                            }
+                        }
+                    } else {
+                        // Path 2: reconnect after transient failure
+                        match Connection::open_with_flags(
+                            &db_path,
+                            OpenFlags::SQLITE_OPEN_READ_WRITE
+                                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                        ) {
+                            Ok(c) => {
+                                last_version =
+                                    poll_data_version(&c).unwrap_or(0);
+                                conn = Some(c);
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "honker: reconnect failed: {e}"
+                                );
+                            }
+                        }
+                    }
+
+                    // Path 3: stat identity check (dead-man's switch)
+                    tick += 1;
+                    if tick % 100 == 0 {
+                        match stat_identity(&db_path) {
+                            Ok(current) => {
+                                if current != initial_identity {
+                                    panic!(
+                                        "honker: database file replaced: \
+                                         expected (dev={}, ino={}), \
+                                         found (dev={}, ino={}) at {:?}. \
+                                         Restart required.",
+                                        initial_identity.0,
+                                        initial_identity.1,
+                                        current.0,
+                                        current.1,
+                                        db_path
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "honker: stat identity check failed: {e}"
+                                );
+                                conn = None;
+                                on_change();
+                            }
+                        }
                     }
                 }
             })
@@ -481,16 +592,17 @@ impl Drop for WalWatcher {
 // Shared WAL watcher (one thread per Database, N subscribers)
 // ---------------------------------------------------------------------
 
-/// Shared WAL-file watcher: one stat-poll thread per `.db-wal` path,
-/// N subscribers. Each [`subscribe`](Self::subscribe) returns a fresh
-/// `Receiver<()>` that sees a tick on every observed change.
+/// Shared database-file watcher: one FCNTL-poll thread per database
+/// path, N subscribers. Each [`subscribe`](Self::subscribe) returns a
+/// fresh `Receiver<()>` that sees a tick on every observed commit.
 ///
 /// Previously every call to `db.wal_events()` spawned its own
 /// stat-poll thread, so N listeners in one process meant N threads
-/// hammering `stat(2)` on the same file at 1 ms cadence. A web process
-/// with 100 active SSE subscribers was doing ~200k stat syscalls/sec
-/// against one file. Now a single shared thread services all
-/// subscribers — 1 ms cadence, same kernel cost regardless of N.
+/// hammering `stat(2)` on the same file at 1 ms cadence. A web
+/// process with 100 active SSE subscribers was doing ~200k stat
+/// syscalls/sec against one file. Now a single shared thread
+/// services all subscribers — 1 ms cadence, same kernel cost
+/// regardless of N.
 ///
 /// Subscriber channels are bounded; on overflow, additional ticks for
 /// that subscriber are dropped. Wakes are idempotent signals — the
@@ -507,12 +619,12 @@ pub struct SharedWalWatcher {
 }
 
 impl SharedWalWatcher {
-    /// Spawn the shared poll thread for `wal_path`.
-    pub fn new(wal_path: PathBuf) -> Self {
+    /// Spawn the shared poll thread for `db_path`.
+    pub fn new(db_path: PathBuf) -> Self {
         let senders: Arc<Mutex<HashMap<u64, SyncSender<()>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let senders_t = senders.clone();
-        let watcher = WalWatcher::spawn(wal_path, move || {
+        let watcher = WalWatcher::spawn(db_path, move || {
             let mut list = senders_t.lock();
             list.retain(|_id, s| match s.try_send(()) {
                 Ok(()) | Err(TrySendError::Full(_)) => true,
@@ -615,28 +727,36 @@ mod tests {
     }
 
     #[test]
-    fn stat_pair_handles_missing_file() {
-        let (size, mt) = stat_pair(std::path::Path::new("/nonexistent/path/nope"));
-        assert_eq!(size, 0);
-        assert_eq!(mt, 0);
-    }
-
-    #[test]
     fn shared_wal_watcher_fans_out_to_many_subscribers() {
         let tmp = std::env::temp_dir().join(format!(
             "honker-shared-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&tmp);
-        std::fs::write(&tmp, b"").unwrap();
+        // Create a real SQLite database in WAL mode so the watcher can
+        // open a read-only connection and poll data_version.
+        {
+            let conn = Connection::open(&tmp).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        }
 
         let shared = SharedWalWatcher::new(tmp.clone());
         let subs: Vec<(u64, std::sync::mpsc::Receiver<()>)> =
             (0..50).map(|_| shared.subscribe()).collect();
 
+        // Open a separate writer connection to trigger commits.
+        let writer = Connection::open(&tmp).unwrap();
+        writer
+            .execute(
+                "CREATE TABLE IF NOT EXISTS _test_trigger(id INTEGER PRIMARY KEY)",
+                [],
+            )
+            .unwrap();
         for i in 0..5 {
             std::thread::sleep(Duration::from_millis(5));
-            std::fs::write(&tmp, format!("{}", i).as_bytes()).unwrap();
+            writer
+                .execute("INSERT INTO _test_trigger(id) VALUES (?)", [i])
+                .unwrap();
         }
         std::thread::sleep(Duration::from_millis(50));
 
@@ -658,7 +778,10 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&tmp);
-        std::fs::write(&tmp, b"").unwrap();
+        {
+            let conn = Connection::open(&tmp).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        }
 
         let shared = SharedWalWatcher::new(tmp.clone());
         let (id, rx) = shared.subscribe();
@@ -681,31 +804,135 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&tmp);
-        std::fs::write(&tmp, b"").unwrap();
+        {
+            let conn = Connection::open(&tmp).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        }
 
         let shared = SharedWalWatcher::new(tmp.clone());
         {
             let _subs: Vec<_> = (0..10).map(|_| shared.subscribe()).collect();
             assert_eq!(shared.subscriber_count(), 10);
         }
-        std::fs::write(&tmp, b"wake").unwrap();
+
+        // Trigger commits so the watcher attempts to send on each
+        // dropped receiver and prunes them.
+        let writer = Connection::open(&tmp).unwrap();
+        writer
+            .execute(
+                "CREATE TABLE IF NOT EXISTS _test_prune(id INTEGER PRIMARY KEY)",
+                [],
+            )
+            .unwrap();
         // Poll for pruning instead of sleeping a fixed duration —
-        // the 1 ms poll thread needs to notice the file change AND
+        // the 1 ms poll thread needs to notice the commit AND
         // attempt to send on each dropped receiver AND prune. Under
-        // parallel test load (`cargo test` runs threads in parallel),
-        // 30 ms is not enough; previously this flaked ~5% of runs.
-        // 2 s gives plenty of headroom without slowing the test.
+        // parallel test load, 30 ms is not enough.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while shared.subscriber_count() != 0
             && std::time::Instant::now() < deadline
         {
             std::thread::sleep(Duration::from_millis(5));
-            // Keep poking the file so the stat-poll thread has a
-            // change to react to. Without this, a missed wake on
-            // the first poke means we wait the full 2s.
-            std::fs::write(&tmp, b"wake").unwrap();
+            writer
+                .execute("INSERT INTO _test_prune(id) VALUES (random())", [])
+                .unwrap();
         }
         assert_eq!(shared.subscriber_count(), 0);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn data_version_detects_commits_and_ignores_rollbacks() {
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-dv-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        // PRAGMA data_version detects changes from OTHER connections.
+        let watcher = Connection::open(&tmp).unwrap();
+        watcher.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        let writer = Connection::open(&tmp).unwrap();
+
+        let v0 = poll_data_version(&watcher).unwrap();
+
+        // Commit increments data_version (observed by watcher).
+        writer.execute("CREATE TABLE t(x INTEGER)", []).unwrap();
+        let v1 = poll_data_version(&watcher).unwrap();
+        assert!(v1 > v0, "commit should increment data_version");
+
+        // Rollback does NOT increment data_version.
+        writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        writer.execute("INSERT INTO t VALUES (1)", []).unwrap();
+        writer.execute_batch("ROLLBACK;").unwrap();
+        let v2 = poll_data_version(&watcher).unwrap();
+        assert_eq!(v2, v1, "rollback should not increment data_version");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn data_version_survives_wal_checkpoint() {
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-dv-ckpt-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        // Watcher connection — observe changes from the writer.
+        let watcher = Connection::open(&tmp).unwrap();
+        watcher.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        let w0 = poll_data_version(&watcher).unwrap();
+
+        // Writer connection — make changes.
+        let writer = Connection::open(&tmp).unwrap();
+        writer.execute("CREATE TABLE t(x INTEGER)", []).unwrap();
+        let w1 = poll_data_version(&watcher).unwrap();
+        assert!(w1 > w0, "commit from other conn should increment data_version");
+
+        // Checkpoint truncates WAL; watcher should still see the change.
+        writer.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        let w2 = poll_data_version(&watcher).unwrap();
+        assert!(
+            w2 > w1,
+            "checkpoint from other conn should increment data_version"
+        );
+
+        // Post-checkpoint commit still detected.
+        writer.execute("INSERT INTO t VALUES (1)", []).unwrap();
+        let w3 = poll_data_version(&watcher).unwrap();
+        assert!(
+            w3 > w2,
+            "post-checkpoint commit should increment data_version"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn stat_identity_detects_file_replacement() {
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-id-test-{}",
+            std::process::id()
+        ));
+        let tmp2 = std::env::temp_dir().join(format!(
+            "honker-id-test2-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&tmp2);
+
+        // Create two distinct files.
+        std::fs::write(&tmp, b"original").unwrap();
+        std::fs::write(&tmp2, b"replacement").unwrap();
+
+        let id1 = stat_identity(&tmp).unwrap();
+        let id2 = stat_identity(&tmp2).unwrap();
+        assert_ne!(id1, id2, "different files should have different identities");
+
+        // After atomic rename, tmp now has tmp2's identity.
+        std::fs::rename(&tmp2, &tmp).unwrap();
+        let id3 = stat_identity(&tmp).unwrap();
+        assert_eq!(id3, id2, "renamed file should carry the replacement's identity");
 
         let _ = std::fs::remove_file(&tmp);
     }
