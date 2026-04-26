@@ -1,0 +1,19 @@
+# Standalone — opts out of honker's workspace via [workspace] below.
+# This bench pulls in memmap2 just for the wal-index reader; we don't
+# want that dep leaking into honker-core.
+
+[package]
+name = "wal_index_methods"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rusqlite = "0.39.0"
+memmap2 = "0.9"
+
+[workspace]
+
+[profile.release]
+debug = false
+lto = "thin"
