@@ -5,6 +5,26 @@ uv run python bench/honker_bench.py --n 5000
 uv run python bench/stream_bench.py --n 5000
 ```
 
+## `wal_index_methods/` — five ways to detect cross-connection commits
+
+Standalone Rust crate. Compares `SQLITE_FCNTL_DATA_VERSION`,
+`PRAGMA data_version` (re-prepared and cached), `stat(2)` on `-wal`,
+and direct `mmap` of `-shm` for honker's `WalWatcher` polling.
+Headline: mmap of `-shm` is ~3,000× faster than the current PRAGMA
+path (0.6 ns/poll vs ~2050 ns), and FCNTL alone *does not detect*
+cross-connection commits despite what the docs imply (it returns a
+cached pager-local value). See `bench/wal_index_methods/README.md`
+for full numbers and the source-code reasoning.
+
+```bash
+cd bench/wal_index_methods && cargo run --release
+```
+
+Why honker still uses PRAGMA: CPU savings are 0.2% per DB → ~0% per DB,
+which doesn't justify the architectural complexity at current scale.
+The bench is kept as a proof of what's possible if scale ever changes.
+Context: https://github.com/russellromney/honker/issues/5
+
 ## Baseline — Apple Silicon M-series, release build, 2026-04
 
 Median of 3 runs. WAL + `synchronous=NORMAL`, default `busy_timeout=5000`.
