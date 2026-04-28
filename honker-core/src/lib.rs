@@ -374,27 +374,27 @@ impl Readers {
 /// `(volume_serial, file_index)` on Windows. Used to detect when the
 /// database file has been replaced underneath us (atomic rename,
 /// litestream restore, volume remount).
-#[cfg(unix)]
+///
+/// Uses the `file-id` crate for stable cross-platform implementation.
 fn stat_identity(path: &Path) -> std::io::Result<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    let m = std::fs::metadata(path)?;
-    Ok((m.dev(), m.ino()))
-}
-
-#[cfg(windows)]
-fn stat_identity(path: &Path) -> std::io::Result<(u64, u64)> {
-    use std::os::windows::fs::MetadataExt;
-    let m = std::fs::metadata(path)?;
-    Ok((
-        m.volume_serial_number().unwrap_or(0) as u64,
-        m.file_index().unwrap_or(0),
-    ))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn stat_identity(path: &Path) -> std::io::Result<(u64, u64)> {
-    let _ = path;
-    Ok((0, 0))
+    let id = file_id::get_file_id(path)?;
+    match id {
+        file_id::FileId::Inode {
+            device_id,
+            inode_number,
+        } => Ok((device_id, inode_number)),
+        file_id::FileId::LowRes {
+            volume_serial_number,
+            file_index,
+        } => Ok((volume_serial_number as u64, file_index)),
+        file_id::FileId::HighRes {
+            volume_serial_number,
+            file_id,
+        } => {
+            let file_index = (file_id & 0xFFFFFFFFFFFFFFFF) as u64;
+            Ok((volume_serial_number, file_index))
+        }
+    }
 }
 
 /// Read the pager's `data_version` counter via `PRAGMA data_version`.
