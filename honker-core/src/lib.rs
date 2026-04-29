@@ -1288,16 +1288,34 @@ while True:
             .arg("-c")
             .arg(&writer_script)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap_or_else(|e| panic!("spawn {python} child writer: {e}"));
 
-        // Let the child accumulate committed rows. 500 ms is a
-        // generous window — Windows process startup is slower than
-        // unix, and `synchronous=NORMAL` may batch fsyncs at
-        // checkpoint boundaries. Plenty of room for at least one
-        // commit before the kill on any reasonable machine.
-        std::thread::sleep(Duration::from_millis(500));
+        // Wait for the child to commit some rows before the kill.
+        // Has to absorb the slowest-platform interpreter startup
+        // we care about: Windows Python takes ~300-700ms cold
+        // before `import sqlite3` returns. 2 seconds is plenty of
+        // margin while keeping the test fast on unix (where the
+        // process startup is ~50ms).
+        std::thread::sleep(Duration::from_millis(2000));
+
+        // Detect "the child died on its own" — most likely cause
+        // is python failing to import sqlite3, the script
+        // panicking, or some other startup error. Surface that
+        // with the child's stderr rather than the downstream
+        // "got 0 rows" symptom.
+        if let Ok(Some(status)) = child.try_wait() {
+            let mut stderr = String::new();
+            if let Some(mut s) = child.stderr.take() {
+                use std::io::Read;
+                let _ = s.read_to_string(&mut stderr);
+            }
+            panic!(
+                "python child exited before kill (status={status:?}); \
+                 stderr: {stderr}"
+            );
+        }
 
         // Hard kill. `Child::kill` sends SIGKILL on unix and
         // `TerminateProcess` on Windows. No chance for graceful
