@@ -24,7 +24,7 @@
 //!     acquire, non-blocking try_acquire, and release.
 //!   - [`Readers`] — bounded pool of reader connections that open
 //!     lazily up to a max.
-//!   - [`WalWatcher`] — 1 ms PRAGMA-polling thread that fires a
+//!   - [`UpdateWatcher`] — 1 ms PRAGMA-polling thread that fires a
 //!     callback on every database commit. Uses `PRAGMA data_version`
 //!     for precise change detection, with a periodic stat identity check
 //!     to detect file replacement. Bindings wrap this to surface wake
@@ -398,18 +398,28 @@ fn stat_identity(path: &Path) -> std::io::Result<(u64, u64)> {
         file_id::FileId::HighRes {
             volume_serial_number,
             file_id,
-        } => {
-            // ReFS file_ids are 128 bits; NTFS leaves the upper 64
-            // at 0. Either truncation or XOR-fold works in practice
-            // for "did this file get atomically renamed?" since ReFS
-            // file_ids change wholesale on rename. XOR-fold uses
-            // bits from both halves for symmetry; the practical
-            // collision probability is the same as truncation
-            // (~2⁻⁶⁴) and acceptable for this use.
-            let file_index = ((file_id >> 64) as u64) ^ (file_id as u64);
-            Ok((volume_serial_number, file_index))
-        }
+        } => Ok(fold_high_res(volume_serial_number, file_id)),
     }
+}
+
+/// Fold a 128-bit ReFS / `FILE_ID_INFO` `file_id` into a 64-bit
+/// identity that fits the `(u64, u64)` return type of
+/// [`stat_identity`].
+///
+/// NTFS leaves the upper 64 bits at 0 so the result is just the lower
+/// 64 bits — bit-for-bit equivalent to truncation. ReFS can populate
+/// both halves; XOR-folding mixes the bits so we use both halves'
+/// entropy for symmetry.
+///
+/// For the "did this file get atomically renamed?" detection that
+/// `UpdateWatcher` uses, either truncation or XOR-fold works — ReFS
+/// file_ids change wholesale on rename, so the lower 64 bits change
+/// too. The practical collision probability is the same as
+/// truncation (~2⁻⁶⁴) and acceptable for this use.
+#[cfg(any(unix, windows))]
+fn fold_high_res(volume_serial_number: u64, file_id: u128) -> (u64, u64) {
+    let file_index = ((file_id >> 64) as u64) ^ (file_id as u64);
+    (volume_serial_number, file_index)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -443,13 +453,14 @@ fn poll_data_version(conn: &Connection) -> Result<u32, String> {
 /// counter, not a timestamp — immune to clock skew, WAL truncation,
 /// and exact-size collisions. It also ignores rolled-back transactions
 /// that touch the WAL but never commit.
-pub struct WalWatcher {
+pub struct UpdateWatcher {
     stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
-impl WalWatcher {
+impl UpdateWatcher {
     /// Spawn a watcher thread on `db_path`. `on_change` is called
-    /// once per observed commit. The thread runs until [`WalWatcher`]
+    /// once per observed commit. The thread runs until [`UpdateWatcher`]
     /// is dropped or [`stop`](Self::stop) is called.
     pub fn spawn<F>(db_path: PathBuf, on_change: F) -> Self
     where
@@ -457,8 +468,8 @@ impl WalWatcher {
     {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_t = stop.clone();
-        std::thread::Builder::new()
-            .name("honker-wal-poll".into())
+        let handle = std::thread::Builder::new()
+            .name("honker-update-poll".into())
             .spawn(move || {
                 let mut conn = match Connection::open_with_flags(
                     &db_path,
@@ -558,25 +569,41 @@ impl WalWatcher {
                     }
                 }
             })
-            .expect("spawn wal-poll thread");
-        Self { stop }
+            .expect("spawn update-poll thread");
+        Self {
+            stop,
+            handle: Some(handle),
+        }
     }
 
     /// Request the watcher thread to stop. Idempotent. Dropping the
-    /// `WalWatcher` also stops the thread.
+    /// `UpdateWatcher` also stops the thread.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
     }
+
+    /// Stop the watcher and wait for the thread to exit. Returns the
+    /// thread's result — `Ok(())` on clean shutdown, `Err(payload)`
+    /// if the thread panicked (e.g. the dead-man's switch detected
+    /// file replacement). Consumes `self` so the watcher can't be
+    /// used after joining.
+    pub fn join(mut self) -> std::thread::Result<()> {
+        self.stop();
+        match self.handle.take() {
+            Some(h) => h.join(),
+            None => Ok(()),
+        }
+    }
 }
 
-impl Drop for WalWatcher {
+impl Drop for UpdateWatcher {
     fn drop(&mut self) {
         self.stop();
     }
 }
 
 // ---------------------------------------------------------------------
-// Shared WAL watcher (one thread per Database, N subscribers)
+// Shared update watcher (one thread per Database, N subscribers)
 // ---------------------------------------------------------------------
 
 /// Shared database-file watcher: one PRAGMA-poll thread per database
@@ -596,22 +623,22 @@ impl Drop for WalWatcher {
 /// consumer re-reads state from SQLite on each wake — so dropping
 /// during backpressure is safe. A disconnected subscriber (receiver
 /// dropped) gets pruned on the next wake via `TrySendError::Disconnected`.
-pub struct SharedWalWatcher {
+pub struct SharedUpdateWatcher {
     /// Hold the underlying poll thread alive. Dropping this stops it.
-    _watcher: WalWatcher,
+    _watcher: UpdateWatcher,
     /// Shared with the watcher closure so it can fan out to every
     /// subscriber and prune disconnected ones opportunistically.
     senders: Arc<Mutex<HashMap<u64, SyncSender<()>>>>,
     next_id: AtomicU64,
 }
 
-impl SharedWalWatcher {
+impl SharedUpdateWatcher {
     /// Spawn the shared poll thread for `db_path`.
     pub fn new(db_path: PathBuf) -> Self {
         let senders: Arc<Mutex<HashMap<u64, SyncSender<()>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let senders_t = senders.clone();
-        let watcher = WalWatcher::spawn(db_path, move || {
+        let watcher = UpdateWatcher::spawn(db_path, move || {
             let mut list = senders_t.lock();
             list.retain(|_id, s| match s.try_send(()) {
                 Ok(()) | Err(TrySendError::Full(_)) => true,
@@ -652,6 +679,31 @@ impl SharedWalWatcher {
         self.senders.lock().len()
     }
 }
+
+// ---------------------------------------------------------------------
+// Back-compat aliases for the previous WAL-themed names.
+//
+// `WalWatcher` and `SharedWalWatcher` were named when the
+// implementation literally polled `stat(2)` on the `-wal` file. The
+// implementation has since switched to `PRAGMA data_version` (which
+// works in any journal mode) and the WAL-themed name no longer
+// describes what the type does — it watches for *updates* to the
+// database, by whatever strategy. The future direction (see issue
+// #5) is a strategy abstraction with two backends: the current
+// `data_version` strategy and an `mmap` of the wal-index `-shm` page
+// that's ~3000× faster.
+//
+// The submodule bindings (`packages/honker`, `packages/honker-node`,
+// `packages/honker-rs`) still import the old names. These aliases
+// keep them building until each binding lands its own rename. Aliases
+// are zero-cost and can be deleted once the bindings are updated.
+// ---------------------------------------------------------------------
+
+#[deprecated(note = "renamed to UpdateWatcher; see honker-core CHANGELOG")]
+pub type WalWatcher = UpdateWatcher;
+
+#[deprecated(note = "renamed to SharedUpdateWatcher; see honker-core CHANGELOG")]
+pub type SharedWalWatcher = SharedUpdateWatcher;
 
 // ---------------------------------------------------------------------
 // Tests
@@ -714,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_wal_watcher_fans_out_to_many_subscribers() {
+    fn shared_update_watcher_fans_out_to_many_subscribers() {
         let tmp = std::env::temp_dir().join(format!(
             "honker-shared-test-{}",
             std::process::id()
@@ -727,7 +779,7 @@ mod tests {
             conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
         }
 
-        let shared = SharedWalWatcher::new(tmp.clone());
+        let shared = SharedUpdateWatcher::new(tmp.clone());
         let subs: Vec<(u64, std::sync::mpsc::Receiver<()>)> =
             (0..50).map(|_| shared.subscribe()).collect();
 
@@ -759,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_wal_watcher_explicit_unsubscribe_disconnects_receiver() {
+    fn shared_update_watcher_explicit_unsubscribe_disconnects_receiver() {
         let tmp = std::env::temp_dir().join(format!(
             "honker-unsub-test-{}",
             std::process::id()
@@ -770,7 +822,7 @@ mod tests {
             conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
         }
 
-        let shared = SharedWalWatcher::new(tmp.clone());
+        let shared = SharedUpdateWatcher::new(tmp.clone());
         let (id, rx) = shared.subscribe();
         assert_eq!(shared.subscriber_count(), 1);
 
@@ -785,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_wal_watcher_prunes_subscribers_when_receiver_dropped() {
+    fn shared_update_watcher_prunes_subscribers_when_receiver_dropped() {
         let tmp = std::env::temp_dir().join(format!(
             "honker-prune-test-{}",
             std::process::id()
@@ -796,7 +848,7 @@ mod tests {
             conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
         }
 
-        let shared = SharedWalWatcher::new(tmp.clone());
+        let shared = SharedUpdateWatcher::new(tmp.clone());
         {
             let _subs: Vec<_> = (0..10).map(|_| shared.subscribe()).collect();
             assert_eq!(shared.subscriber_count(), 10);
@@ -924,6 +976,115 @@ mod tests {
         std::fs::rename(&tmp2, &tmp).unwrap();
         let id3 = stat_identity(&tmp).unwrap();
         assert_eq!(id3, id2, "renamed file should carry the replacement's identity");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Direct test of the XOR-fold logic on synthetic 128-bit
+    /// inputs. CI runners use NTFS, so the live `stat_identity` test
+    /// above never exercises the `HighRes` arm with non-zero upper
+    /// bits. This unit test does.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn fold_high_res_uses_both_halves() {
+        // NTFS-shaped: upper = 0, fold == lower.
+        let (vsn, idx) = fold_high_res(0xAABB, 0x0000_0000_0000_0000_DEAD_BEEF_CAFE_F00D);
+        assert_eq!(vsn, 0xAABB);
+        assert_eq!(idx, 0xDEAD_BEEF_CAFE_F00D);
+
+        // ReFS-shaped: both halves non-zero, fold == upper XOR lower.
+        let upper = 0x1111_2222_3333_4444u64;
+        let lower = 0x5555_6666_7777_8888u64;
+        let file_id = ((upper as u128) << 64) | (lower as u128);
+        let (vsn, idx) = fold_high_res(0xCCDD, file_id);
+        assert_eq!(vsn, 0xCCDD);
+        assert_eq!(idx, upper ^ lower);
+
+        // Adversarial: upper == lower → fold == 0. This is the known
+        // XOR weakness; documented and acceptable because ReFS
+        // file_ids aren't constructed to satisfy this property.
+        let same = 0xDEAD_BEEF_CAFE_F00Du64;
+        let file_id = ((same as u128) << 64) | (same as u128);
+        let (_, idx) = fold_high_res(0, file_id);
+        assert_eq!(idx, 0);
+    }
+
+    /// Verifies the `UpdateWatcher` dead-man's-switch panics when the
+    /// underlying database file is replaced under it. Joins the
+    /// watcher thread and inspects the panic payload — no global
+    /// panic-hook trickery needed because `UpdateWatcher::join()`
+    /// returns the thread's `Result`.
+    ///
+    /// Unix-only. The test triggers replacement via `std::fs::rename`
+    /// over the open SQLite file, which is a normal operation on
+    /// Linux / macOS and the actual scenario the dead-man's switch
+    /// defends against — litestream restore, atomic backup swap, NFS
+    /// remount. On Windows the kernel rejects the rename with
+    /// `ERROR_ACCESS_DENIED` even though SQLite opens with
+    /// `FILE_SHARE_DELETE`, so the test can't trigger the scenario
+    /// it's verifying. Atomic open-file replacement isn't a typical
+    /// Windows pattern in practice; the Windows behavior of the
+    /// dead-man's switch is intentionally untested.
+    #[cfg(unix)]
+    #[test]
+    fn update_watcher_panics_on_file_replacement() {
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-watcher-replace-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        // Create the DB so the watcher can open + stat it.
+        {
+            let conn = Connection::open(&tmp).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        }
+
+        let watcher = UpdateWatcher::spawn(tmp.clone(), || {});
+
+        // The watcher's identity check fires every 100 ticks and each
+        // tick is `sleep(1ms)` — but Windows' default timer
+        // granularity rounds 1 ms sleeps up to ~15 ms, so 100 ticks
+        // there is ~1.5 s rather than ~100 ms. Wait 2 s on each side
+        // so the test is reliable across platforms.
+        std::thread::sleep(Duration::from_millis(2000));
+
+        // Replace the file. Atomic-rename instead of delete+create so
+        // it works even when SQLite has the destination open
+        // (Windows allows replace-on-rename for files opened with
+        // FILE_SHARE_DELETE, which SQLite uses).
+        let tmp2 = std::env::temp_dir().join(format!(
+            "honker-watcher-replace-new-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp2);
+        {
+            let conn = Connection::open(&tmp2).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        }
+        std::fs::rename(&tmp2, &tmp).unwrap();
+
+        // Wait for the next identity-check tick to fire and panic.
+        std::thread::sleep(Duration::from_millis(2000));
+
+        // Stop and join. Should be Err because the thread panicked.
+        let result = watcher.join();
+        assert!(
+            result.is_err(),
+            "watcher should have panicked on file replacement, instead got Ok"
+        );
+        let payload = result.unwrap_err();
+        let msg = if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else if let Some(s) = payload.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else {
+            String::from("<panic payload not a string>")
+        };
+        assert!(
+            msg.contains("database file replaced"),
+            "panic message should mention replacement; got: {msg}"
+        );
 
         let _ = std::fs::remove_file(&tmp);
     }
