@@ -1089,6 +1089,304 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
+    /// Verify `poll_data_version` detects cross-connection commits in
+    /// every supported journal mode. WAL was the only mode that had
+    /// explicit coverage before; the bootstrap-without-WAL change in
+    /// commit `c6716d5` made the watcher work in any mode but never
+    /// added tests for the others. This closes that gap.
+    fn poll_data_version_works_in_journal_mode(mode: &str) {
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-jm-{}-{}",
+            mode.to_ascii_lowercase(),
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let watcher = Connection::open(&tmp).unwrap();
+        watcher
+            .execute_batch(&format!("PRAGMA journal_mode = {mode};"))
+            .unwrap();
+
+        let writer = Connection::open(&tmp).unwrap();
+
+        let v0 = poll_data_version(&watcher).unwrap();
+
+        // Commit increments data_version (observed across connections).
+        writer
+            .execute("CREATE TABLE t(x INTEGER)", [])
+            .unwrap();
+        let v1 = poll_data_version(&watcher).unwrap();
+        assert!(
+            v1 > v0,
+            "journal_mode={mode}: cross-conn commit should bump \
+             data_version; saw {v0} -> {v1}"
+        );
+
+        // Rollback should NOT increment data_version (still true in
+        // non-WAL modes — the docs are journal-mode-agnostic on this).
+        writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        writer
+            .execute("INSERT INTO t VALUES (1)", [])
+            .unwrap();
+        writer.execute_batch("ROLLBACK;").unwrap();
+        let v2 = poll_data_version(&watcher).unwrap();
+        assert_eq!(
+            v2, v1,
+            "journal_mode={mode}: rollback should not bump data_version"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-journal", tmp.display()));
+    }
+
+    #[test]
+    fn poll_data_version_works_in_wal() {
+        poll_data_version_works_in_journal_mode("WAL");
+    }
+
+    #[test]
+    fn poll_data_version_works_in_delete() {
+        poll_data_version_works_in_journal_mode("DELETE");
+    }
+
+    #[test]
+    fn poll_data_version_works_in_truncate() {
+        poll_data_version_works_in_journal_mode("TRUNCATE");
+    }
+
+    #[test]
+    fn poll_data_version_works_in_persist() {
+        poll_data_version_works_in_journal_mode("PERSIST");
+    }
+
+    // MEMORY journal mode is per-connection (the journal lives in
+    // RAM, not a file), so cross-connection rollback semantics are
+    // different. SQLite's docs are clear that MEMORY is intended for
+    // single-process use. honker doesn't promise MEMORY support, so
+    // we don't test it here — flagging in case it ever becomes a
+    // user-visible question.
+
+    /// Crash-recovery / durability test. Spawns a child writer
+    /// process (python3, available on every CI runner) that hammers
+    /// the DB with committed inserts. SIGKILLs the child mid-flight,
+    /// reopens the DB in the parent, asserts:
+    ///
+    ///   1. `PRAGMA integrity_check` returns "ok" (no corruption from
+    ///      the crash-mid-WAL state).
+    ///   2. Some rows committed before the kill are still present.
+    ///   3. Re-opening the DB succeeds (WAL replay works after a
+    ///      hard kill).
+    ///
+    /// Unix-only: SIGKILL semantics + python3 + sqlite3 CLI on PATH
+    /// are reliable on Linux/macOS runners and in dev. Windows kill
+    /// behavior on python child processes is more involved and is
+    /// not the durability scenario honker is most exposed to.
+    #[cfg(unix)]
+    #[test]
+    fn writer_killed_mid_workload_leaves_db_consistent() {
+        use std::process::{Command, Stdio};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-crash-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+
+        // Bootstrap schema + WAL mode in the parent.
+        {
+            let conn = Connection::open(&tmp).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA synchronous = NORMAL;
+                 CREATE TABLE q(id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER);",
+            )
+            .unwrap();
+        }
+
+        // Spawn a python3 child that writes committed rows in a tight
+        // loop. Open DB in WAL mode + synchronous=NORMAL to match the
+        // honker default. Each iteration is its own auto-commit txn.
+        let writer_script = format!(
+            r#"
+import sqlite3
+conn = sqlite3.connect({path:?})
+conn.execute("PRAGMA journal_mode = WAL")
+conn.execute("PRAGMA synchronous = NORMAL")
+i = 0
+while True:
+    conn.execute("INSERT INTO q(v) VALUES (?)", (i,))
+    conn.commit()
+    i += 1
+"#,
+            path = tmp.to_str().unwrap()
+        );
+
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(&writer_script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn python3 child writer");
+
+        // Let the child accumulate committed rows. 200 ms with
+        // synchronous=NORMAL is plenty to commit hundreds of rows on
+        // any reasonable machine.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // SIGKILL — no chance for graceful close.
+        let _ = child.kill();
+        let _ = child.wait();
+
+        // Reopen and verify.
+        let conn = Connection::open(&tmp).unwrap();
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            integrity, "ok",
+            "DB should be intact after writer SIGKILL during WAL writes"
+        );
+
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM q", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            count > 0,
+            "at least one INSERT should have committed in 200 ms before SIGKILL; got {count}"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+    }
+
+    /// Long-running soak. Spawns an `UpdateWatcher` plus a committer
+    /// thread, lets them run for `HONKER_SOAK_DURATION_SECS` (default
+    /// 3600 = 1 hour), then asserts:
+    ///
+    ///   * `PRAGMA integrity_check` returns "ok"
+    ///   * the watcher observed at least one change per second on
+    ///     average (catches "watcher silently stopped" regressions)
+    ///   * the queue table has at least the expected number of rows
+    ///     (catches "writer silently lost rows" regressions)
+    ///
+    /// `#[ignore]`-d so it doesn't run in normal `cargo test` —
+    /// invoked explicitly by the `Soak` workflow on a nightly cron.
+    /// Set `HONKER_SOAK_DURATION_SECS=10` for a quick local
+    /// smoke-run before pushing soak-relevant changes.
+    #[test]
+    #[ignore]
+    fn soak_watcher_durability() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        let duration_secs: u64 = std::env::var("HONKER_SOAK_DURATION_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3600);
+
+        eprintln!("soak: running for {duration_secs} seconds");
+
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-soak-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+
+        {
+            let conn = Connection::open(&tmp).unwrap();
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA synchronous = NORMAL;
+                 CREATE TABLE q(id INTEGER PRIMARY KEY AUTOINCREMENT, v INTEGER);",
+            )
+            .unwrap();
+        }
+
+        let observed = Arc::new(AtomicU64::new(0));
+        let observed_w = observed.clone();
+        let watcher = UpdateWatcher::spawn(tmp.clone(), move || {
+            observed_w.fetch_add(1, Ordering::Relaxed);
+        });
+
+        // Committer thread. Commits ~100/sec — pacing keeps WAL from
+        // growing unboundedly between checkpoints and gives the
+        // watcher time to actually observe each change.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_w = stop.clone();
+        let tmp_w = tmp.clone();
+        let writer_handle = std::thread::Builder::new()
+            .name("soak-writer".into())
+            .spawn(move || {
+                let conn = Connection::open(&tmp_w).unwrap();
+                let mut i: i64 = 0;
+                while !stop_w.load(Ordering::Acquire) {
+                    conn.execute("INSERT INTO q(v) VALUES (?1)", [i])
+                        .unwrap();
+                    i += 1;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                i
+            })
+            .unwrap();
+
+        // Run the soak.
+        std::thread::sleep(Duration::from_secs(duration_secs));
+
+        // Stop the writer and join.
+        stop.store(true, Ordering::Release);
+        let writes = writer_handle.join().unwrap();
+
+        // Stop the watcher and join. join() returns Err if it
+        // panicked; for a clean soak we expect Ok.
+        let watcher_result = watcher.join();
+        assert!(
+            watcher_result.is_ok(),
+            "watcher thread panicked during soak: {watcher_result:?}"
+        );
+
+        // Verify integrity, row count, and that the watcher observed
+        // a reasonable fraction of the writes.
+        let conn = Connection::open(&tmp).unwrap();
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok", "soak ended with corrupt DB");
+
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM q", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, writes,
+            "row count {count} should match writer's reported {writes}"
+        );
+
+        let observed_count = observed.load(Ordering::Relaxed);
+        // Watcher should see at least 1/sec on average; allow a 50%
+        // floor to absorb scheduling jitter and merged-tick effects.
+        let floor = duration_secs / 2;
+        assert!(
+            observed_count >= floor,
+            "watcher saw only {observed_count} changes in {duration_secs}s; \
+             expected ≥ {floor} (writer committed {writes})"
+        );
+
+        eprintln!(
+            "soak: {duration_secs}s, {writes} writes, {observed_count} observed wakes, integrity ok"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+    }
+
     #[test]
     fn bootstrap_honker_schema_creates_tables_and_index() {
         let conn = mem();

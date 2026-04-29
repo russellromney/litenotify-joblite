@@ -43,6 +43,64 @@ jobs:
           prefix-key: "v1-src-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
       - run: cargo test -p honker-core --release --lib
 
+  rust-core-debug:
+    # Release builds catch most regressions; debug builds catch a
+    # different class — slightly different timing exposes races, and
+    # debug-assertions catch arithmetic and bounds problems that
+    # release builds skip. One ubuntu job is enough.
+    name: rust · honker-core (debug build, ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          prefix-key: "v1-debug-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
+      - run: cargo test -p honker-core --lib
+
+  perf-regression:
+    # Run bench/wal_index_methods and assert mmap-shm is meaningfully
+    # faster than PRAGMA. The threshold is intentionally loose (50×)
+    # — observed delta is ~3000× on real hardware, so anything
+    # within 60× of that means something has fundamentally changed.
+    # Catches "I removed the cached prepared stmt and now PRAGMA is
+    # 5µs/call" or "I broke the mmap reader" — not micro-regressions.
+    name: bench · wal_index_methods (regression check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "bench/wal_index_methods"
+          prefix-key: "v1-bench-${{ hashFiles('bench/wal_index_methods/Cargo.toml', 'bench/wal_index_methods/src/**/*.rs') }}"
+      - name: Run wal_index_methods bench
+        working-directory: bench/wal_index_methods
+        run: cargo run --release | tee /tmp/bench.out
+      - name: Assert mmap-shm beats cached PRAGMA by ≥50×
+        run: |
+          set -euo pipefail
+          # Output lines look like:
+          #   "  shm iChange (safe dual-read + barrier)                             0.6 ns/poll"
+          #   "  PRAGMA data_version via cached prepared stmt                    1543.9 ns/poll"
+          # Extract the numeric ns/poll value from each.
+          SHM=$(awk '/shm iChange \(safe dual-read/ {print $(NF-1)}' /tmp/bench.out)
+          PRAGMA=$(awk '/PRAGMA data_version via cached prepared stmt/ {print $(NF-1)}' /tmp/bench.out)
+          test -n "$SHM"    || { echo "could not parse shm iChange line"; cat /tmp/bench.out; exit 1; }
+          test -n "$PRAGMA" || { echo "could not parse cached PRAGMA line"; cat /tmp/bench.out; exit 1; }
+          python3 -c "
+          shm = float('$SHM')
+          pragma = float('$PRAGMA')
+          ratio = pragma / max(shm, 0.01)
+          print(f'mmap shm iChange: {shm} ns/poll')
+          print(f'cached PRAGMA:    {pragma} ns/poll')
+          print(f'ratio:            {ratio:.0f}x')
+          assert ratio >= 50, f'mmap-shm should be at least 50x faster than cached PRAGMA, got {ratio:.1f}x'
+          "
+
   rust-extension:
     name: rust · honker-extension (build)
     runs-on: ${{ matrix.os }}
