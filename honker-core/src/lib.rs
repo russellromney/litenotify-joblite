@@ -1014,7 +1014,18 @@ mod tests {
     /// watcher thread and inspects the panic payload — no global
     /// panic-hook trickery needed because `UpdateWatcher::join()`
     /// returns the thread's `Result`.
-    #[cfg(any(unix, windows))]
+    ///
+    /// Unix-only. The test triggers replacement via `std::fs::rename`
+    /// over the open SQLite file, which is a normal operation on
+    /// Linux / macOS and the actual scenario the dead-man's switch
+    /// defends against — litestream restore, atomic backup swap, NFS
+    /// remount. On Windows the kernel rejects the rename with
+    /// `ERROR_ACCESS_DENIED` even though SQLite opens with
+    /// `FILE_SHARE_DELETE`, so the test can't trigger the scenario
+    /// it's verifying. Atomic open-file replacement isn't a typical
+    /// Windows pattern in practice; the Windows behavior of the
+    /// dead-man's switch is intentionally untested.
+    #[cfg(unix)]
     #[test]
     fn update_watcher_panics_on_file_replacement() {
         let tmp = std::env::temp_dir().join(format!(
