@@ -1031,21 +1031,30 @@ mod tests {
 
         let watcher = UpdateWatcher::spawn(tmp.clone(), || {});
 
-        // Wait long enough for at least one identity-check tick
-        // (every 100 ms in the loop).
-        std::thread::sleep(Duration::from_millis(150));
+        // The watcher's identity check fires every 100 ticks and each
+        // tick is `sleep(1ms)` — but Windows' default timer
+        // granularity rounds 1 ms sleeps up to ~15 ms, so 100 ticks
+        // there is ~1.5 s rather than ~100 ms. Wait 2 s on each side
+        // so the test is reliable across platforms.
+        std::thread::sleep(Duration::from_millis(2000));
 
-        // Replace the file. Delete + recreate gives the new file a
-        // different inode / file_id, so stat_identity returns a
-        // different value next tick.
-        let _ = std::fs::remove_file(&tmp);
+        // Replace the file. Atomic-rename instead of delete+create so
+        // it works even when SQLite has the destination open
+        // (Windows allows replace-on-rename for files opened with
+        // FILE_SHARE_DELETE, which SQLite uses).
+        let tmp2 = std::env::temp_dir().join(format!(
+            "honker-watcher-replace-new-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp2);
         {
-            let conn = Connection::open(&tmp).unwrap();
+            let conn = Connection::open(&tmp2).unwrap();
             conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
         }
+        std::fs::rename(&tmp2, &tmp).unwrap();
 
         // Wait for the next identity-check tick to fire and panic.
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(2000));
 
         // Stop and join. Should be Err because the thread panicked.
         let result = watcher.join();
