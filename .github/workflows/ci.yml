@@ -440,7 +440,7 @@ jobs:
         run: |
           uv venv .venv
           . .venv/bin/activate
-          uv pip install pytest maturin
+          uv pip install pytest pytest-xdist maturin
           cd packages/honker
           maturin develop --release
       - name: Install Ruby binding dependencies
