@@ -10,6 +10,15 @@ honker ships as a [Rust crate](https://crates.io/crates/honker) (`honker`, plus 
 
 > Experimental. API may change.
 
+## Pre-1.0 cleanup sequence
+
+Current cleanup order: land the green test-gap PR after small review
+cleanup, close the superseded `migrate-to-fcntl` PR, finish the
+`UpdateWatcher` rename across core and bindings, then split the
+remaining follow-ups into binding smoke CI, cross-binding interop,
+Windows fixes, and time-based watcher cadence. Completed roadmap work
+belongs in `CHANGELOG.md`; `ROADMAP.md` should stay future tense.
+
 SQLite is increasingly the database for shipped projects. Those inevitably require pubsub and a task queue. The usual answer is "add Redis + Celery." That works, but it introduces a second datastore with its own backup story, a dual-write problem between your business table and the queue, and the operational overhead of running a broker.
 
 honker takes the approach that if SQLite is the primary datastore, the queue should live in the same file. That means `INSERT INTO orders` and `queue.enqueue(...)` commit in the same transaction. Rollback drops both. The queue is just rows in a table with a partial index.
@@ -224,7 +233,7 @@ The language bindings default to `journal_mode = WAL` because it gives concurren
 
 Idle cost is a single `PRAGMA data_version` query per millisecond per database. Listener count scales for free because the wake signal is a SQLite counter read instead of a polling query.
 
-`SharedWalWatcher` (in `honker-core`) owns the poll thread and fans out to N subscribers via bounded `SyncSender<()>` channels keyed by subscriber id. Each `db.wal_events()` call registers a subscriber and returns a handle whose `Drop` auto-unsubscribes, so a dropped listener causes the bridge thread's `rx.recv() -> Err` and exits cleanly.
+`SharedUpdateWatcher` (in `honker-core`) owns the poll thread and fans out to N subscribers via bounded `SyncSender<()>` channels keyed by subscriber id. Each `db.update_events()` call registers a subscriber and returns a handle whose `Drop` auto-unsubscribes, so a dropped listener causes the bridge thread's `rx.recv() -> Err` and exits cleanly.
 
 ### Queue schema
 

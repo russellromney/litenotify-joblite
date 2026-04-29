@@ -1,8 +1,8 @@
 """Regression tests for the "subscribe-after-first-read" race.
 
-Consumers that (a) snapshot some state and (b) wait on the WAL watcher
-must subscribe to wal_events BEFORE the snapshot. Otherwise a commit
-landing in the window between snapshot and subscribe fires its WAL tick
+Consumers that (a) snapshot some state and (b) wait on the update watcher
+must subscribe to update_events BEFORE the snapshot. Otherwise a commit
+landing in the window between snapshot and subscribe fires its update tick
 to no subscriber, and the consumer parks on its paranoia timeout
 (15s / idle_poll_s) before re-polling.
 
@@ -13,7 +13,7 @@ These tests cover the three iterator/consumer types:
 
 Each test has a structural check (the subscription exists at
 construction / before the first read) and a behavioral check (a commit
-that races the initial snapshot is observed within the stat-poll
+that races the initial snapshot is observed within the update-watcher
 cadence, never the paranoia timeout).
 """
 
@@ -34,32 +34,32 @@ import honker
 def test_listener_subscribes_at_construction(db_path):
     db = honker.open(db_path)
     lst = db.listen("orders")
-    # Eager subscription: the WalEvents handle exists before any
+    # Eager subscription: the UpdateEvents handle exists before any
     # __anext__ call. If someone ever makes this lazy, this test fires.
-    assert lst._wal is not None
-    assert hasattr(lst._wal, "path")
+    assert lst._updates is not None
+    assert hasattr(lst._updates, "path")
 
 
 def test_worker_iter_subscribes_at_construction(db_path):
     db = honker.open(db_path)
     q = db.queue("work")
     it = q.claim("w1")
-    # Eager subscription: _wal is already a WalEvents, not None. Regression
+    # Eager subscription: _updates is already a UpdateEvents, not None. Regression
     # guard for the old "subscribe lazily inside __anext__" bug where a
-    # commit landing between claim_batch() and wal_events() was lost.
-    assert it._wal is not None
-    assert hasattr(it._wal, "path")
+    # commit landing between claim_batch() and update_events() was lost.
+    assert it._updates is not None
+    assert hasattr(it._updates, "path")
 
 
 # ---------------------------------------------------------------------
 # Behavioral: a commit racing the initial snapshot wakes the consumer
-# within the stat-poll cadence, not the paranoia fallback
+# within the update-watcher cadence, not the paranoia fallback
 # ---------------------------------------------------------------------
 
 
 async def test_listener_observes_publish_racing_construction(db_path):
     """A publish landing after Listener.__init__ but before the first
-    __anext__ must be delivered within the stat-poll cadence, not wait
+    __anext__ must be delivered within the update-watcher cadence, not wait
     for the 15s paranoia timeout.
 
     We construct the listener, then publish from a worker thread with
@@ -90,10 +90,10 @@ async def test_listener_observes_publish_racing_construction(db_path):
 
 async def test_worker_iter_observes_enqueue_racing_construction(db_path):
     """An enqueue landing right after q.claim() returns (but before
-    __anext__ is awaited) must be delivered within the WAL cadence.
+    __anext__ is awaited) must be delivered within the update cadence.
 
     Previously `_WorkerQueueIter` subscribed lazily on first
-    claim_batch()==[], so an enqueue in this window fired a WAL tick
+    claim_batch()==[], so an enqueue in this window fired a update tick
     to no subscriber; the worker would park for idle_poll_s (5s
     default) before re-polling. We set idle_poll_s=30 to make the
     regression visible — a failing test times out at 2s rather than
@@ -116,19 +116,19 @@ async def test_worker_iter_observes_enqueue_racing_construction(db_path):
     t.join()
 
     assert job.payload == {"n": 1}
-    # Wake must come via the WAL watcher, not idle_poll_s (30s). If the
+    # Wake must come via the update watcher, not idle_poll_s (30s). If the
     # subscription raced, we'd have timed out at 2s already; the elapsed
     # check is a stronger assertion that we actually wake fast.
     assert elapsed < 1.0, (
         f"worker woke in {elapsed:.2f}s — looks like a fallback poll, "
-        "not a WAL tick"
+        "not a update tick"
     )
     job.ack()
 
 
 async def test_wait_result_observes_save_racing_the_call(db_path):
     """A save_result landing between `wait_result`'s initial check and
-    its wal_events subscribe must not be lost to the 15s paranoia
+    its update_events subscribe must not be lost to the 15s paranoia
     timeout.
 
     We kick off a background thread that saves the result ~50ms after
@@ -153,7 +153,7 @@ async def test_wait_result_observes_save_racing_the_call(db_path):
     t.join()
 
     assert value == {"ok": True}
-    # If we'd raced the subscribe, the save's WAL tick would have
+    # If we'd raced the subscribe, the save's update tick would have
     # fired to no subscriber and we'd be sitting on the 15s paranoia
     # poll. <1s means the WAL wake got through.
     assert elapsed < 1.0, (

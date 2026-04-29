@@ -1,7 +1,7 @@
 """Cross-process wake-latency regression test.
 
 The README's pitch is 'sub-millisecond to low-single-digit-ms wake
-latency, bounded by the 1 ms stat-poll cadence, for commits in OTHER
+latency, bounded by the 1 ms update-watcher cadence, for commits in OTHER
 processes.' This test pins that story in CI so it can't silently
 regress.
 
@@ -100,7 +100,7 @@ def test_cross_process_wake_latency_p99_under_bound(tmp_path):
 
     # Under pytest-xdist parallel load, the subprocess running the
     # listener can get scheduled out for hundreds of ms at a time;
-    # the stat-poll thread doesn't tick, the wake fires late. Using
+    # the update watcher thread doesn't tick, the wake fires late. Using
     # max-of-samples as "p99" means a single outlier from OS
     # scheduling failed the assertion. Use real percentiles: p50
     # and p90. With 30 samples, p90 tolerates up to 3 outliers, which

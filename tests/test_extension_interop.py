@@ -52,12 +52,10 @@ def ext_db_path(tmp_path):
 
 
 @pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
-def test_bootstrap_rejects_non_wal_connection(ext_db_path):
-    """`honker_bootstrap` on a file-backed DB that isn't in WAL mode
-    must fail loudly. Without this, the extension would install tables
-    on a journal_mode=DELETE connection and the user would watch their
-    workers silently never fire (no WAL file = no stat-poll signal).
-    Phase Shakedown (d)."""
+def test_bootstrap_succeeds_on_delete_connection(ext_db_path):
+    """`honker_bootstrap` works before callers opt into WAL mode.
+    The update watcher uses `PRAGMA data_version`, so DELETE-mode
+    databases are still observable."""
     conn = sqlite3.connect(ext_db_path)
     conn.enable_load_extension(True)
     conn.load_extension(_EXT_PATH)

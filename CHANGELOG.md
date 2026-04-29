@@ -1,5 +1,51 @@
 # CHANGELOG
 
+## Unreleased — watcher rename and roadmap cleanup
+
+- Finished the public `WalWatcher` -> `UpdateWatcher` rename in the
+  core-facing bindings. `honker-core` now exposes `UpdateWatcher` and
+  `SharedUpdateWatcher` without deprecated WAL-themed aliases.
+- Updated Python, Node, and Rust binding code to import
+  `SharedUpdateWatcher` directly.
+- Updated package docs, tests, and bench notes to describe the wake
+  path as a PRAGMA-backed update watcher rather than a WAL-file stat
+  watcher.
+- Pruned completed history out of `ROADMAP.md`. Future work remains
+  there; shipped correctness/refactor notes live in this changelog.
+
+## Unreleased — pre-launch correctness sweep
+
+Moved the completed Phase Shakedown items out of the roadmap.
+
+- Fixed subscribe-before-first-read races in listener, queue-claim,
+  and result-wait paths by subscribing to update events before the
+  first state snapshot.
+- Fixed scheduler runner processes that had no local registrations:
+  `Scheduler.run()` now checks persisted scheduler tasks before
+  deciding whether it has work.
+- Fixed scheduler wakeup on register/unregister by emitting a reserved
+  scheduler notification and racing sleeps against update events.
+- Documented listener pruning caveats and scheduler lock
+  pause-tolerance.
+- Kept resource-bound regression coverage for listener churn and many
+  simultaneous listeners.
+
+## Unreleased — binding/core consolidation
+
+- Moved `honker_*` SQL helper registration into `honker-core` so the
+  loadable extension, Python binding, and other wrappers share one SQL
+  surface.
+- Added SQL functions for enqueue, retry, fail, heartbeat, ack,
+  scheduler registration/tick, stream publish/read/offset, result
+  storage, locks, and rate limits.
+- Reworked the Python package into thin context-manager / iterator /
+  async glue over the shared Rust SQL functions.
+- Moved packages into `packages/` as self-contained directories ready
+  for split repositories or submodules.
+- Dropped framework plugins from the maintained package set. Framework
+  integration now belongs in cookbook examples unless real users ask
+  for packaged adapters.
+
 ## Unreleased — task result storage
 
 Workers can now persist a handler's return value, and callers can
@@ -31,9 +77,9 @@ column layout.
 - `Queue.get_result(job_id) -> (found: bool, value: Any)` —
   two-tuple disambiguates "None result saved" from "no result".
 - `Queue.wait_result(job_id, timeout=None) -> value` — async,
-  blocks until saved; wakes on WAL commit so a worker in another
+  blocks until saved; wakes on database update so a worker in another
   process finishing the job gets the caller's attention within the
-  stat-poll cadence. Raises `asyncio.TimeoutError` on expiry.
+  update-watcher cadence. Raises `asyncio.TimeoutError` on expiry.
 - `Queue.sweep_results()` — disk-space reclaim.
 
 ### Worker integration

@@ -22,7 +22,7 @@ If you want to *use* Honker:
 - `attach_honker_functions(conn)` — register every `honker_*` SQL scalar (queues, streams, scheduler, rate limits, locks, results).
 - `bootstrap_honker_schema(conn)` — idempotent DDL for all `_honker_*` tables.
 - `Writer` / `Readers` — single-writer slot + bounded reader pool with blocking and non-blocking acquire.
-- `SharedWalWatcher` — one stat-polling thread per database fanning out to N subscribers.
+- `SharedUpdateWatcher` — one PRAGMA-polling thread per database fanning out to N subscribers.
 - `cron::next_after_unix(expr, from_unix)` — standard 5-field crontab parser + next-fire calculator with local-TZ + DST handling.
 
 ## License

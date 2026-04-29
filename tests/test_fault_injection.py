@@ -44,7 +44,7 @@ def test_corrupted_db_file_raises_on_first_use(tmp_path):
 def test_readonly_directory_raises_clear_error(tmp_path):
     """Opening a DB in a read-only directory must raise — not
     silently fall back to a read-only connection that would then
-    fail mysteriously on the first WAL commit."""
+    fail mysteriously on the first database update."""
     ro_dir = tmp_path / "ro"
     ro_dir.mkdir()
     os.chmod(str(ro_dir), stat.S_IRUSR | stat.S_IXUSR)  # r-x only

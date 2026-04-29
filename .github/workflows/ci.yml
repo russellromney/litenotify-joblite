@@ -37,11 +37,84 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
+      # `writer_killed_mid_workload_leaves_db_consistent` spawns a
+      # Python child writer to test crash-recovery durability. Set
+      # up Python on every OS so the test runs cross-platform.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
           prefix-key: "v1-src-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
       - run: cargo test -p honker-core --release --lib
+
+  rust-core-debug:
+    # Release builds catch most regressions; debug builds catch a
+    # different class — slightly different timing exposes races, and
+    # debug-assertions catch arithmetic and bounds problems that
+    # release builds skip. Run on all three OSes so a Windows-debug-
+    # only race or a macOS-debug-only assertion failure doesn't
+    # slip through.
+    name: rust · honker-core (debug build)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          prefix-key: "v1-debug-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
+      - run: cargo test -p honker-core --lib
+
+  perf-regression:
+    # Run bench/wal_index_methods and assert mmap-shm is meaningfully
+    # faster than PRAGMA. The threshold is intentionally loose (50×)
+    # — observed delta is ~3000× on real hardware, so anything
+    # within 60× of that means something has fundamentally changed.
+    # Catches "I removed the cached prepared stmt and now PRAGMA is
+    # 5µs/call" or "I broke the mmap reader" — not micro-regressions.
+    name: bench · wal_index_methods (regression check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "bench/wal_index_methods"
+          prefix-key: "v1-bench-${{ hashFiles('bench/wal_index_methods/Cargo.toml', 'bench/wal_index_methods/src/**/*.rs') }}"
+      - name: Run wal_index_methods bench
+        working-directory: bench/wal_index_methods
+        run: cargo run --release | tee /tmp/bench.out
+      - name: Assert mmap-shm beats cached PRAGMA by ≥50×
+        run: |
+          set -euo pipefail
+          # Output lines look like:
+          #   "  shm iChange (safe dual-read + barrier)                             0.6 ns/poll"
+          #   "  PRAGMA data_version via cached prepared stmt                    1543.9 ns/poll"
+          # Extract the numeric ns/poll value from each.
+          SHM=$(awk '/shm iChange \(safe dual-read/ {print $(NF-1)}' /tmp/bench.out)
+          PRAGMA=$(awk '/PRAGMA data_version via cached prepared stmt/ {print $(NF-1)}' /tmp/bench.out)
+          test -n "$SHM"    || { echo "could not parse shm iChange line"; cat /tmp/bench.out; exit 1; }
+          test -n "$PRAGMA" || { echo "could not parse cached PRAGMA line"; cat /tmp/bench.out; exit 1; }
+          python3 -c "
+          shm = float('$SHM')
+          pragma = float('$PRAGMA')
+          ratio = pragma / max(shm, 0.01)
+          print(f'mmap shm iChange: {shm} ns/poll')
+          print(f'cached PRAGMA:    {pragma} ns/poll')
+          print(f'ratio:            {ratio:.0f}x')
+          assert ratio >= 50, f'mmap-shm should be at least 50x faster than cached PRAGMA, got {ratio:.1f}x'
+          "
 
   rust-extension:
     name: rust · honker-extension (build)
@@ -176,12 +249,12 @@ jobs:
           else
             . .venv/bin/activate
           fi
-          # macOS runners deadlock under pytest-xdist with the
-          # update-watcher thread (sqlite3 + PyO3 + process forking).
-          # Windows runners haven't been tested under -xdist; play it
-          # safe with -n 1 there too. Force single-process on both.
+          # macOS runners show scheduler outliers under pytest-xdist
+          # with the update-watcher thread (sqlite3 + PyO3 + process
+          # spawning). Windows runners haven't been tested under
+          # xdist; force single-process on both.
           if [ "${{ runner.os }}" = "macOS" ] || [ "${{ runner.os }}" = "Windows" ]; then
-            python -m pytest tests/ -q -n 1 --tb=short
+            python -m pytest tests/ -q -n 0 --tb=short
           else
             python -m pytest tests/ -q --tb=short
           fi
@@ -255,3 +328,126 @@ jobs:
         working-directory: packages/honker-node
         shell: bash
         run: node --test test/cross_lang.js
+
+  binding-smoke:
+    name: binding smoke · ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - binding: honker-rs
+            name: Rust wrapper
+          - binding: honker-go
+            name: Go
+          - binding: honker-cpp
+            name: C++
+          - binding: honker-bun
+            name: Bun
+          - binding: honker-ruby
+            name: Ruby
+          - binding: honker-ex
+            name: Elixir
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          prefix-key: "v1-bindings-${{ matrix.binding }}-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
+
+      - uses: actions/setup-go@v5
+        if: matrix.binding == 'honker-go'
+        with:
+          go-version-file: packages/honker-go/go.mod
+      - uses: mlugg/setup-zig@v2
+        if: matrix.binding == 'honker-cpp'
+      - uses: oven-sh/setup-bun@v2
+        if: matrix.binding == 'honker-bun'
+      - uses: ruby/setup-ruby@v1
+        if: matrix.binding == 'honker-ruby'
+        with:
+          ruby-version: "3.3"
+      - uses: erlef/setup-beam@v1
+        if: matrix.binding == 'honker-ex'
+        with:
+          otp-version: "27"
+          elixir-version: "1.17"
+
+      - name: Build honker-extension
+        if: matrix.binding != 'honker-rs'
+        run: cargo build --release -p honker-extension
+
+      - name: Rust wrapper
+        if: matrix.binding == 'honker-rs'
+        run: cargo test --manifest-path packages/honker-rs/Cargo.toml
+      - name: Go
+        if: matrix.binding == 'honker-go'
+        working-directory: packages/honker-go
+        run: go test -tags sqlite_load_extension ./...
+      - name: C++
+        if: matrix.binding == 'honker-cpp'
+        working-directory: packages/honker-cpp
+        run: zig build test -Dhonker-ext="${GITHUB_WORKSPACE}/target/release/libhonker_ext.so"
+      - name: Bun
+        if: matrix.binding == 'honker-bun'
+        working-directory: packages/honker-bun
+        run: |
+          bun install --frozen-lockfile
+          bun test
+      - name: Ruby
+        if: matrix.binding == 'honker-ruby'
+        working-directory: packages/honker-ruby
+        run: |
+          bundle install
+          bundle exec ruby -Ilib spec/honker_spec.rb
+          bundle exec ruby -Ilib spec/smoke_spec.rb
+          bundle exec ruby -Ilib spec/parity_spec.rb
+      - name: Elixir
+        if: matrix.binding == 'honker-ex'
+        working-directory: packages/honker-ex
+        run: |
+          mix deps.get
+          mix test
+
+  ruby-python-interop:
+    name: interop · ruby ↔ python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          prefix-key: "v1-ruby-python-interop-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml', 'packages/honker/src/**/*.rs', 'packages/honker/Cargo.toml') }}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - name: Build honker-extension
+        run: cargo build --release -p honker-extension
+      - name: Install Python binding
+        shell: bash
+        run: |
+          uv venv .venv
+          . .venv/bin/activate
+          uv pip install pytest pytest-xdist maturin
+          cd packages/honker
+          maturin develop --release
+      - name: Install Ruby binding dependencies
+        working-directory: packages/honker-ruby
+        run: bundle install
+      - name: Run Ruby ↔ Python interop
+        shell: bash
+        run: |
+          . .venv/bin/activate
+          python -m pytest tests/test_ruby_python_interop.py -q --tb=short

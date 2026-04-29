@@ -136,11 +136,7 @@ pub fn next_after_unix(expr: &str, from_unix: i64) -> Result<i64, String> {
 /// so DST edge cases are reproducible regardless of the host's
 /// timezone. `pub(crate)` because it's a testing seam, not a stable
 /// API — bindings should call `next_after_unix`.
-pub(crate) fn next_after_unix_in_tz<Tz>(
-    expr: &str,
-    from_unix: i64,
-    tz: &Tz,
-) -> Result<i64, String>
+pub(crate) fn next_after_unix_in_tz<Tz>(expr: &str, from_unix: i64, tz: &Tz) -> Result<i64, String>
 where
     Tz: chrono::TimeZone,
 {
@@ -156,7 +152,10 @@ where
             return Err(format!("invalid timestamp: {}", from_unix));
         }
     };
-    let start_naive = local.naive_local().with_second(0).and_then(|d| d.with_nanosecond(0));
+    let start_naive = local
+        .naive_local()
+        .with_second(0)
+        .and_then(|d| d.with_nanosecond(0));
     let Some(start_naive) = start_naive else {
         return Err("failed to truncate to minute".to_string());
     };
