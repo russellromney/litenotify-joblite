@@ -49,7 +49,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -59,25 +59,45 @@ jobs:
           prefix-key: "v1-src-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
       - name: Build loadable extension
         run: cargo build --release -p honker-extension
+      # Windows stock Python ships sqlite without load_extension support.
+      # Use python-build-standalone (via setup-python) which has it.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Sanity-load via Python sqlite3
         shell: bash
         run: |
-          python3 - <<'PY'
+          python - <<'PY'
           import os
           import sqlite3
 
-          ext = None
-          for cand in (
+          # Order matters: dylib (macOS), so (Linux), dll (Windows).
+          # honker-extension's cdylib name is `honker_ext` — Cargo
+          # adds the platform prefix/suffix.
+          candidates = (
               "target/release/libhonker_ext.dylib",
               "target/release/libhonker_ext.so",
-          ):
+              "target/release/honker_ext.dll",
+          )
+          ext = None
+          for cand in candidates:
               if os.path.exists(cand):
-                  ext = cand
+                  ext = os.path.abspath(cand)
                   break
-          assert ext, "extension artifact not found"
+          assert ext, f"extension artifact not found; tried: {candidates}"
+          print(f"loading: {ext}")
 
           conn = sqlite3.connect(":memory:")
-          conn.enable_load_extension(True)
+          # Older Pythons / minimal SQLite builds don't expose
+          # enable_load_extension. Skip with a clear message there.
+          if not hasattr(conn, "enable_load_extension"):
+              print("sqlite3.Connection.enable_load_extension unavailable; skipping load test")
+              raise SystemExit(0)
+          try:
+              conn.enable_load_extension(True)
+          except sqlite3.NotSupportedError:
+              print("sqlite3 was not compiled with load_extension; skipping load test")
+              raise SystemExit(0)
           conn.load_extension(ext)
           conn.execute("SELECT honker_bootstrap()")
           conn.commit()
@@ -95,7 +115,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
@@ -109,15 +129,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install dev deps (uv)
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - name: Create venv + install
+        shell: bash
         run: |
           uv venv .venv
-          . .venv/bin/activate
-          uv pip install pytest pytest-asyncio pytest-xdist maturin
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            VENV_PY=.venv/Scripts/python.exe
+          else
+            VENV_PY=.venv/bin/python
+          fi
+          uv pip install --python "$VENV_PY" pytest pytest-asyncio pytest-xdist maturin
       - name: Build honker-extension
         run: cargo build --release -p honker-extension
       - name: Build PyO3 _honker_native (maturin develop)
@@ -126,15 +150,27 @@ jobs:
         # the pure-Python files; maturin is what compiles + installs
         # the Rust cdylib into the venv's site-packages.
         working-directory: packages/honker
+        shell: bash
         run: |
-          . ../../.venv/bin/activate
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            . ../../.venv/Scripts/activate
+          else
+            . ../../.venv/bin/activate
+          fi
           maturin develop --release
       - name: Run pytest
+        shell: bash
         run: |
-          . .venv/bin/activate
-          # macOS runners deadlock under pytest-xdist with the WAL watcher
-          # thread (sqlite3 + PyO3 + process forking). Force single-process.
-          if [ "${{ matrix.os }}" = "macos-latest" ]; then
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            . .venv/Scripts/activate
+          else
+            . .venv/bin/activate
+          fi
+          # macOS runners deadlock under pytest-xdist with the
+          # update-watcher thread (sqlite3 + PyO3 + process forking).
+          # Windows runners haven't been tested under -xdist; play it
+          # safe with -n 1 there too. Force single-process on both.
+          if [ "${{ runner.os }}" = "macOS" ] || [ "${{ runner.os }}" = "Windows" ]; then
             python -m pytest tests/ -q -n 1 --tb=short
           else
             python -m pytest tests/ -q --tb=short
@@ -146,7 +182,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         node-version: ["20", "22"]
     steps:
       - uses: actions/checkout@v4
@@ -160,28 +196,46 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-      # cross_lang.js spawns `.venv/bin/python` to verify Python ↔ Node
+      # cross_lang.js spawns the venv's python to verify Python ↔ Node
       # share the same .db. So the node job also needs Python with the
       # honker package + _honker_native cdylib installed.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install uv + maturin
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - name: Create venv + build Python extension
+        shell: bash
         run: |
           uv venv .venv
-          . .venv/bin/activate
-          uv pip install maturin
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            VENV_PY=.venv/Scripts/python.exe
+            ACTIVATE=.venv/Scripts/activate
+          else
+            VENV_PY=.venv/bin/python
+            ACTIVATE=.venv/bin/activate
+          fi
+          uv pip install --python "$VENV_PY" maturin
           cd packages/honker
+          . "../../$ACTIVATE"
           maturin develop --release
       - name: Build .node binary
         working-directory: packages/honker-node
+        shell: bash
         run: |
           npm install
           npx napi build --platform --release
-      - name: Test
+      - name: Test (basic — node only)
         working-directory: packages/honker-node
-        run: npm test
+        shell: bash
+        run: node --test test/basic.js
+      - name: Test (cross-language — node ↔ python)
+        # cross_lang.js currently hard-codes `.venv/bin/python` which
+        # doesn't exist on Windows venvs (Windows uses
+        # `.venv/Scripts/python.exe`). Skip on Windows until the test
+        # script learns about the Windows venv layout.
+        if: runner.os != 'Windows'
+        working-directory: packages/honker-node
+        shell: bash
+        run: node --test test/cross_lang.js
