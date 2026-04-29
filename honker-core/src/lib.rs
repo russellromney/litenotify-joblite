@@ -1292,30 +1292,47 @@ while True:
             .spawn()
             .unwrap_or_else(|e| panic!("spawn {python} child writer: {e}"));
 
-        // Wait for the child to commit some rows before the kill.
-        // Has to absorb the slowest-platform interpreter startup
-        // we care about: Windows Python takes ~300-700ms cold
-        // before `import sqlite3` returns. 2 seconds is plenty of
-        // margin while keeping the test fast on unix (where the
-        // process startup is ~50ms).
-        std::thread::sleep(Duration::from_millis(2000));
-
-        // Detect "the child died on its own" — most likely cause
-        // is python failing to import sqlite3, the script
-        // panicking, or some other startup error. Surface that
-        // with the child's stderr rather than the downstream
-        // "got 0 rows" symptom.
-        if let Ok(Some(status)) = child.try_wait() {
-            let mut stderr = String::new();
-            if let Some(mut s) = child.stderr.take() {
-                use std::io::Read;
-                let _ = s.read_to_string(&mut stderr);
+        // Poll the database from a separate connection until we see
+        // at least one committed row. This turns a timing-fragile
+        // "sleep N ms and hope" into a deterministic "kill once
+        // we've observed a commit" — robust across slow-Python
+        // startup on Windows, loaded CI runners, etc.
+        let read_conn = Connection::open(&tmp).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut high_water: i64 = 0;
+        while std::time::Instant::now() < deadline {
+            // Bail early if the child died — surface its stderr
+            // rather than the downstream "got 0 rows" symptom.
+            if let Ok(Some(status)) = child.try_wait() {
+                let mut stderr = String::new();
+                if let Some(mut s) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = s.read_to_string(&mut stderr);
+                }
+                panic!(
+                    "python child exited before kill (status={status:?}); \
+                     stderr: {stderr}"
+                );
             }
-            panic!(
-                "python child exited before kill (status={status:?}); \
-                 stderr: {stderr}"
-            );
+            if let Ok(c) = read_conn
+                .query_row("SELECT count(*) FROM q", [], |r| r.get::<_, i64>(0))
+            {
+                if c > 0 {
+                    high_water = c;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
+        // Drop the read connection before kill so we don't hold any
+        // shared lock when the child's process is reaped.
+        drop(read_conn);
+
+        // Let a few more commits accumulate so we test "lots of
+        // committed transactions, then sudden death" rather than
+        // "exactly one commit" — gives the WAL-replay path
+        // something more interesting to recover.
+        std::thread::sleep(Duration::from_millis(200));
 
         // Hard kill. `Child::kill` sends SIGKILL on unix and
         // `TerminateProcess` on Windows. No chance for graceful
@@ -1349,9 +1366,19 @@ while True:
         let count: i64 = conn
             .query_row("SELECT count(*) FROM q", [], |r| r.get(0))
             .unwrap();
+        // Stronger durability assertion: at least the rows we
+        // observed before kill must still be there. (Likely many
+        // more committed in the +200ms window before the kill —
+        // we're checking the floor, not the exact count.)
+        assert!(
+            count >= high_water,
+            "lost committed rows: observed {high_water} before kill, \
+             only {count} present after reopen"
+        );
         assert!(
             count > 0,
-            "at least one INSERT should have committed in 500 ms before kill; got {count}"
+            "expected the child to commit some rows in the 15s window \
+             before timeout; got {count}"
         );
 
         // Drop the connection before cleanup — Windows can't unlink
