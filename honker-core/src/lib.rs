@@ -375,7 +375,14 @@ impl Readers {
 /// database file has been replaced underneath us (atomic rename,
 /// litestream restore, volume remount).
 ///
-/// Uses the `file-id` crate for stable cross-platform implementation.
+/// Uses the `file-id` crate on unix and windows for stable Rust
+/// support without nightly features. Falls back to `(0, 0)` on other
+/// targets (WASI, Redox, illumos, etc.) — same behavior as the
+/// pre-`file-id` `#[cfg(not(any(unix, windows)))]` branch. Identity
+/// collisions disable replacement detection on those platforms but
+/// the watcher still functions; nobody is known to deploy honker
+/// there today.
+#[cfg(any(unix, windows))]
 fn stat_identity(path: &Path) -> std::io::Result<(u64, u64)> {
     let id = file_id::get_file_id(path)?;
     match id {
@@ -398,6 +405,11 @@ fn stat_identity(path: &Path) -> std::io::Result<(u64, u64)> {
             Ok((volume_serial_number, file_index))
         }
     }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stat_identity(_path: &Path) -> std::io::Result<(u64, u64)> {
+    Ok((0, 0))
 }
 
 /// Read the pager's `data_version` counter via `PRAGMA data_version`.
