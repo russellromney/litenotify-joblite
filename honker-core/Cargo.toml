@@ -17,6 +17,7 @@ name = "honker_core"
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+file-id = "0.2.3"
 parking_lot = "0.12.5"
 rusqlite = { version = "0.39.0", features = ["functions", "hooks"] }
 thiserror = "2.0.18"
