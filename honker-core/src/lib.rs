@@ -391,7 +391,10 @@ fn stat_identity(path: &Path) -> std::io::Result<(u64, u64)> {
             volume_serial_number,
             file_id,
         } => {
-            let file_index = (file_id & 0xFFFFFFFFFFFFFFFF) as u64;
+            // ReFS file_ids are 128 bits and the upper 64 can be
+            // non-zero (NTFS leaves them at 0). XOR-fold so we keep
+            // entropy from both halves rather than truncating.
+            let file_index = ((file_id >> 64) as u64) ^ (file_id as u64);
             Ok((volume_serial_number, file_index))
         }
     }
