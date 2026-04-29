@@ -27,7 +27,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # Windows job verifies the file-id integration on stable Rust
+        # (no nightly-only `windows_by_handle` feature). honker-core's
+        # rusqlite dep enables `bundled` on Windows so no system
+        # SQLite install is required on the runner.
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
         with:

@@ -375,7 +375,15 @@ impl Readers {
 /// database file has been replaced underneath us (atomic rename,
 /// litestream restore, volume remount).
 ///
-/// Uses the `file-id` crate for stable cross-platform implementation.
+/// Uses the `file-id` crate on unix and windows for stable Rust
+/// support without nightly features. Falls back to `(0, 0)` on other
+/// targets (WASI, Redox, illumos, etc.) — same behavior as the
+/// pre-`file-id` `#[cfg(not(any(unix, windows)))]` branch. On those
+/// targets the dead-man's switch is a no-op (every `stat_identity`
+/// returns `(0, 0)` so the equality check never trips); replacement
+/// detection is disabled but the watcher still functions. Nobody is
+/// known to deploy honker there today.
+#[cfg(any(unix, windows))]
 fn stat_identity(path: &Path) -> std::io::Result<(u64, u64)> {
     let id = file_id::get_file_id(path)?;
     match id {
@@ -391,10 +399,22 @@ fn stat_identity(path: &Path) -> std::io::Result<(u64, u64)> {
             volume_serial_number,
             file_id,
         } => {
-            let file_index = (file_id & 0xFFFFFFFFFFFFFFFF) as u64;
+            // ReFS file_ids are 128 bits; NTFS leaves the upper 64
+            // at 0. Either truncation or XOR-fold works in practice
+            // for "did this file get atomically renamed?" since ReFS
+            // file_ids change wholesale on rename. XOR-fold uses
+            // bits from both halves for symmetry; the practical
+            // collision probability is the same as truncation
+            // (~2⁻⁶⁴) and acceptable for this use.
+            let file_index = ((file_id >> 64) as u64) ^ (file_id as u64);
             Ok((volume_serial_number, file_index))
         }
     }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn stat_identity(_path: &Path) -> std::io::Result<(u64, u64)> {
+    Ok((0, 0))
 }
 
 /// Read the pager's `data_version` counter via `PRAGMA data_version`.
@@ -875,6 +895,10 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
+    // Gate to platforms where stat_identity returns real values.
+    // On other targets the function returns (0, 0) for every call,
+    // so the assert_ne! below would fire.
+    #[cfg(any(unix, windows))]
     #[test]
     fn stat_identity_detects_file_replacement() {
         let tmp = std::env::temp_dir().join(format!(
