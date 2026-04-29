@@ -37,6 +37,12 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
+      # `writer_killed_mid_workload_leaves_db_consistent` spawns a
+      # Python child writer to test crash-recovery durability. Set
+      # up Python on every OS so the test runs cross-platform.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
@@ -47,14 +53,23 @@ jobs:
     # Release builds catch most regressions; debug builds catch a
     # different class — slightly different timing exposes races, and
     # debug-assertions catch arithmetic and bounds problems that
-    # release builds skip. One ubuntu job is enough.
-    name: rust · honker-core (debug build, ubuntu)
-    runs-on: ubuntu-latest
+    # release builds skip. Run on all three OSes so a Windows-debug-
+    # only race or a macOS-debug-only assertion failure doesn't
+    # slip through.
+    name: rust · honker-core (debug build)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."

@@ -539,7 +539,18 @@ impl UpdateWatcher {
                         }
                     }
 
-                    // Path 3: stat identity check (dead-man's switch)
+                    // Path 3: stat identity check (dead-man's switch).
+                    //
+                    // Triggers on Linux/macOS scenarios that swap the
+                    // db file out from under us — atomic rename
+                    // (litestream restore), volume remount, NFS
+                    // server restart. On Windows the kernel rejects
+                    // rename-over-open even with `FILE_SHARE_DELETE`,
+                    // so the practical replacement scenarios that
+                    // trigger this on unix don't happen in the same
+                    // way; the dead-man's switch is effectively a
+                    // no-op on Windows. Identity check still runs,
+                    // it just rarely sees a difference.
                     tick += 1;
                     if tick % 100 == 0 {
                         match stat_identity(&db_path) {
@@ -1107,6 +1118,21 @@ mod tests {
             .execute_batch(&format!("PRAGMA journal_mode = {mode};"))
             .unwrap();
 
+        // Verify the mode actually took effect. SQLite returns the
+        // resulting mode from the PRAGMA, but `execute_batch`
+        // discards the result — without this assertion, a silent
+        // fallback (e.g., to `MEMORY` for `:memory:` databases, or
+        // a sticky setting that won't change) would leave the test
+        // green while exercising a different mode entirely.
+        let actual: String = watcher
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            actual.to_ascii_uppercase(),
+            mode.to_ascii_uppercase(),
+            "PRAGMA journal_mode = {mode} silently fell back to {actual}"
+        );
+
         let writer = Connection::open(&tmp).unwrap();
 
         let v0 = poll_data_version(&watcher).unwrap();
@@ -1170,23 +1196,53 @@ mod tests {
 
     /// Crash-recovery / durability test. Spawns a child writer
     /// process (python3, available on every CI runner) that hammers
-    /// the DB with committed inserts. SIGKILLs the child mid-flight,
+    /// the DB with committed inserts. Hard-kills the child mid-flight
+    /// (SIGKILL on unix, `TerminateProcess` via std on Windows),
     /// reopens the DB in the parent, asserts:
     ///
-    ///   1. `PRAGMA integrity_check` returns "ok" (no corruption from
-    ///      the crash-mid-WAL state).
+    ///   1. `PRAGMA integrity_check` returns "ok" (no corruption
+    ///      from the crash-mid-WAL state).
     ///   2. Some rows committed before the kill are still present.
     ///   3. Re-opening the DB succeeds (WAL replay works after a
     ///      hard kill).
     ///
-    /// Unix-only: SIGKILL semantics + python3 + sqlite3 CLI on PATH
-    /// are reliable on Linux/macOS runners and in dev. Windows kill
-    /// behavior on python child processes is more involved and is
-    /// not the durability scenario honker is most exposed to.
-    #[cfg(unix)]
+    /// Cross-platform: `Child::kill` is portable, `python3` and
+    /// `sqlite3.connect` work the same on all three OSes. The
+    /// scenario being tested — process dies with WAL writes
+    /// outstanding — is universal, not unix-specific. Worth running
+    /// on Windows specifically because Windows file-locking
+    /// semantics differ; if `Child::kill` doesn't release the WAL
+    /// + SHM file handles cleanly, the parent's reopen will fail
+    /// and we'll know.
     #[test]
     fn writer_killed_mid_workload_leaves_db_consistent() {
         use std::process::{Command, Stdio};
+
+        // Locate a Python interpreter. setup-python in CI puts both
+        // `python` and `python3` on PATH on every OS; locally
+        // either may be present. Try in order. If neither resolves,
+        // skip with a clear message rather than leaving the test
+        // mysteriously red on a stripped-down dev box.
+        let python = ["python3", "python"]
+            .iter()
+            .find(|cmd| {
+                Command::new(cmd)
+                    .arg("--version")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+            })
+            .map(|s| *s);
+        let Some(python) = python else {
+            eprintln!(
+                "writer_killed_mid_workload_leaves_db_consistent: \
+                 no `python3` or `python` on PATH; skipping (set up Python \
+                 to exercise the crash-recovery path)"
+            );
+            return;
+        };
 
         let tmp = std::env::temp_dir().join(format!(
             "honker-crash-{}",
@@ -1207,9 +1263,12 @@ mod tests {
             .unwrap();
         }
 
-        // Spawn a python3 child that writes committed rows in a tight
-        // loop. Open DB in WAL mode + synchronous=NORMAL to match the
-        // honker default. Each iteration is its own auto-commit txn.
+        // Spawn a Python child that writes committed rows in a tight
+        // loop. Open DB in WAL mode + synchronous=NORMAL to match
+        // honker's default. Each iteration is its own auto-commit
+        // transaction. The path is debug-formatted so quoting is
+        // correct on every platform (Windows backslashes are
+        // escaped, unix paths get safe quoting).
         let writer_script = format!(
             r#"
 import sqlite3
@@ -1225,31 +1284,48 @@ while True:
             path = tmp.to_str().unwrap()
         );
 
-        let mut child = Command::new("python3")
+        let mut child = Command::new(python)
             .arg("-c")
             .arg(&writer_script)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn python3 child writer");
+            .unwrap_or_else(|e| panic!("spawn {python} child writer: {e}"));
 
-        // Let the child accumulate committed rows. 200 ms with
-        // synchronous=NORMAL is plenty to commit hundreds of rows on
-        // any reasonable machine.
-        std::thread::sleep(Duration::from_millis(200));
+        // Let the child accumulate committed rows. 500 ms is a
+        // generous window — Windows process startup is slower than
+        // unix, and `synchronous=NORMAL` may batch fsyncs at
+        // checkpoint boundaries. Plenty of room for at least one
+        // commit before the kill on any reasonable machine.
+        std::thread::sleep(Duration::from_millis(500));
 
-        // SIGKILL — no chance for graceful close.
+        // Hard kill. `Child::kill` sends SIGKILL on unix and
+        // `TerminateProcess` on Windows. No chance for graceful
+        // close — file handles are released by the OS, and any
+        // outstanding writes-since-last-fsync are lost.
         let _ = child.kill();
         let _ = child.wait();
 
-        // Reopen and verify.
-        let conn = Connection::open(&tmp).unwrap();
+        // Reopen and verify. On Windows the OS may take a moment
+        // to fully release the killed process's file locks; a tight
+        // retry loop on the open absorbs that without flaking.
+        let conn = (0..20)
+            .find_map(|i| match Connection::open(&tmp) {
+                Ok(c) => Some(c),
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(50 * (i + 1)));
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                Connection::open(&tmp).expect("reopen after retry budget exhausted")
+            });
         let integrity: String = conn
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
             integrity, "ok",
-            "DB should be intact after writer SIGKILL during WAL writes"
+            "DB should be intact after writer hard-kill during WAL writes"
         );
 
         let count: i64 = conn
@@ -1257,8 +1333,12 @@ while True:
             .unwrap();
         assert!(
             count > 0,
-            "at least one INSERT should have committed in 200 ms before SIGKILL; got {count}"
+            "at least one INSERT should have committed in 500 ms before kill; got {count}"
         );
+
+        // Drop the connection before cleanup — Windows can't unlink
+        // open files. (Linux/macOS tolerate this either way.)
+        drop(conn);
 
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
@@ -1269,14 +1349,30 @@ while True:
     /// thread, lets them run for `HONKER_SOAK_DURATION_SECS` (default
     /// 3600 = 1 hour), then asserts:
     ///
-    ///   * `PRAGMA integrity_check` returns "ok"
-    ///   * the watcher observed at least one change per second on
-    ///     average (catches "watcher silently stopped" regressions)
-    ///   * the queue table has at least the expected number of rows
-    ///     (catches "writer silently lost rows" regressions)
+    ///   * `PRAGMA integrity_check` returns "ok" — DB structurally
+    ///     intact after a long stress.
+    ///   * the queue table has exactly the writer's reported row
+    ///     count — catches "writer silently lost rows" regressions.
+    ///   * the watcher observed at least 10% of the expected wake
+    ///     rate — catches "watcher silently stopped" regressions.
     ///
-    /// `#[ignore]`-d so it doesn't run in normal `cargo test` —
-    /// invoked explicitly by the `Soak` workflow on a nightly cron.
+    /// What this **doesn't** verify (yet): memory / FD / thread
+    /// leaks. Real leak detection would need to read
+    /// `/proc/self/status` (Linux) or equivalent to track VmRSS, FD
+    /// count, and thread count across the soak. Not currently
+    /// implemented; running this manually under `valgrind` /
+    /// `heaptrack` is the substitute. Tracked as a follow-up under
+    /// issue #12.
+    ///
+    /// `#[ignore]`-d so it doesn't run in normal `cargo test` and
+    /// doesn't run in CI at all. Invoke manually:
+    ///
+    /// ```sh
+    /// HONKER_SOAK_DURATION_SECS=600 \
+    ///     cargo test -p honker-core --release --lib \
+    ///         soak_watcher_durability -- --ignored --nocapture
+    /// ```
+    ///
     /// Set `HONKER_SOAK_DURATION_SECS=10` for a quick local
     /// smoke-run before pushing soak-relevant changes.
     #[test]
@@ -1340,9 +1436,16 @@ while True:
         // Run the soak.
         std::thread::sleep(Duration::from_secs(duration_secs));
 
-        // Stop the writer and join.
+        // Stop the writer and join. join() returns Err if the
+        // thread panicked; surface that explicitly rather than the
+        // opaque `unwrap` panic-on-Err message.
         stop.store(true, Ordering::Release);
-        let writes = writer_handle.join().unwrap();
+        let writer_result = writer_handle.join();
+        assert!(
+            writer_result.is_ok(),
+            "writer thread panicked during soak: {writer_result:?}"
+        );
+        let writes = writer_result.unwrap();
 
         // Stop the watcher and join. join() returns Err if it
         // panicked; for a clean soak we expect Ok.
@@ -1369,13 +1472,18 @@ while True:
         );
 
         let observed_count = observed.load(Ordering::Relaxed);
-        // Watcher should see at least 1/sec on average; allow a 50%
-        // floor to absorb scheduling jitter and merged-tick effects.
-        let floor = duration_secs / 2;
+        // The committer commits every 10ms → ~100 wakes/sec
+        // expected. Floor at 10% of that absorbs runner jitter,
+        // merged ticks (multiple commits in one watcher poll), and
+        // initial-warmup time. Anything below this floor means the
+        // watcher silently stalled or fired far below the commit
+        // rate — both real regressions worth catching.
+        let expected = duration_secs * 100;
+        let floor = expected / 10;
         assert!(
             observed_count >= floor,
-            "watcher saw only {observed_count} changes in {duration_secs}s; \
-             expected ≥ {floor} (writer committed {writes})"
+            "watcher saw only {observed_count} wakes in {duration_secs}s; \
+             expected ≥ {floor} (10% of theoretical {expected}; writer committed {writes})"
         );
 
         eprintln!(
