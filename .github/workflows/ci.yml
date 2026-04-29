@@ -122,11 +122,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows verification deferred — `rusqlite`'s
-        # `loadable_extension` feature panics across the FFI boundary
-        # ("panic in a function that cannot unwind") when loaded via
-        # Python's sqlite3 on Windows. Tracked in the follow-up issue.
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -192,13 +188,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows verification deferred — `tempfile.TemporaryDirectory`
-        # cleanup raises `WinError 32: file in use by another process`
-        # because the watcher holds the DB open and Windows can't
-        # unlink open files. Needs a fix in `packages/honker` (close
-        # the watcher before tempdir cleanup, or use
-        # `delete=False`). Tracked in the follow-up issue.
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
@@ -265,13 +255,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows verification deferred — basic.js fails with
-        # `EBUSY: resource busy or locked, unlink` on temp DB cleanup
-        # (same root cause as the python job: watcher holds DB open
-        # and Windows can't unlink open files). cross_lang.js also
-        # hard-codes `.venv/bin/python`. Both need fixes in
-        # `packages/honker-node`. Tracked in the follow-up issue.
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
         node-version: ["20", "22"]
     steps:
       - uses: actions/checkout@v4
@@ -318,16 +302,11 @@ jobs:
       - name: Test (basic — node only)
         working-directory: packages/honker-node
         shell: bash
-        run: node --test test/basic.js
+        run: node --expose-gc --test test/basic.js
       - name: Test (cross-language — node ↔ python)
-        # cross_lang.js currently hard-codes `.venv/bin/python` which
-        # doesn't exist on Windows venvs (Windows uses
-        # `.venv/Scripts/python.exe`). Skip on Windows until the test
-        # script learns about the Windows venv layout.
-        if: runner.os != 'Windows'
         working-directory: packages/honker-node
         shell: bash
-        run: node --test test/cross_lang.js
+        run: node --expose-gc --test test/cross_lang.js
 
   binding-smoke:
     name: binding smoke · ${{ matrix.name }}

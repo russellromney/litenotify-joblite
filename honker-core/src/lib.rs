@@ -617,8 +617,9 @@ impl Drop for UpdateWatcher {
 /// during backpressure is safe. A disconnected subscriber (receiver
 /// dropped) gets pruned on the next wake via `TrySendError::Disconnected`.
 pub struct SharedUpdateWatcher {
-    /// Hold the underlying poll thread alive. Dropping this stops it.
-    _watcher: UpdateWatcher,
+    /// Hold the underlying poll thread alive. Closing or dropping this
+    /// stops it and waits for the thread to exit.
+    watcher: Mutex<Option<UpdateWatcher>>,
     /// Shared with the watcher closure so it can fan out to every
     /// subscriber and prune disconnected ones opportunistically.
     senders: Arc<Mutex<HashMap<u64, SyncSender<()>>>>,
@@ -639,7 +640,7 @@ impl SharedUpdateWatcher {
             });
         });
         Self {
-            _watcher: watcher,
+            watcher: Mutex::new(Some(watcher)),
             senders,
             next_id: AtomicU64::new(0),
         }
@@ -667,9 +668,28 @@ impl SharedUpdateWatcher {
         self.senders.lock().remove(&id);
     }
 
+    /// Disconnect all subscribers and wait for the poll thread to
+    /// exit. Safe to call more than once.
+    pub fn close(&self) -> std::thread::Result<()> {
+        self.senders.lock().clear();
+        match self.watcher.lock().take() {
+            Some(watcher) => watcher.join(),
+            None => Ok(()),
+        }
+    }
+
     /// Current subscriber count. Test/introspection helper.
     pub fn subscriber_count(&self) -> usize {
         self.senders.lock().len()
+    }
+}
+
+impl Drop for SharedUpdateWatcher {
+    fn drop(&mut self) {
+        self.senders.lock().clear();
+        if let Some(watcher) = self.watcher.get_mut().take() {
+            let _ = watcher.join();
+        }
     }
 }
 
