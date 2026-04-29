@@ -249,12 +249,12 @@ jobs:
           else
             . .venv/bin/activate
           fi
-          # macOS runners deadlock under pytest-xdist with the
-          # update-watcher thread (sqlite3 + PyO3 + process forking).
-          # Windows runners haven't been tested under -xdist; play it
-          # safe with -n 1 there too. Force single-process on both.
+          # macOS runners show scheduler outliers under pytest-xdist
+          # with the update-watcher thread (sqlite3 + PyO3 + process
+          # spawning). Windows runners haven't been tested under
+          # xdist; force single-process on both.
           if [ "${{ runner.os }}" = "macOS" ] || [ "${{ runner.os }}" = "Windows" ]; then
-            python -m pytest tests/ -q -n 1 --tb=short
+            python -m pytest tests/ -q -n 0 --tb=short
           else
             python -m pytest tests/ -q --tb=short
           fi
