@@ -77,7 +77,7 @@ def test_claim_batch_throughput_floor(db_path):
 async def test_notify_listener_receive_floor(db_path):
     """100 notifies delivered to a listener must be observed within
     1 second end-to-end. Measured ~4ms on M-series. A 250x slowdown
-    trips. Catches regressions in the listener buffer, WAL watcher
+    trips. Catches regressions in the listener buffer, update watcher
     fanout, or the cross-thread asyncio.Queue bridge."""
     db = honker.open(db_path)
 
@@ -104,6 +104,6 @@ async def test_notify_listener_receive_floor(db_path):
     assert elapsed < 1.0, (
         f"100 notify → listener receive took {elapsed:.3f}s "
         f"(floor: 1.0s). Likely regression in listener polling, "
-        f"WAL watcher fanout, or the asyncio bridge."
+        f"update watcher fanout, or the asyncio bridge."
     )
     assert len(received) == 100

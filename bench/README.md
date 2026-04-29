@@ -9,7 +9,7 @@ uv run python bench/stream_bench.py --n 5000
 
 Standalone Rust crate. Compares `SQLITE_FCNTL_DATA_VERSION`,
 `PRAGMA data_version` (re-prepared and cached), `stat(2)` on `-wal`,
-and direct `mmap` of `-shm` for honker's `WalWatcher` polling.
+and direct `mmap` of `-shm` for honker's `UpdateWatcher` polling.
 Headline: mmap of `-shm` is ~3,000× faster than the current PRAGMA
 path (0.6 ns/poll vs ~2050 ns), and FCNTL alone *does not detect*
 cross-connection commits despite what the docs imply (it returns a

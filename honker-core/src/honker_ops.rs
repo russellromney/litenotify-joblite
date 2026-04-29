@@ -33,42 +33,27 @@ fn to_sql_err<E: std::fmt::Display>(e: E) -> rusqlite::Error {
 /// per-connection: creating the same function twice is a rusqlite
 /// error, so call exactly once per connection.
 pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
-    conn.create_scalar_function(
-        "honker_bootstrap",
-        0,
-        FunctionFlags::SQLITE_UTF8,
-        |ctx| {
-            let db = unsafe { ctx.get_connection() }?;
-            super::bootstrap_honker_schema(&db).map_err(to_sql_err)?;
-            Ok(1i64)
-        },
-    )?;
+    conn.create_scalar_function("honker_bootstrap", 0, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let db = unsafe { ctx.get_connection() }?;
+        super::bootstrap_honker_schema(&db).map_err(to_sql_err)?;
+        Ok(1i64)
+    })?;
 
-    conn.create_scalar_function(
-        "honker_claim_batch",
-        4,
-        FunctionFlags::SQLITE_UTF8,
-        |ctx| {
-            let queue: String = ctx.get(0)?;
-            let worker_id: String = ctx.get(1)?;
-            let n: i64 = ctx.get(2)?;
-            let timeout_s: i64 = ctx.get(3)?;
-            let db = unsafe { ctx.get_connection() }?;
-            claim_batch(&db, &queue, &worker_id, n, timeout_s).map_err(to_sql_err)
-        },
-    )?;
+    conn.create_scalar_function("honker_claim_batch", 4, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let queue: String = ctx.get(0)?;
+        let worker_id: String = ctx.get(1)?;
+        let n: i64 = ctx.get(2)?;
+        let timeout_s: i64 = ctx.get(3)?;
+        let db = unsafe { ctx.get_connection() }?;
+        claim_batch(&db, &queue, &worker_id, n, timeout_s).map_err(to_sql_err)
+    })?;
 
-    conn.create_scalar_function(
-        "honker_ack_batch",
-        2,
-        FunctionFlags::SQLITE_UTF8,
-        |ctx| {
-            let ids_json: String = ctx.get(0)?;
-            let worker_id: String = ctx.get(1)?;
-            let db = unsafe { ctx.get_connection() }?;
-            ack_batch(&db, &ids_json, &worker_id).map_err(to_sql_err)
-        },
-    )?;
+    conn.create_scalar_function("honker_ack_batch", 2, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let ids_json: String = ctx.get(0)?;
+        let worker_id: String = ctx.get(1)?;
+        let db = unsafe { ctx.get_connection() }?;
+        ack_batch(&db, &ids_json, &worker_id).map_err(to_sql_err)
+    })?;
 
     conn.create_scalar_function(
         "honker_sweep_expired",
@@ -197,29 +182,19 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
         },
     )?;
 
-    conn.create_scalar_function(
-        "honker_result_save",
-        3,
-        FunctionFlags::SQLITE_UTF8,
-        |ctx| {
-            let job_id: i64 = ctx.get(0)?;
-            let value: String = ctx.get(1)?;
-            let ttl_s: i64 = ctx.get(2)?;
-            let db = unsafe { ctx.get_connection() }?;
-            result_save(&db, job_id, &value, ttl_s).map_err(to_sql_err)
-        },
-    )?;
+    conn.create_scalar_function("honker_result_save", 3, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let job_id: i64 = ctx.get(0)?;
+        let value: String = ctx.get(1)?;
+        let ttl_s: i64 = ctx.get(2)?;
+        let db = unsafe { ctx.get_connection() }?;
+        result_save(&db, job_id, &value, ttl_s).map_err(to_sql_err)
+    })?;
 
-    conn.create_scalar_function(
-        "honker_result_get",
-        1,
-        FunctionFlags::SQLITE_UTF8,
-        |ctx| {
-            let job_id: i64 = ctx.get(0)?;
-            let db = unsafe { ctx.get_connection() }?;
-            result_get(&db, job_id).map_err(to_sql_err)
-        },
-    )?;
+    conn.create_scalar_function("honker_result_get", 1, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let job_id: i64 = ctx.get(0)?;
+        let db = unsafe { ctx.get_connection() }?;
+        result_get(&db, job_id).map_err(to_sql_err)
+    })?;
 
     conn.create_scalar_function(
         "honker_result_sweep",
@@ -237,89 +212,70 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     // else if `run_at` is not NULL, use that literal; else use
     // `unixepoch()`. `expires` is `unixepoch() + expires` if non-NULL,
     // else NULL (never expires).
-    conn.create_scalar_function(
-        "honker_enqueue",
-        7,
-        FunctionFlags::SQLITE_UTF8,
-        |ctx| {
-            let queue: String = ctx.get(0)?;
-            let payload: String = ctx.get(1)?;
-            let run_at: Option<i64> = ctx.get(2)?;
-            let delay: Option<i64> = ctx.get(3)?;
-            let priority: i64 = ctx.get(4)?;
-            let max_attempts: i64 = ctx.get(5)?;
-            let expires: Option<i64> = ctx.get(6)?;
-            let db = unsafe { ctx.get_connection() }?;
-            enqueue(
-                &db, &queue, &payload, run_at, delay, priority,
-                max_attempts, expires,
-            )
-            .map_err(to_sql_err)
-        },
-    )?;
+    conn.create_scalar_function("honker_enqueue", 7, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let queue: String = ctx.get(0)?;
+        let payload: String = ctx.get(1)?;
+        let run_at: Option<i64> = ctx.get(2)?;
+        let delay: Option<i64> = ctx.get(3)?;
+        let priority: i64 = ctx.get(4)?;
+        let max_attempts: i64 = ctx.get(5)?;
+        let expires: Option<i64> = ctx.get(6)?;
+        let db = unsafe { ctx.get_connection() }?;
+        enqueue(
+            &db,
+            &queue,
+            &payload,
+            run_at,
+            delay,
+            priority,
+            max_attempts,
+            expires,
+        )
+        .map_err(to_sql_err)
+    })?;
 
     // honker_ack(job_id, worker_id) -> 1 if ack'd, 0 if claim expired /
     // not ours.
-    conn.create_scalar_function(
-        "honker_ack",
-        2,
-        FunctionFlags::SQLITE_UTF8,
-        |ctx| {
-            let job_id: i64 = ctx.get(0)?;
-            let worker_id: String = ctx.get(1)?;
-            let db = unsafe { ctx.get_connection() }?;
-            ack(&db, job_id, &worker_id).map_err(to_sql_err)
-        },
-    )?;
+    conn.create_scalar_function("honker_ack", 2, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let job_id: i64 = ctx.get(0)?;
+        let worker_id: String = ctx.get(1)?;
+        let db = unsafe { ctx.get_connection() }?;
+        ack(&db, job_id, &worker_id).map_err(to_sql_err)
+    })?;
 
     // honker_retry(job_id, worker_id, delay_s, error) -> 1 if retried /
     // moved to dead, 0 if not our claim. If attempts >= max_attempts,
     // moves the row to `_honker_dead` instead of flipping it back
     // to pending. Fires a notify on the queue's channel on successful
     // pending-flip (so waiting workers wake).
-    conn.create_scalar_function(
-        "honker_retry",
-        4,
-        FunctionFlags::SQLITE_UTF8,
-        |ctx| {
-            let job_id: i64 = ctx.get(0)?;
-            let worker_id: String = ctx.get(1)?;
-            let delay_s: i64 = ctx.get(2)?;
-            let error: String = ctx.get(3)?;
-            let db = unsafe { ctx.get_connection() }?;
-            retry(&db, job_id, &worker_id, delay_s, &error).map_err(to_sql_err)
-        },
-    )?;
+    conn.create_scalar_function("honker_retry", 4, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let job_id: i64 = ctx.get(0)?;
+        let worker_id: String = ctx.get(1)?;
+        let delay_s: i64 = ctx.get(2)?;
+        let error: String = ctx.get(3)?;
+        let db = unsafe { ctx.get_connection() }?;
+        retry(&db, job_id, &worker_id, delay_s, &error).map_err(to_sql_err)
+    })?;
 
     // honker_fail(job_id, worker_id, error) -> 1 if failed-to-dead, 0 if
     // not our claim.
-    conn.create_scalar_function(
-        "honker_fail",
-        3,
-        FunctionFlags::SQLITE_UTF8,
-        |ctx| {
-            let job_id: i64 = ctx.get(0)?;
-            let worker_id: String = ctx.get(1)?;
-            let error: String = ctx.get(2)?;
-            let db = unsafe { ctx.get_connection() }?;
-            fail(&db, job_id, &worker_id, &error).map_err(to_sql_err)
-        },
-    )?;
+    conn.create_scalar_function("honker_fail", 3, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let job_id: i64 = ctx.get(0)?;
+        let worker_id: String = ctx.get(1)?;
+        let error: String = ctx.get(2)?;
+        let db = unsafe { ctx.get_connection() }?;
+        fail(&db, job_id, &worker_id, &error).map_err(to_sql_err)
+    })?;
 
     // honker_heartbeat(job_id, worker_id, extend_s) -> 1 if extended, 0
     // if not our claim.
-    conn.create_scalar_function(
-        "honker_heartbeat",
-        3,
-        FunctionFlags::SQLITE_UTF8,
-        |ctx| {
-            let job_id: i64 = ctx.get(0)?;
-            let worker_id: String = ctx.get(1)?;
-            let extend_s: i64 = ctx.get(2)?;
-            let db = unsafe { ctx.get_connection() }?;
-            heartbeat(&db, job_id, &worker_id, extend_s).map_err(to_sql_err)
-        },
-    )?;
+    conn.create_scalar_function("honker_heartbeat", 3, FunctionFlags::SQLITE_UTF8, |ctx| {
+        let job_id: i64 = ctx.get(0)?;
+        let worker_id: String = ctx.get(1)?;
+        let extend_s: i64 = ctx.get(2)?;
+        let db = unsafe { ctx.get_connection() }?;
+        heartbeat(&db, job_id, &worker_id, extend_s).map_err(to_sql_err)
+    })?;
 
     // honker_cron_next_after(expr, from_unix) -> unix_ts of next boundary
     // strictly after `from_unix`, minute precision, system local time.
@@ -432,19 +388,16 @@ pub fn claim_batch(
          )
          RETURNING id, queue, payload, worker_id, attempts, claim_expires_at",
     )?;
-    let rows = stmt.query_map(
-        rusqlite::params![worker_id, queue, n, timeout_s],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-            ))
-        },
-    )?;
+    let rows = stmt.query_map(rusqlite::params![worker_id, queue, n, timeout_s], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+        ))
+    })?;
     let mut out = String::from("[");
     let mut first = true;
     for row in rows {
@@ -463,11 +416,7 @@ pub fn claim_batch(
     Ok(out)
 }
 
-pub fn ack_batch(
-    conn: &Connection,
-    ids_json: &str,
-    worker_id: &str,
-) -> rusqlite::Result<i64> {
+pub fn ack_batch(conn: &Connection, ids_json: &str, worker_id: &str) -> rusqlite::Result<i64> {
     let mut stmt = conn.prepare_cached(
         "DELETE FROM _honker_live
          WHERE id IN (SELECT value FROM json_each(?1))
@@ -519,7 +468,14 @@ pub fn enqueue(
            (queue, payload, run_at, priority, max_attempts, expires_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          RETURNING id",
-        rusqlite::params![queue, payload, run_at_val, priority, max_attempts, expires_at],
+        rusqlite::params![
+            queue,
+            payload,
+            run_at_val,
+            priority,
+            max_attempts,
+            expires_at
+        ],
         |r| r.get(0),
     )?;
     // Fire a wake so workers parked on this queue's channel re-poll.
@@ -546,7 +502,7 @@ pub fn ack(conn: &Connection, job_id: i64, worker_id: &str) -> rusqlite::Result<
 /// Retry or fail based on `attempts` vs `max_attempts`. If another
 /// attempt is allowed, flips the row back to `'pending'` with
 /// `run_at = unixepoch() + delay_s` and fires a wake. Otherwise
-    /// DELETEs from `_honker_live` and INSERTs into `_honker_dead`
+/// DELETEs from `_honker_live` and INSERTs into `_honker_dead`
 /// with `last_error=error`.
 ///
 /// Returns 1 if either branch ran, 0 if the claim is no longer valid
@@ -568,10 +524,18 @@ pub fn retry(
                AND claim_expires_at >= unixepoch()
                AND state = 'processing'",
             rusqlite::params![job_id, worker_id],
-            |r| Ok((
-                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?,
-                r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
-            )),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            },
         )
         .ok();
     let Some((id, queue, payload, priority, run_at, max_attempts, attempts, created_at)) = row
@@ -589,8 +553,15 @@ pub fn retry(
                 attempts, last_error, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
-                id, queue, payload, priority, run_at, max_attempts,
-                attempts, error, created_at
+                id,
+                queue,
+                payload,
+                priority,
+                run_at,
+                max_attempts,
+                attempts,
+                error,
+                created_at
             ],
         )?;
     } else {
@@ -606,23 +577,18 @@ pub fn retry(
         // Fire a wake — the row is now claimable again (after the
         // delay), and waiting workers should re-poll.
         let channel = format!("honker:{}", queue);
-    conn.execute(
-        "INSERT INTO _honker_notifications (channel, payload)
+        conn.execute(
+            "INSERT INTO _honker_notifications (channel, payload)
          VALUES (?1, 'new')",
-        rusqlite::params![channel],
-    )?;
+            rusqlite::params![channel],
+        )?;
     }
     Ok(1)
 }
 
 /// Unconditionally move the claim to `_honker_dead` with the given
 /// error. Returns 1 if moved, 0 if not our claim.
-pub fn fail(
-    conn: &Connection,
-    job_id: i64,
-    worker_id: &str,
-    error: &str,
-) -> rusqlite::Result<i64> {
+pub fn fail(conn: &Connection, job_id: i64, worker_id: &str, error: &str) -> rusqlite::Result<i64> {
     #[allow(clippy::type_complexity)]
     let row: Option<(i64, String, String, i64, i64, i64, i64, i64)> = conn
         .query_row(
@@ -632,10 +598,18 @@ pub fn fail(
              RETURNING id, queue, payload, priority, run_at, max_attempts,
                        attempts, created_at",
             rusqlite::params![job_id, worker_id],
-            |r| Ok((
-                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?,
-                r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
-            )),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            },
         )
         .ok();
     let Some((id, queue, payload, priority, run_at, max_attempts, attempts, created_at)) = row
@@ -648,8 +622,15 @@ pub fn fail(
             attempts, last_error, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
-            id, queue, payload, priority, run_at, max_attempts,
-            attempts, error, created_at
+            id,
+            queue,
+            payload,
+            priority,
+            run_at,
+            max_attempts,
+            attempts,
+            error,
+            created_at
         ],
     )?;
     Ok(1)
@@ -693,8 +674,14 @@ pub fn sweep_expired(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
     let rows: Vec<(i64, String, String, i64, i64, i64, i64, i64)> = select
         .query_map(rusqlite::params![queue], |r| {
             Ok((
-                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?,
-                r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -709,9 +696,7 @@ pub fn sweep_expired(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
     )?;
     let count = rows.len() as i64;
     for r in rows {
-        insert.execute(rusqlite::params![
-            r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7
-        ])?;
+        insert.execute(rusqlite::params![r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7])?;
     }
     Ok(count)
 }
@@ -743,14 +728,14 @@ pub fn lock_acquire(
             |r| r.get(0),
         )
         .ok();
-    Ok(if current.as_deref() == Some(owner) { 1 } else { 0 })
+    Ok(if current.as_deref() == Some(owner) {
+        1
+    } else {
+        0
+    })
 }
 
-pub fn lock_release(
-    conn: &Connection,
-    name: &str,
-    owner: &str,
-) -> rusqlite::Result<i64> {
+pub fn lock_release(conn: &Connection, name: &str, owner: &str) -> rusqlite::Result<i64> {
     let deleted = conn.execute(
         "DELETE FROM _honker_locks WHERE name = ?1 AND owner = ?2",
         rusqlite::params![name, owner],
@@ -796,10 +781,7 @@ pub fn rate_limit_try(
     Ok(1)
 }
 
-pub fn rate_limit_sweep(
-    conn: &Connection,
-    older_than_s: i64,
-) -> rusqlite::Result<i64> {
+pub fn rate_limit_sweep(conn: &Connection, older_than_s: i64) -> rusqlite::Result<i64> {
     let deleted = conn.execute(
         "DELETE FROM _honker_rate_limits
          WHERE window_start < unixepoch() - ?1",
@@ -838,7 +820,15 @@ pub fn scheduler_register(
            priority = excluded.priority,
            expires_s = excluded.expires_s,
            next_fire_at = excluded.next_fire_at",
-        rusqlite::params![name, queue, cron_expr, payload, priority, expires_s, next_fire_at],
+        rusqlite::params![
+            name,
+            queue,
+            cron_expr,
+            payload,
+            priority,
+            expires_s,
+            next_fire_at
+        ],
     )?;
     // Wake any sleeping scheduler leader so it re-computes
     // honker_scheduler_soonest() against the new task set. Without
@@ -865,8 +855,8 @@ pub fn scheduler_unregister(conn: &Connection, name: &str) -> rusqlite::Result<i
 }
 
 /// INSERT a row on channel `honker:scheduler` so a sleeping scheduler
-/// leader sitting on `wal_events()` wakes and re-evaluates. Payload
-/// is opaque — the leader doesn't read it, only the WAL tick matters.
+/// leader sitting on `update_events()` wakes and re-evaluates. Payload
+/// is opaque — the leader doesn't read it, only the update tick matters.
 fn scheduler_wake(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO _honker_notifications (channel, payload)
@@ -910,13 +900,7 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
             // Enqueue at this boundary. `run_at` is NULL (claimable
             // immediately); `expires` is the task's expires_s if set.
             let job_id = enqueue(
-                conn,
-                &queue,
-                &payload,
-                None,
-                None,
-                priority,
-                3, /* max_attempts default */
+                conn, &queue, &payload, None, None, priority, 3, /* max_attempts default */
                 expires_s,
             )?;
             if !first {
@@ -987,10 +971,7 @@ pub fn result_save(
     Ok(1)
 }
 
-pub fn result_get(
-    conn: &Connection,
-    job_id: i64,
-) -> rusqlite::Result<Option<String>> {
+pub fn result_get(conn: &Connection, job_id: i64) -> rusqlite::Result<Option<String>> {
     let row: Option<(Option<String>, Option<i64>)> = conn
         .query_row(
             "SELECT value, expires_at FROM _honker_results WHERE job_id = ?1",
@@ -1056,18 +1037,15 @@ pub fn stream_read_since(
          ORDER BY offset ASC
          LIMIT ?3",
     )?;
-    let rows = stmt.query_map(
-        rusqlite::params![topic, offset, limit],
-        |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, i64>(4)?,
-            ))
-        },
-    )?;
+    let rows = stmt.query_map(rusqlite::params![topic, offset, limit], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, i64>(4)?,
+        ))
+    })?;
     let mut out = String::from("[");
     let mut first = true;
     for row in rows {
@@ -1111,11 +1089,7 @@ pub fn stream_save_offset(
     Ok(if changed > 0 { 1 } else { 0 })
 }
 
-pub fn stream_get_offset(
-    conn: &Connection,
-    consumer: &str,
-    topic: &str,
-) -> rusqlite::Result<i64> {
+pub fn stream_get_offset(conn: &Connection, consumer: &str, topic: &str) -> rusqlite::Result<i64> {
     Ok(conn
         .query_row(
             "SELECT offset FROM _honker_stream_consumers

@@ -1,7 +1,7 @@
 //! wal_index_methods — comparing four ways to detect cross-connection
 //! WAL commits from a watcher that does no other SQL.
 //!
-//! Background: honker's `WalWatcher` polls a SQLite database every
+//! Background: honker's `UpdateWatcher` polls a SQLite database every
 //! 1 ms to wake subscribers when a commit lands. The thread holds a
 //! connection but issues no other SQL — only the change-detection
 //! call. This bench measures the four candidate primitives:

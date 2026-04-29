@@ -328,3 +328,126 @@ jobs:
         working-directory: packages/honker-node
         shell: bash
         run: node --test test/cross_lang.js
+
+  binding-smoke:
+    name: binding smoke · ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - binding: honker-rs
+            name: Rust wrapper
+          - binding: honker-go
+            name: Go
+          - binding: honker-cpp
+            name: C++
+          - binding: honker-bun
+            name: Bun
+          - binding: honker-ruby
+            name: Ruby
+          - binding: honker-ex
+            name: Elixir
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          prefix-key: "v1-bindings-${{ matrix.binding }}-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
+
+      - uses: actions/setup-go@v5
+        if: matrix.binding == 'honker-go'
+        with:
+          go-version-file: packages/honker-go/go.mod
+      - uses: mlugg/setup-zig@v2
+        if: matrix.binding == 'honker-cpp'
+      - uses: oven-sh/setup-bun@v2
+        if: matrix.binding == 'honker-bun'
+      - uses: ruby/setup-ruby@v1
+        if: matrix.binding == 'honker-ruby'
+        with:
+          ruby-version: "3.3"
+      - uses: erlef/setup-beam@v1
+        if: matrix.binding == 'honker-ex'
+        with:
+          otp-version: "27"
+          elixir-version: "1.17"
+
+      - name: Build honker-extension
+        if: matrix.binding != 'honker-rs'
+        run: cargo build --release -p honker-extension
+
+      - name: Rust wrapper
+        if: matrix.binding == 'honker-rs'
+        run: cargo test --manifest-path packages/honker-rs/Cargo.toml
+      - name: Go
+        if: matrix.binding == 'honker-go'
+        working-directory: packages/honker-go
+        run: go test -tags sqlite_load_extension ./...
+      - name: C++
+        if: matrix.binding == 'honker-cpp'
+        working-directory: packages/honker-cpp
+        run: zig build test -Dhonker-ext="${GITHUB_WORKSPACE}/target/release/libhonker_ext.so"
+      - name: Bun
+        if: matrix.binding == 'honker-bun'
+        working-directory: packages/honker-bun
+        run: |
+          bun install --frozen-lockfile
+          bun test
+      - name: Ruby
+        if: matrix.binding == 'honker-ruby'
+        working-directory: packages/honker-ruby
+        run: |
+          bundle install
+          bundle exec ruby -Ilib spec/honker_spec.rb
+          bundle exec ruby -Ilib spec/smoke_spec.rb
+          bundle exec ruby -Ilib spec/parity_spec.rb
+      - name: Elixir
+        if: matrix.binding == 'honker-ex'
+        working-directory: packages/honker-ex
+        run: |
+          mix deps.get
+          mix test
+
+  ruby-python-interop:
+    name: interop · ruby ↔ python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          prefix-key: "v1-ruby-python-interop-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml', 'packages/honker/src/**/*.rs', 'packages/honker/Cargo.toml') }}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+      - name: Build honker-extension
+        run: cargo build --release -p honker-extension
+      - name: Install Python binding
+        shell: bash
+        run: |
+          uv venv .venv
+          . .venv/bin/activate
+          uv pip install pytest maturin
+          cd packages/honker
+          maturin develop --release
+      - name: Install Ruby binding dependencies
+        working-directory: packages/honker-ruby
+        run: bundle install
+      - name: Run Ruby ↔ Python interop
+        shell: bash
+        run: |
+          . .venv/bin/activate
+          python -m pytest tests/test_ruby_python_interop.py -q --tb=short

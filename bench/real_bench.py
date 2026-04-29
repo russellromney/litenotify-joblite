@@ -326,7 +326,7 @@ def main():
         type=float,
         default=0.1,
         help="Worker poll interval when the queue is empty. Default 0.1s "
-        "(10 checks/sec). Paranoia fallback only — the WAL watcher wakes "
+        "(10 checks/sec). Paranoia fallback only — the update watcher wakes "
         "workers on every commit from any process, so idle-poll rarely fires."
     )
     ap.add_argument("--queue", default="bench")

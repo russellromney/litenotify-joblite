@@ -380,7 +380,7 @@ async def test_scheduler_wakes_on_new_registration(db_path):
     Phase Shakedown (c).
 
     `honker_scheduler_register` fires a wake on the 'honker:scheduler'
-    channel; the main loop races its timer against wal_events(), so a
+    channel; the main loop races its timer against update_events(), so a
     new registration kicks it out of sleep. Without this, a leader
     scheduled to next wake in an hour would silently miss a task
     registered 1 minute from now until the current sleep ended.
@@ -402,7 +402,7 @@ async def test_scheduler_wakes_on_new_registration(db_path):
     await asyncio.sleep(0.2)  # let the leader enter its sleep
 
     # Inject a "closer" task from a second scheduler on the same DB.
-    # The main loop should wake within the WAL stat-poll cadence.
+    # The main loop should wake within the WAL update-watcher cadence.
     injected = Scheduler(db)
     start = time.monotonic()
     injected.add(

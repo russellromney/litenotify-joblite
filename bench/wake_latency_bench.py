@@ -11,14 +11,14 @@ the watcher has a stable baseline. Then repeats:
   1. Parent spawns a short-lived Python subprocess that opens the
      same file, begins a listener, and waits to see one notification.
      The subprocess prints its READY marker once the listener is
-     blocked on wal_events.
+     blocked on update_events.
   2. Parent waits until READY, records `t0`, commits one
      `tx.notify('wake', ...)`, then reads a single line from the
      subprocess which contains the wake timestamp in ms-since-epoch.
   3. Parent records `dt = wake_ts - t0`.
 
 Repeat N times, report p50 / p90 / p99. On M-series darwin expect
-~1–2 ms p50 (bounded by the 1 ms stat-poll cadence); Linux tends to
+~1–2 ms p50 (bounded by the 1 ms update-watcher cadence); Linux tends to
 run faster.
 
 Run:

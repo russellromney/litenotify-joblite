@@ -1,6 +1,6 @@
 # wal_index_methods — comparing five ways to detect cross-connection WAL commits
 
-Honker's `WalWatcher` polls a SQLite database every 1 ms to wake
+Honker's `UpdateWatcher` polls a SQLite database every 1 ms to wake
 subscribers when a commit lands. The thread holds a connection but
 issues no other SQL — only the change-detection call. This bench
 compares the candidate primitives.

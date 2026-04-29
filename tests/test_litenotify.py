@@ -325,7 +325,7 @@ def test_connection_returned_after_commit_error(db_path):
 
 async def test_slow_wal_consumer_does_not_block_writer(db_path):
     """A slow WAL-event consumer must not backpressure the writer.
-    The shared WalWatcher has bounded per-subscriber buffers; ticks
+    The shared UpdateWatcher has bounded per-subscriber buffers; ticks
     to a slow subscriber are dropped, but the writer path is never
     slowed. Regression against a previous design where listeners
     shared a tokio broadcast ring that could block on a full consumer.
@@ -472,7 +472,7 @@ async def test_busy_channel_does_not_delay_quiet_channel(db_path):
 async def test_listener_drop_allows_clean_reuse(db_path):
     """Creating and dropping many listeners (as SSE reconnects do)
     must cleanly release their WAL-watcher subscriptions. Dropping a
-    WalEvents now unsubscribes its channel from the shared watcher;
+    UpdateEvents now unsubscribes its channel from the shared watcher;
     the bridge thread exits on disconnect."""
     db = honker.open(db_path)
     _make_table(db)
