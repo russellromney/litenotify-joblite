@@ -31,8 +31,12 @@ file-id = "0.2.3"
 # build is self-contained. Linux / macOS keep the system-link path
 # they've used since 0.1 — adding `bundled` everywhere would add
 # ~150k lines of C to every fresh compile for no real win.
+#
+# Cargo unions feature sets across `[dependencies]` and target-cfg
+# blocks, so we only list what's added on Windows here. The Windows
+# resolved feature set is `["functions", "hooks", "bundled"]`.
 [target.'cfg(windows)'.dependencies]
-rusqlite = { version = "0.39.0", features = ["functions", "hooks", "bundled"] }
+rusqlite = { version = "0.39.0", features = ["bundled"] }
 
 [dev-dependencies]
 # chrono-tz only in tests — lets us exercise DST edge cases with a
