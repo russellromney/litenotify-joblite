@@ -151,11 +151,27 @@ tx.execute('INSERT INTO orders (id) VALUES (?)', [42]);
 tx.notify('orders', { id: 42 });
 tx.commit();
 
-// Listen wakes on any commit to the db, filters by channel
-for await (const n of db.listen('orders')) {
-  handle(n.payload);
+// updateEvents wakes on any commit to the db.
+const ev = db.updateEvents();
+let lastSeen = 0;
+while (running) {
+  await ev.next();
+  const rows = db.query(
+    'SELECT id, payload FROM _honker_notifications WHERE id > ? ORDER BY id',
+    [lastSeen],
+  );
+  for (const row of rows) {
+    handle(JSON.parse(row.payload));
+    lastSeen = row.id;
+  }
 }
 ```
+
+Current cross-language direct proof is asymmetric: Python -> Node wake
+through Node `updateEvents()` runs in CI on Linux, macOS, and Windows.
+Node -> Python listener wake is directly proved on Linux and macOS.
+On Windows, the repo currently keeps shared-row interop and close/cleanup
+proof, but not reverse listener parity proof yet.
 
 ### SQLite extension (any SQLite 3.9+ client)
 

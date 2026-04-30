@@ -277,9 +277,9 @@ jobs:
         # thread release their SQLite handles synchronously. Without
         # it, basic.js cleanup hits "EBUSY: resource busy or locked,
         # unlink" on the temp .db file — Windows mandatory locking
-        # rejects unlink while any handle is open. cross_lang.js's
-        # hardcoded `.venv/bin/python` path is fixed below by
-        # branching on runner.os.
+        # rejects unlink while any handle is open. The cross-language
+        # Node tests spawn the repo venv's Python, so we branch on
+        # runner.os below for the venv path.
         os: [ubuntu-latest, macos-latest, windows-latest]
         node-version: ["20", "22"]
     steps:
@@ -294,9 +294,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-      # cross_lang.js spawns the venv's python to verify Python ↔ Node
-      # share the same .db. So the node job also needs Python with the
-      # honker package + _honker_native cdylib installed.
+      # The cross-language Node proof files spawn the venv's Python to
+      # verify Python ↔ Node share the same .db. So the node job also
+      # needs Python with the honker package + _honker_native cdylib
+      # installed.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -328,10 +329,18 @@ jobs:
         working-directory: packages/honker-node
         shell: bash
         run: node --test test/basic.js
-      - name: Test (cross-language — node ↔ python)
+      - name: Test (direct proof — python writes, node updateEvents observes)
         working-directory: packages/honker-node
         shell: bash
-        run: node --test test/cross_lang.js
+        run: node --test test/cross_lang_python_to_node.js
+      - name: Test (direct proof — node writes, python listens)
+        working-directory: packages/honker-node
+        shell: bash
+        run: node --test test/cross_lang_node_to_python.js
+      - name: Test (supporting proof — cross-language shared rows/schema)
+        working-directory: packages/honker-node
+        shell: bash
+        run: node --test test/cross_lang_supporting.js
 
   binding-smoke:
     name: binding smoke · ${{ matrix.name }}
