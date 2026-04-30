@@ -43,3 +43,12 @@ jobs:
           # bucket includes nudges like use-trusted-publishing
           # (we considered and decided against OIDC).
           min-severity: low
+          # Don't upload SARIF to the Security tab. The action
+          # defaults to advanced-security: true, which needs
+          # `security-events: write`; we run with `contents: read`
+          # only on principle, so granting that just for one action
+          # widens the blast radius. Findings show as PR-inline
+          # annotations and in the job log instead — same actionable
+          # info, no extra permission.
+          advanced-security: false
+          annotations: true
