@@ -328,11 +328,6 @@ jobs:
         shell: bash
         run: node --test test/basic.js
       - name: Test (cross-language — node ↔ python)
-        # cross_lang.js currently hard-codes `.venv/bin/python` which
-        # doesn't exist on Windows venvs (Windows uses
-        # `.venv/Scripts/python.exe`). Skip on Windows until the test
-        # script learns about the Windows venv layout.
-        if: runner.os != 'Windows'
         working-directory: packages/honker-node
         shell: bash
         run: node --test test/cross_lang.js
