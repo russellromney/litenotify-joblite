@@ -1,0 +1,45 @@
+name: zizmor · workflow lint
+
+# zizmor audits GitHub Actions workflows for the footguns documented in
+# https://nesbitt.io/2026/04/28/github-actions-is-the-weakest-link.html
+# (pull_request_target on untrusted forks, template injection in run:
+# steps, mutable action references in workflows that hold secrets,
+# excessive default permissions, cache poisoning, etc.).
+#
+# Failing this job blocks the PR — fix the flagged issue or add a
+# zizmor ignore comment with a reason.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      # Watch the zizmor config too — otherwise a PR could weaken
+      # `.github/zizmor.yml` (the file that decides which rules
+      # block) without ever triggering this lint. With the config
+      # path included, any change that touches the policy is gated
+      # by the same lint that enforces it.
+      - ".github/zizmor.yml"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - ".github/zizmor.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: zizmor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@b1d7e1fb5de872772f31590499237e7cce841e8e  # v0.5.3
+        with:
+          # Fail only on actionable findings. The "informational"
+          # bucket includes nudges like use-trusted-publishing
+          # (we considered and decided against OIDC).
+          min-severity: low

@@ -29,28 +29,51 @@ on:
 # Source-tree hash pinning lives per-job (hashFiles() can't run at
 # workflow level before checkout). See ci.yml for context.
 
+# Drop the default-write GITHUB_TOKEN — this workflow publishes via
+# CARGO_REGISTRY_TOKEN (env var below), not the GitHub token. Pure
+# `contents: read` is enough for checkout.
+permissions:
+  contents: read
+
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # Actions are pinned to commit SHAs — this workflow has the
+      # crates.io publish token in scope. A compromised tag (the
+      # tj-actions/changed-files class of attack) on any of these
+      # actions would otherwise be able to exfiltrate the token.
+      # Bump the SHAs intentionally; Dependabot will open PRs.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
-          prefix-key: "v1-src-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
+          # Don't leave the GITHUB_TOKEN in `.git/config` for later
+          # steps to scoop up.
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      # No rust-cache here. Releases run on tag-push (rare), so the
+      # ~60s saved by sharing ci.yml's cache isn't worth the cache-
+      # poisoning surface area: a compromised PR run could populate
+      # an entry that this workflow restores under release context.
 
       - name: Determine crate
         id: crate
+        # Pull `${{ … }}` into env vars first; never expand template
+        # context directly into a shell run: block. (template-injection
+        # mitigation per zizmor.)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_CRATE: ${{ github.event.inputs.crate }}
         shell: bash
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "name=${{ github.event.inputs.crate }}" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.ref }}" == refs/tags/core-v* ]]; then
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "name=$INPUT_CRATE" >> $GITHUB_OUTPUT
+          elif [[ "$REF" == refs/tags/core-v* ]]; then
             echo "name=honker-core" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.ref }}" == refs/tags/ext-v* ]]; then
+          elif [[ "$REF" == refs/tags/ext-v* ]]; then
             echo "name=honker-extension" >> $GITHUB_OUTPUT
           else
-            echo "Unknown tag pattern: ${{ github.ref }}" >&2
+            echo "Unknown tag pattern: $REF" >&2
             exit 1
           fi
 
@@ -60,5 +83,6 @@ jobs:
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CRATE: ${{ steps.crate.outputs.name }}
         run: |
-          cargo publish -p "${{ steps.crate.outputs.name }}"
+          cargo publish -p "$CRATE"
