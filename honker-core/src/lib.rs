@@ -269,9 +269,18 @@ pub fn open_conn(path: &str, install_notify: bool) -> Result<Connection, Error> 
 /// Single-connection write slot. Writers serialize through one
 /// rusqlite `Connection` because WAL mode allows only one writer at a
 /// time anyway; doing it in user space avoids busy-timeout retries.
+///
+/// Provides explicit [`close`](Self::close) so bindings can release the
+/// underlying SQLite handle independent of `Arc<Writer>` reference
+/// count. Without this, an outstanding `Arc<Writer>` clone (kept alive
+/// by a not-yet-GC'd Transaction object on the JS/Python side) would
+/// keep the connection open and the `.db` file locked. On Windows that
+/// blocks `rmdir`/`unlink` of the temp directory until GC runs; on
+/// Linux/macOS the unlink succeeds but the file descriptor leaks.
 pub struct Writer {
     slot: Mutex<Option<Connection>>,
     available: Condvar,
+    closed: AtomicBool,
 }
 
 impl Writer {
@@ -279,31 +288,62 @@ impl Writer {
         Self {
             slot: Mutex::new(Some(conn)),
             available: Condvar::new(),
+            closed: AtomicBool::new(false),
         }
     }
 
     /// Blocking acquire. Waits on a condvar if the slot is held.
-    pub fn acquire(&self) -> Connection {
+    /// Returns `None` if the writer has been [closed](Self::close).
+    pub fn acquire(&self) -> Option<Connection> {
         let mut guard = self.slot.lock();
-        while guard.is_none() {
+        loop {
+            if self.closed.load(Ordering::Acquire) {
+                return None;
+            }
+            if let Some(c) = guard.take() {
+                return Some(c);
+            }
             self.available.wait(&mut guard);
         }
-        guard.take().unwrap()
     }
 
     /// Non-blocking. Returns `Some(conn)` if the slot was immediately
     /// free, else `None`. Bindings use this for a fast path that
     /// avoids GIL release (Python) or async thread-hops (Node) when
-    /// the slot is uncontended.
+    /// the slot is uncontended. Also returns `None` if closed.
     pub fn try_acquire(&self) -> Option<Connection> {
-        let mut guard = self.slot.lock();
-        guard.take()
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        self.slot.lock().take()
     }
 
+    /// Return a connection to the slot. After [close](Self::close), the
+    /// connection is dropped instead of being returned to the pool.
     pub fn release(&self, conn: Connection) {
+        if self.closed.load(Ordering::Acquire) {
+            // Drop conn instead of returning it to a closed pool.
+            return;
+        }
         let mut guard = self.slot.lock();
         *guard = Some(conn);
         self.available.notify_one();
+    }
+
+    /// Drop the underlying connection and refuse further acquisitions.
+    /// Idempotent. Wakes any blocked `acquire()` callers; they observe
+    /// the closed flag and return `None`.
+    ///
+    /// If a transaction is currently holding the connection (i.e. the
+    /// slot is empty), it stays out — the transaction's eventual
+    /// `release` will see `closed == true` and drop the connection
+    /// itself. So the file handle is released either way; what
+    /// matters is that no further writes happen after `close`.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        let mut guard = self.slot.lock();
+        guard.take(); // drops the connection if the slot is occupied
+        self.available.notify_all();
     }
 }
 
@@ -314,12 +354,16 @@ impl Writer {
 /// Bounded pool of reader connections. Readers are cheap (one file
 /// descriptor + a page cache) and WAL mode allows any number to run
 /// concurrently with the writer.
+///
+/// Provides explicit [`close`](Self::close) for the same reason as
+/// [`Writer::close`] — see that doc.
 pub struct Readers {
     pool: Mutex<Vec<Connection>>,
     outstanding: Mutex<usize>,
     available: Condvar,
     path: String,
     max: usize,
+    closed: AtomicBool,
 }
 
 impl Readers {
@@ -330,14 +374,20 @@ impl Readers {
             available: Condvar::new(),
             path,
             max: max.max(1),
+            closed: AtomicBool::new(false),
         }
     }
 
     /// Acquire a reader. Pops a pooled one if available; otherwise
     /// opens a new connection up to `max`. Above `max`, waits on the
-    /// condvar.
+    /// condvar. After [`close`](Self::close), returns
+    /// `Err(rusqlite::Error::ExecuteReturnedResults)` as a sentinel —
+    /// bindings should map this to "Database is closed".
     pub fn acquire(&self) -> Result<Connection, Error> {
         loop {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(closed_err());
+            }
             let mut pool = self.pool.lock();
             if let Some(c) = pool.pop() {
                 return Ok(c);
@@ -347,18 +397,51 @@ impl Readers {
                 *out += 1;
                 drop(out);
                 drop(pool);
-                return open_conn(&self.path, false);
+                let conn = open_conn(&self.path, false)?;
+                // Re-check: if close() raced us, drop the brand-new
+                // connection instead of handing it out.
+                if self.closed.load(Ordering::Acquire) {
+                    drop(conn);
+                    return Err(closed_err());
+                }
+                return Ok(conn);
             }
             drop(out);
             self.available.wait(&mut pool);
         }
     }
 
+    /// Return a connection to the pool. After [close](Self::close), the
+    /// connection is dropped instead of pooled.
     pub fn release(&self, conn: Connection) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
         let mut pool = self.pool.lock();
         pool.push(conn);
         self.available.notify_one();
     }
+
+    /// Drop all pooled connections and refuse further acquisitions.
+    /// Idempotent. Wakes any blocked `acquire()` callers; they observe
+    /// the closed flag and return the closed sentinel.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.pool.lock().clear(); // drops pooled connections
+        self.available.notify_all();
+    }
+}
+
+/// Sentinel error for "pool closed". Bindings can match the inner
+/// `rusqlite::Error::SqliteFailure` with code `SQLITE_MISUSE` and
+/// message containing "Database is closed" to surface a clean error
+/// to user code. `SQLITE_MISUSE` is appropriate here — calling
+/// acquire on a closed pool is a misuse of the API.
+fn closed_err() -> Error {
+    Error::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+        Some("Database is closed".to_string()),
+    ))
 }
 
 // ---------------------------------------------------------------------
@@ -617,8 +700,14 @@ impl Drop for UpdateWatcher {
 /// during backpressure is safe. A disconnected subscriber (receiver
 /// dropped) gets pruned on the next wake via `TrySendError::Disconnected`.
 pub struct SharedUpdateWatcher {
-    /// Hold the underlying poll thread alive. Dropping this stops it.
-    _watcher: UpdateWatcher,
+    /// Hold the underlying poll thread alive. Dropping or
+    /// [`close`](Self::close)ing this stops it. Wrapped in
+    /// `Mutex<Option<...>>` so `close()` can take the watcher out and
+    /// `join()` it synchronously — required to release the watcher's
+    /// read-only `Connection` before a `db.close()` consumer tries to
+    /// `unlink` the database file (Windows: `EBUSY` until every
+    /// handle is dropped).
+    watcher: Mutex<Option<UpdateWatcher>>,
     /// Shared with the watcher closure so it can fan out to every
     /// subscriber and prune disconnected ones opportunistically.
     senders: Arc<Mutex<HashMap<u64, SyncSender<()>>>>,
@@ -639,7 +728,7 @@ impl SharedUpdateWatcher {
             });
         });
         Self {
-            _watcher: watcher,
+            watcher: Mutex::new(Some(watcher)),
             senders,
             next_id: AtomicU64::new(0),
         }
@@ -670,6 +759,34 @@ impl SharedUpdateWatcher {
     /// Current subscriber count. Test/introspection helper.
     pub fn subscriber_count(&self) -> usize {
         self.senders.lock().len()
+    }
+
+    /// Disconnect all subscribers and synchronously join the poll
+    /// thread. The thread owns the watcher's read-only `Connection`;
+    /// joining drops that connection and releases the file handle.
+    /// Idempotent — safe to call more than once.
+    pub fn close(&self) -> std::thread::Result<()> {
+        self.senders.lock().clear();
+        match self.watcher.lock().take() {
+            Some(watcher) => watcher.join(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for SharedUpdateWatcher {
+    fn drop(&mut self) {
+        // Best-effort: signal stop. We don't synchronously join here
+        // because Drop runs from arbitrary contexts (including async
+        // executors) where blocking on a thread join is unsafe.
+        // Bindings that need a synchronous release should call
+        // `close()` explicitly.
+        self.senders.lock().clear();
+        if let Some(watcher) = self.watcher.get_mut().take() {
+            // Dropping UpdateWatcher signals stop; the thread exits
+            // shortly after and its Connection drops then.
+            drop(watcher);
+        }
     }
 }
 
@@ -725,10 +842,61 @@ mod tests {
     #[test]
     fn writer_try_acquire_returns_none_when_held() {
         let w = Writer::new(Connection::open_in_memory().unwrap());
-        let conn = w.acquire();
+        let conn = w.acquire().expect("acquire on fresh Writer");
         assert!(w.try_acquire().is_none());
         w.release(conn);
         assert!(w.try_acquire().is_some());
+    }
+
+    #[test]
+    fn writer_close_drops_idle_connection() {
+        let w = Writer::new(Connection::open_in_memory().unwrap());
+        // Slot is currently occupied (Some(conn)).
+        w.close();
+        // After close, acquire and try_acquire return None even though
+        // a slot was free at close time — the connection was dropped.
+        assert!(w.acquire().is_none());
+        assert!(w.try_acquire().is_none());
+    }
+
+    #[test]
+    fn writer_close_drops_returned_connection() {
+        let w = Writer::new(Connection::open_in_memory().unwrap());
+        let conn = w.acquire().expect("acquire on fresh Writer");
+        // Close while a transaction is "holding" the connection.
+        w.close();
+        // Releasing after close drops the connection (no-op into the
+        // pool); acquire still returns None.
+        w.release(conn);
+        assert!(w.try_acquire().is_none());
+    }
+
+    #[test]
+    fn readers_close_returns_closed_err() {
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-readers-close-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        // Create the file so open_conn succeeds.
+        Connection::open(&tmp)
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode=WAL;")
+            .unwrap();
+
+        let r = Readers::new(tmp.to_string_lossy().into_owned(), 4);
+        // Acquire one to populate the pool indirectly via outstanding count.
+        let c = r.acquire().expect("first acquire");
+        r.release(c);
+        r.close();
+        // After close, acquire returns the closed sentinel.
+        match r.acquire() {
+            Err(Error::Sqlite(rusqlite::Error::SqliteFailure(_, Some(msg)))) => {
+                assert!(msg.contains("Database is closed"));
+            }
+            other => panic!("expected closed err, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
