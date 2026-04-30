@@ -29,7 +29,6 @@ permissions:
 jobs:
   rust-core:
     name: rust · honker-core (lib tests)
-    if: github.head_ref != 'claude/diag-windows-listener' && github.ref != 'refs/heads/claude/diag-windows-listener'
     timeout-minutes: 5
     runs-on: ${{ matrix.os }}
     strategy:
@@ -62,7 +61,6 @@ jobs:
           fi
 
   rust-core-debug:
-    if: github.head_ref != 'claude/diag-windows-listener' && github.ref != 'refs/heads/claude/diag-windows-listener'
     # Release builds catch most regressions; debug builds catch a
     # different class — slightly different timing exposes races, and
     # debug-assertions catch arithmetic and bounds problems that
@@ -97,7 +95,6 @@ jobs:
           fi
 
   perf-regression:
-    if: github.head_ref != 'claude/diag-windows-listener' && github.ref != 'refs/heads/claude/diag-windows-listener'
     # Run bench/wal_index_methods and assert mmap-shm is meaningfully
     # faster than PRAGMA. The threshold is intentionally loose (50×)
     # — observed delta is ~3000× on real hardware, so anything
@@ -139,7 +136,6 @@ jobs:
           "
 
   rust-extension:
-    if: github.head_ref != 'claude/diag-windows-listener' && github.ref != 'refs/heads/claude/diag-windows-listener'
     name: rust · honker-extension (build)
     timeout-minutes: 5
     runs-on: ${{ matrix.os }}
@@ -208,7 +204,6 @@ jobs:
 
   python:
     name: python · honker
-    if: github.head_ref != 'claude/diag-windows-listener' && github.ref != 'refs/heads/claude/diag-windows-listener'
     timeout-minutes: 5
     runs-on: ${{ matrix.os }}
     strategy:
@@ -283,12 +278,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # On the diag branch, only the failing windows × node-22 cell
-        # is interesting; everything else has been validated already
-        # (see PR #22 / phase 002). Restore the full matrix when the
-        # branch is deleted by reverting this commit.
-        os: ${{ (github.head_ref == 'claude/diag-windows-listener' || github.ref == 'refs/heads/claude/diag-windows-listener') && fromJSON('["windows-latest"]') || fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]') }}
-        node-version: ${{ (github.head_ref == 'claude/diag-windows-listener' || github.ref == 'refs/heads/claude/diag-windows-listener') && fromJSON('["22"]') || fromJSON('["20", "22"]') }}
+        # Windows: enabled in #18, which adds Database.close() to the
+        # napi-rs binding so the writer/reader pools and watcher poll
+        # thread release their SQLite handles synchronously. Without
+        # it, basic.js cleanup hits "EBUSY: resource busy or locked,
+        # unlink" on the temp .db file — Windows mandatory locking
+        # rejects unlink while any handle is open. The cross-language
+        # Node tests spawn the repo venv's Python, so we branch on
+        # runner.os below for the venv path.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node-version: ["20", "22"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -350,7 +349,6 @@ jobs:
         run: node --test test/cross_lang_supporting.js
 
   binding-smoke:
-    if: github.head_ref != 'claude/diag-windows-listener' && github.ref != 'refs/heads/claude/diag-windows-listener'
     name: binding smoke · ${{ matrix.name }}
     timeout-minutes: 5
     runs-on: ubuntu-latest
@@ -435,7 +433,6 @@ jobs:
           mix test
 
   ruby-python-interop:
-    if: github.head_ref != 'claude/diag-windows-listener' && github.ref != 'refs/heads/claude/diag-windows-listener'
     name: interop · ruby ↔ python
     timeout-minutes: 5
     runs-on: ubuntu-latest
