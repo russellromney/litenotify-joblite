@@ -235,7 +235,7 @@ jobs:
       - name: Create venv + install
         shell: bash
         run: |
-          uv venv .venv
+          uv venv --python "${{ matrix.python-version }}" .venv
           if [ "${{ runner.os }}" = "Windows" ]; then
             VENV_PY=.venv/Scripts/python.exe
           else
@@ -313,7 +313,7 @@ jobs:
       - name: Create venv + build Python extension
         shell: bash
         run: |
-          uv venv .venv
+          uv venv --python "3.12" .venv
           if [ "${{ runner.os }}" = "Windows" ]; then
             VENV_PY=.venv/Scripts/python.exe
             ACTIVATE=.venv/Scripts/activate
@@ -459,7 +459,7 @@ jobs:
       - name: Install Python binding
         shell: bash
         run: |
-          uv venv .venv
+          uv venv --python "3.12" .venv
           . .venv/bin/activate
           uv pip install pytest pytest-xdist maturin
           cd packages/honker
