@@ -296,11 +296,16 @@ jobs:
           . "../../$ACTIVATE"
           maturin develop --release
       - name: Build .node binary
+        # `npm run build` invokes `napi build … --js native.js` from the
+        # submodule's package.json. Without `--js native.js`, napi-rs
+        # writes its auto-generated CJS loader to `index.js` and clobbers
+        # the hand-written wrapper class, breaking JS-only methods like
+        # `db.listen` (the test failure that brought us here).
         working-directory: packages/honker-node
         shell: bash
         run: |
           npm install
-          npx napi build --platform --release
+          npm run build
       - name: Test (basic — node only)
         working-directory: packages/honker-node
         shell: bash
