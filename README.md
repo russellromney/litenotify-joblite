@@ -151,11 +151,28 @@ tx.execute('INSERT INTO orders (id) VALUES (?)', [42]);
 tx.notify('orders', { id: 42 });
 tx.commit();
 
-// Listen wakes on any commit to the db, filters by channel
-for await (const n of db.listen('orders')) {
-  handle(n.payload);
+// updateEvents wakes on any commit to the db.
+const ev = db.updateEvents();
+let lastSeen = 0;
+while (running) {
+  await ev.next();
+  const rows = db.query(
+    'SELECT id, payload FROM _honker_notifications WHERE id > ? ORDER BY id',
+    [lastSeen],
+  );
+  for (const row of rows) {
+    handle(JSON.parse(row.payload));
+    lastSeen = row.id;
+  }
 }
 ```
+
+Current cross-language direct proof is intended to run on every platform:
+Python -> Node wake through Node `updateEvents()`, and Node -> Python
+listener wake through Python `listen()`. Today, Windows reverse listener
+parity is still a real gap. The CI suite keeps the supporting shared-row
+interop and close/cleanup proofs, but the direct reverse-listener proof
+is allowed to fail until parity is fixed.
 
 ### SQLite extension (any SQLite 3.9+ client)
 

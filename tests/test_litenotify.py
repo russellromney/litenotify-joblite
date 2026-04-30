@@ -6,6 +6,7 @@ and the BEGIN IMMEDIATE concurrency story.
 """
 
 import asyncio
+import gc
 import sqlite3
 import threading
 import time
@@ -479,21 +480,19 @@ async def test_listener_drop_allows_clean_reuse(db_path):
 
     # Churn through 50 short-lived listeners, each consuming one event.
     for i in range(50):
-        got = []
-
-        async def once():
-            async for n in db.listen(f"ch-{i}"):
-                got.append(n.payload)
-                return
-
-        task = asyncio.create_task(once())
-        await asyncio.sleep(0.01)
+        listener = db.listen(f"ch-{i}")
+        task = asyncio.create_task(listener.__anext__())
         with db.transaction() as tx:
             tx.notify(f"ch-{i}", "ok")
-        await asyncio.wait_for(task, timeout=2.0)
-        assert got == ["ok"]
-        # Listener python object goes out of scope here; Drop impl
-        # deregisters the subscriber so the bridge thread exits cleanly.
+        got = await asyncio.wait_for(task, timeout=2.0)
+        assert got.payload == "ok"
+        del task
+        del listener
+        gc.collect()
+        # Explicitly dropping the listener each round makes this test
+        # prove teardown instead of assuming the event loop scheduled
+        # construction quickly enough and CPython reclaimed the object
+        # before the next iteration.
 
 
 def test_pure_sqlite_reader_sees_committed_writes(db_path):
