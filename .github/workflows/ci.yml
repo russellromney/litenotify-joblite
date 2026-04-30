@@ -11,6 +11,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Drop the default-write GITHUB_TOKEN. Only checkout (contents:read)
+# is needed across these jobs. If a job ever needs more, it should
+# request it explicitly at the job level.
+permissions:
+  contents: read
+
 # Swatinem/rust-cache@v2 derives its cache key from Cargo.lock + rustc
 # version by default. That's good for dependency bumps but NOT for edits
 # to .rs files in our own crates — a source-only change produces the same

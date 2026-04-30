@@ -1,0 +1,25 @@
+# zizmor configuration. See https://docs.zizmor.sh/configuration/
+#
+# Two scope decisions worth knowing:
+#
+#  1. ci.yml's actions are NOT SHA-pinned. This is intentional. ci.yml
+#     runs with `permissions: contents: read`, so a compromised action
+#     can't push to the repo or exfiltrate publish secrets — the
+#     blast radius is bounded. Pinning every action to a SHA in a
+#     workflow that runs hundreds of times across PRs would generate
+#     a constant stream of Dependabot bumps for marginal security
+#     gain. release-crates.yml IS pinned because it has the
+#     CARGO_REGISTRY_TOKEN.
+#
+#  2. artipacked (credential persistence in checkout) is similarly
+#     allowed in ci.yml — the persisted token is read-only.
+
+rules:
+  unpinned-uses:
+    ignore:
+      - ci.yml
+      - zizmor.yml
+  artipacked:
+    ignore:
+      - ci.yml
+      - zizmor.yml
