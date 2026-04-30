@@ -41,6 +41,10 @@ def test_corrupted_db_file_raises_on_first_use(tmp_path):
         db.query("SELECT 1")
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX chmod r-x doesn't translate cleanly to Windows ACLs; the dir stays writable to the owning user, so open succeeds. The Unix-side semantic is what we care about.",
+)
 def test_readonly_directory_raises_clear_error(tmp_path):
     """Opening a DB in a read-only directory must raise — not
     silently fall back to a read-only connection that would then

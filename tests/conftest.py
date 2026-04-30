@@ -1,3 +1,4 @@
+import gc
 import os
 import sys
 import tempfile
@@ -16,3 +17,11 @@ if _PACKAGES_ROOT not in sys.path:
 def db_path():
     with tempfile.TemporaryDirectory() as d:
         yield os.path.join(d, "t.db")
+        # Pytest captures test-function locals for failure reporting,
+        # so the test's `db = honker.open(path)` reference can outlive
+        # the test body and delay Database's Drop until after the
+        # `with` exits. On Linux/macOS unlink-while-open hides this;
+        # on Windows tempfile cleanup hits WinError 32.
+        # Force a collection cycle here so Drop runs and releases the
+        # SQLite handles before TemporaryDirectory.__exit__ unlinks.
+        gc.collect()

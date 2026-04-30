@@ -13,7 +13,6 @@ run. Invoke via `pytest -m slow tests/test_soak.py`.
 
 import asyncio
 import os
-import resource
 import sys
 import time
 
@@ -24,7 +23,14 @@ import honker
 
 def _rss_bytes() -> int:
     """Current process RSS in bytes. `ru_maxrss` is in KB on Linux,
-    bytes on macOS — normalize."""
+    bytes on macOS — normalize.
+
+    `resource` is Unix-only; importing it at module top would fail
+    pytest collection on Windows even though every test in this file
+    is `@pytest.mark.slow` and excluded by default. The slow tests
+    don't claim to run on Windows; lazy-import keeps that explicit.
+    """
+    import resource  # noqa: PLC0415 — see docstring
     kb_or_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     if sys.platform == "darwin":
         return kb_or_bytes
