@@ -13,13 +13,14 @@ run. Invoke via `pytest -m slow tests/test_soak.py`.
 
 import asyncio
 import os
-import resource
 import sys
 import time
 
 import pytest
 
 import honker
+
+resource = pytest.importorskip("resource")
 
 
 def _rss_bytes() -> int:

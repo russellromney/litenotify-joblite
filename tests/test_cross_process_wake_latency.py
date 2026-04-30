@@ -102,20 +102,22 @@ def test_cross_process_wake_latency_p99_under_bound(tmp_path):
     # listener can get scheduled out for hundreds of ms at a time;
     # the update watcher thread doesn't tick, the wake fires late. Using
     # max-of-samples as "p99" means a single outlier from OS
-    # scheduling failed the assertion. Use real percentiles: p50
-    # and p90. With 30 samples, p90 tolerates up to 3 outliers, which
-    # is enough to absorb scheduler noise while still catching
-    # anything that shifts the distribution.
+    # scheduling failed the assertion. What we actually care about is
+    # the distribution staying fast while tolerating a tiny number of
+    # scheduler hiccups. So keep the median bound and require that all
+    # but the slowest 3 samples stay under the tail bound.
     p50 = times_ms[int(len(times_ms) * 0.5)]
-    p90 = times_ms[int(len(times_ms) * 0.9)]
     median_bound = 25.0   # real p50 ~= 1-2 ms on M-series
     p90_bound = 100.0     # real p90 rarely exceeds 30 ms
+    allowed_outliers = 3
+    p90ish = times_ms[-(allowed_outliers + 1)]
 
     assert p50 < median_bound, (
         f"cross-process wake p50 = {p50:.2f} ms exceeds {median_bound} ms; "
         f"samples (sorted) = {times_ms}"
     )
-    assert p90 < p90_bound, (
-        f"cross-process wake p90 = {p90:.2f} ms exceeds {p90_bound} ms; "
+    assert p90ish < p90_bound, (
+        f"cross-process wake had more than {allowed_outliers} samples over "
+        f"{p90_bound} ms; slowest retained sample = {p90ish:.2f} ms; "
         f"samples (sorted) = {times_ms}"
     )
