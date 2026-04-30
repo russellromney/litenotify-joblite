@@ -198,13 +198,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows verification deferred — `tempfile.TemporaryDirectory`
-        # cleanup raises `WinError 32: file in use by another process`
-        # because the watcher holds the DB open and Windows can't
-        # unlink open files. Needs a fix in `packages/honker` (close
-        # the watcher before tempdir cleanup, or use
-        # `delete=False`). Tracked in the follow-up issue.
-        os: [ubuntu-latest, macos-latest]
+        # Windows: enabled in #18, which adds Database.close() to the
+        # PyO3 binding so tempfile cleanup releases the watcher's
+        # file handles before unlink. Without it, Windows raises
+        # WinError 32 ("file in use by another process") on tempdir
+        # cleanup. Tests must call db.close() in finally / __exit__
+        # before the tempdir scope ends.
+        os: [ubuntu-latest, macos-latest, windows-latest]
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
@@ -271,13 +271,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows verification deferred — basic.js fails with
-        # `EBUSY: resource busy or locked, unlink` on temp DB cleanup
-        # (same root cause as the python job: watcher holds DB open
-        # and Windows can't unlink open files). cross_lang.js also
-        # hard-codes `.venv/bin/python`. Both need fixes in
-        # `packages/honker-node`. Tracked in the follow-up issue.
-        os: [ubuntu-latest, macos-latest]
+        # Windows: enabled in #18, which adds Database.close() to the
+        # napi-rs binding so the writer/reader pools and watcher poll
+        # thread release their SQLite handles synchronously. Without
+        # it, basic.js cleanup hits "EBUSY: resource busy or locked,
+        # unlink" on the temp .db file — Windows mandatory locking
+        # rejects unlink while any handle is open. cross_lang.js's
+        # hardcoded `.venv/bin/python` path is fixed below by
+        # branching on runner.os.
+        os: [ubuntu-latest, macos-latest, windows-latest]
         node-version: ["20", "22"]
     steps:
       - uses: actions/checkout@v4
