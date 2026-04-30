@@ -35,6 +35,16 @@ import time
 
 import pytest
 
+# Whole-module skip on Windows: `signal.SIGKILL` doesn't exist there
+# (Windows has no fully-equivalent forced-kill that mirrors the
+# kernel-level "process disappears mid-syscall" we want to test).
+# These crash-recovery tests are Unix-specific by their nature; the
+# durability invariant they prove is independent of the kill mechanism.
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="SIGKILL is Unix-only; crash recovery is exercised on linux/macos.",
+)
+
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PACKAGES_ROOT = os.path.join(REPO_ROOT, "packages")

@@ -22,6 +22,16 @@ import time
 
 import pytest
 
+# Windows GitHub-hosted runners can stall a sleeping thread for hundreds
+# of ms under contention. The 1ms watcher poll cadence the test asserts
+# is structurally fine on Windows, but the runner environment makes the
+# tail too noisy for a CI gate. Linux/macOS still enforce it; bench
+# script is the runnable knob if anyone wants Windows numbers.
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="cross-process wake p90 is too noisy on Windows GitHub-hosted runners; gated on linux/macos.",
+)
+
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PACKAGES_ROOT = os.path.join(REPO_ROOT, "packages")
