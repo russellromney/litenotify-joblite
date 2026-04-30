@@ -29,6 +29,7 @@ permissions:
 jobs:
   rust-core:
     name: rust · honker-core (lib tests)
+    timeout-minutes: 5
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -67,6 +68,7 @@ jobs:
     # only race or a macOS-debug-only assertion failure doesn't
     # slip through.
     name: rust · honker-core (debug build)
+    timeout-minutes: 5
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -100,6 +102,7 @@ jobs:
     # Catches "I removed the cached prepared stmt and now PRAGMA is
     # 5µs/call" or "I broke the mmap reader" — not micro-regressions.
     name: bench · wal_index_methods (regression check)
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -134,6 +137,7 @@ jobs:
 
   rust-extension:
     name: rust · honker-extension (build)
+    timeout-minutes: 5
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -200,6 +204,7 @@ jobs:
 
   python:
     name: python · honker
+    timeout-minutes: 5
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -268,6 +273,7 @@ jobs:
 
   node:
     name: node · honker-node
+    timeout-minutes: 5
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -344,6 +350,7 @@ jobs:
 
   binding-smoke:
     name: binding smoke · ${{ matrix.name }}
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -427,6 +434,7 @@ jobs:
 
   ruby-python-interop:
     name: interop · ruby ↔ python
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
