@@ -19,7 +19,7 @@ import honker
 
 def _cleanup_tempdir(path: str) -> None:
     last_err = None
-    attempts = 40 if sys.platform == "win32" else 1
+    attempts = 60 if sys.platform == "win32" else 1
     for i in range(attempts):
         try:
             shutil.rmtree(path)
@@ -34,10 +34,67 @@ def _cleanup_tempdir(path: str) -> None:
             last_err = err
         gc.collect()
         time.sleep(0.05 * (i + 1))
-    if sys.platform == "win32" and last_err is not None:
-        return
     if last_err is not None:
         raise last_err
+
+
+def _track_closeable(resource, closables):
+    if resource is not None and hasattr(resource, "close"):
+        closables.append(resource)
+    return resource
+
+
+def _instrument_database(db, closables):
+    _track_closeable(db, closables)
+
+    real_listen = db.listen
+
+    def listen(*args, **kwargs):
+        return _track_closeable(real_listen(*args, **kwargs), closables)
+
+    db.listen = listen
+
+    real_update_events = db.update_events
+
+    def update_events(*args, **kwargs):
+        return _track_closeable(
+            real_update_events(*args, **kwargs), closables
+        )
+
+    db.update_events = update_events
+
+    real_stream = db.stream
+
+    def stream(*args, **kwargs):
+        stream_obj = real_stream(*args, **kwargs)
+        real_subscribe = stream_obj.subscribe
+
+        def subscribe(*sub_args, **sub_kwargs):
+            return _track_closeable(
+                real_subscribe(*sub_args, **sub_kwargs), closables
+            )
+
+        stream_obj.subscribe = subscribe
+        return stream_obj
+
+    db.stream = stream
+
+    real_queue = db.queue
+
+    def queue(*args, **kwargs):
+        queue_obj = real_queue(*args, **kwargs)
+        real_claim = queue_obj.claim
+
+        def claim(*claim_args, **claim_kwargs):
+            return _track_closeable(
+                real_claim(*claim_args, **claim_kwargs), closables
+            )
+
+        queue_obj.claim = claim
+        return queue_obj
+
+    db.queue = queue
+    return db
 
 
 @pytest.fixture
@@ -51,22 +108,26 @@ def db_path():
 
 @pytest.fixture(autouse=True)
 def close_opened_honker_dbs(monkeypatch):
-    opened = []
+    closables = []
     real_open = honker.open
 
     def tracked_open(*args, **kwargs):
         db = real_open(*args, **kwargs)
-        opened.append(db)
-        return db
+        return _instrument_database(db, closables)
 
     monkeypatch.setattr(honker, "open", tracked_open)
     yield
-    while opened:
-        db = opened.pop()
+    closed = set()
+    while closables:
+        db = closables.pop()
+        ident = id(db)
+        if ident in closed:
+            continue
+        closed.add(ident)
         try:
             db.close()
         except Exception:
             pass
     gc.collect()
     if sys.platform == "win32":
-        time.sleep(0.25)
+        time.sleep(0.5)
