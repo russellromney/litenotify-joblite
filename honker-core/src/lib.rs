@@ -549,6 +549,9 @@ impl UpdateWatcher {
         let handle = std::thread::Builder::new()
             .name("honker-update-poll".into())
             .spawn(move || {
+                // DIAG: trace watcher startup so CI tells us whether the
+                // poll thread actually launched on Windows.
+                eprintln!("[honker-diag] watcher thread starting, path={:?}", db_path);
                 let mut conn = match Connection::open_with_flags(
                     &db_path,
                     OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -563,6 +566,12 @@ impl UpdateWatcher {
                     .as_ref()
                     .and_then(|c| poll_data_version(c).ok())
                     .unwrap_or(0);
+                eprintln!(
+                    "[honker-diag] watcher initial data_version={} (conn={})",
+                    last_version,
+                    conn.is_some()
+                );
+                #[cfg(not(windows))]
                 let initial_identity = match stat_identity(&db_path) {
                     Ok(id) => id,
                     Err(e) => {
@@ -571,6 +580,7 @@ impl UpdateWatcher {
                     }
                 };
                 let mut tick: u64 = 0;
+                let mut diag_tick: u64 = 0;
 
                 while !stop_t.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(1));
@@ -580,6 +590,10 @@ impl UpdateWatcher {
                         match poll_data_version(c) {
                             Ok(version) => {
                                 if version != last_version {
+                                    eprintln!(
+                                        "[honker-diag] watcher: data_version {} -> {} (tick={})",
+                                        last_version, version, tick
+                                    );
                                     last_version = version;
                                     on_change();
                                 }
@@ -608,17 +622,20 @@ impl UpdateWatcher {
 
                     // Path 3: stat identity check (dead-man's switch).
                     //
-                    // Triggers on Linux/macOS scenarios that swap the
-                    // db file out from under us — atomic rename
-                    // (litestream restore), volume remount, NFS
-                    // server restart. On Windows the kernel rejects
+                    // Unix-only: catches atomic-rename / volume remount /
+                    // NFS server restart, all of which silently swap
+                    // the inode while existing handles point at the
+                    // orphaned old file. On Windows the kernel rejects
                     // rename-over-open even with `FILE_SHARE_DELETE`,
-                    // so the practical replacement scenarios that
-                    // trigger this on unix don't happen in the same
-                    // way; the dead-man's switch is effectively a
-                    // no-op on Windows. Identity check still runs,
-                    // it just rarely sees a difference.
+                    // so the scenario this defends against essentially
+                    // can't happen — and we've seen file-id flake on
+                    // Windows under unrelated conditions, so a
+                    // false-positive panic here would silently kill
+                    // the watcher thread and leave listeners stuck
+                    // waiting on an mpsc channel nobody sends on.
+                    // Skip the check entirely on Windows.
                     tick += 1;
+                    #[cfg(not(windows))]
                     if tick % 100 == 0 {
                         match stat_identity(&db_path) {
                             Ok(current) => {
@@ -643,7 +660,19 @@ impl UpdateWatcher {
                             }
                         }
                     }
+
+                    // DIAG: heartbeat every ~500ms so CI shows the
+                    // watcher is alive and what it's seeing. Suppress
+                    // initial-zero quiet to avoid log spam.
+                    diag_tick += 1;
+                    if diag_tick % 500 == 0 {
+                        eprintln!(
+                            "[honker-diag] watcher heartbeat: data_version={} tick={}",
+                            last_version, tick
+                        );
+                    }
                 }
+                eprintln!("[honker-diag] watcher thread exiting, last_version={}", last_version);
             })
             .expect("spawn update-poll thread");
         Self {
