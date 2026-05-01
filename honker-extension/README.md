@@ -38,4 +38,4 @@ Full SQL reference: [honker.dev/reference/extension](https://honker.dev/referenc
 
 ## License
 
-Apache-2.0.
+Dual-licensed under MIT or Apache-2.0, at your option.

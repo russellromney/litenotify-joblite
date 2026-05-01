@@ -155,6 +155,45 @@ native packaging, cancellation semantics, and cross-platform behavior.
 - CI builds and tests on Linux, macOS, and Windows for the supported RIDs
   included in the NuGet package.
 
+## Phase Herd — Bindings Source Of Truth
+
+> After: Phase Ballmer · Before: 1.0 release prep
+
+The current "one repo per binding plus git submodules in the main repo"
+shape made parity work much more expensive than it should be. Future
+binding work should move to a single source-of-truth repo layout, with
+language packages published from one tree.
+
+### Shape
+
+- Keep `honker-core` and `honker-extension` in the main repo.
+- Move maintained bindings back into `packages/` as normal directories,
+  not git submodules.
+- Treat the main repo as the place where cross-binding feature work,
+  docs, parity tests, and releases are coordinated.
+- Publish language packages from the monorepo by subdirectory.
+- If separate public binding repos still matter, make them mirrors or
+  split artifacts, not the primary place humans edit.
+
+### Why
+
+- One feature should be one PR, not a convoy of PRs across many repos.
+- Parity tests belong next to the shared fixtures and shared extension.
+- Release prep becomes much less fragile when submodule SHAs are not part
+  of the work.
+- The current arrangement makes it too easy for one binding to drift in
+  names, docs, CI, or packaging.
+
+### Notes
+
+- "Parity" today mostly means the core database surface: queues,
+  streams, scheduler, `run_at`, deadline wake, and recurring `schedule`
+  naming.
+- Python is still ahead on the higher-level task-runtime layer
+  (`@task`, `@periodic_task`, `TaskResult`, `wait_result`, worker/task
+  registry ergonomics). Other bindings mostly expose the underlying
+  primitives, not that whole product layer yet.
+
 ## Completed — Time-trigger scheduler and wake parity
 
 Shipped in PR #29, with follow-up release prep in PR #33.

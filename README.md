@@ -395,4 +395,5 @@ Python coverage reflects the full honker test suite (~92% of `packages/honker/`)
 
 ## License
 
-Apache 2.0. See [LICENSE](LICENSE).
+Dual-licensed under MIT or Apache-2.0, at your option. See
+`LICENSE`, `LICENSE-APACHE`, and `LICENSE-MIT`.

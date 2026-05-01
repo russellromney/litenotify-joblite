@@ -27,4 +27,4 @@ If you want to *use* Honker:
 
 ## License
 
-Apache-2.0.
+Dual-licensed under MIT or Apache-2.0, at your option.
