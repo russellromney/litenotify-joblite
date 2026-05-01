@@ -6,6 +6,13 @@
 
 honker ships as a [Rust crate](https://crates.io/crates/honker) (`honker`, plus `honker-core`/`honker-extension`), a [SQLite loadable extension](#sqlite-extension-any-sqlite-39-client), and language packages: Python (`honker`), Node (`@russellthehippo/honker-node`), Bun (`@russellthehippo/honker-bun`), Ruby (`honker`), Go, Elixir, C++. The on-disk layout is defined once in Rust; every binding is a thin wrapper around the loadable extension.
 
+Bindings aim for the same core runtime semantics across languages.
+Python currently also carries the richest task-framework layer
+(`@task`, `TaskResult`, worker CLI). Other bindings are closer to
+"excellent thin wrapper over the shared runtime" today; that split is
+intentional until we decide which languages should also grow the richer
+application-facing layer.
+
 `honker` works by replacing application-level polling with a single-digit-µs `PRAGMA data_version` read on the database every 1ms, achieving push-like semantics and cross-process notifications with single-digit-millisecond delivery.
 
 > Experimental. API may change.
