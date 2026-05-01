@@ -283,6 +283,91 @@ observed behavior. Document the results in
 - README + module docs updated with a "behavior matrix" table that
   cites the test name for each cell, so docs and tests can't drift.
 
+## Phase Boundary — Wake-Source Isolation And Independence
+
+> After: Phase Atlas · Before: 1.0 release prep
+
+As honker grows multiple wake/signal sources (DB-update wake via
+`SharedUpdateWatcher`, deadline wake from #29, fallback poll, push
+signals via `notify` rows), each consumer ends up listening on a
+union of them. They should be **independent** — disabling any one
+should leave the others able to carry the load — and there should
+be no double-fire that produces spurious work.
+
+Today's mechanisms appear independent by inspection but no test
+proves it. This phase pins it down with isolation tests.
+
+### Wake topology (current + post-#29)
+
+| source | fires when | mechanism | who consumes |
+|---|---|---|---|
+| DB-update wake | any commit detected | `SharedUpdateWatcher` → bounded channel | every `update_events()` subscriber (Listener, Queue.claim, Stream.subscribe) |
+| Deadline wake (#29) | a known future deadline arrives (delayed `run_at`, expired `claim_expires_at`) | `asyncio.wait_for(timeout=until_deadline)` | Queue.claim worker loop |
+| Fallback poll | nothing else fired in `idle_poll_s` | timer | every async iterator consumer |
+| Push signal | `notify(channel, payload)` was committed | rides on DB-update wake; rows in `_honker_notifications` | `db.listen(channel)` |
+
+### Invariants to prove
+
+1. **No source fires for the wrong reason.** Deadline wake only on
+   deadline expiry, not on commits. DB-update wake only on commits,
+   not on deadlines.
+
+2. **Missing one source doesn't go undetected.** A worker sleeping
+   to deadline T will wake at T even if a commit at T-1 ms's
+   DB-update wake was lost — the deadline wake "masks" the missed
+   wake silently. Correctness is preserved (re-query covers both),
+   but a regression in DB-update wake delivery would be invisible
+   without dedicated tests.
+
+3. **No double-fire causes spurious work.** A commit that lands
+   exactly at a deadline shouldn't run two re-queries (one per
+   source). Cap-1 channel + asyncio.wait_for racing semantics
+   currently behave correctly; pin it with a test.
+
+4. **Sources don't deadlock or starve each other.** A flood of
+   DB-update wakes shouldn't prevent deadline wakes from firing,
+   and vice versa.
+
+### Test approach: isolate one source, prove others carry the load
+
+For each source, mock or disable it and assert the consumer still
+makes progress on a representative workload:
+
+- **DB-update only** — disable deadline wake (no delayed jobs / no
+  pending claims). Worker drains commits via DB-update wake alone.
+  Already covered by existing queue tests in WAL mode; just label
+  them as the "DB-update-only" case.
+
+- **Deadline-only** — mock `SharedUpdateWatcher` to never fire.
+  Workers should wake at delayed-job `run_at` and reclaim
+  `claim_expires_at` deadlines and process work. Uses the existing
+  `idle_poll_s` paranoia poll as the only DB-update fallback.
+
+- **Fallback-poll-only** — mock both DB-update wake AND deadline
+  timer. Worker should still drain queued work, just at
+  `idle_poll_s` cadence. Slow but correct.
+
+- **Push-signal isolation** — `db.listen(channel)` consumer should
+  see notifications without depending on the deadline wake (no
+  deadline applies to listen).
+
+### Verification
+
+- Per-isolation tests pass on Linux and macOS.
+- New cross-process test: writer subprocess + worker subprocess where
+  the worker has each wake source disabled in turn. Worker still
+  drains in every config (with appropriate latency expectations).
+- Documentation in `docs/wake-topology.md` (new) — the table above
+  plus a per-consumer note on which sources they listen to.
+
+### Non-goals
+
+- Don't try to *unify* the sources. They serve different purposes
+  (event-driven vs deadline-driven vs paranoia poll vs in-band
+  notification data). Independence is a feature.
+- Don't add a "source priority" mechanism. Every source can fire;
+  consumers always re-query state on wake; idempotent.
+
 ## Phase Cadence — Time-Based Watcher Ticks
 
 > After: Phase Wake Parity · Before: 1.0 release prep
