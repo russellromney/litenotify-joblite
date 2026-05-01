@@ -183,6 +183,106 @@ For each of `honker-bun`, `honker-go`, `honker-rs`, `honker-ruby`,
   `tests/test_watcher_backends_queue_e2e.py` continue to pass for
   Python; equivalents continue to pass for Node.
 
+## Phase Atlas — Map Experimental Backend Edge-Case Behavior
+
+> After: Phase Echo · Before: 1.0 release prep
+
+The experimental `kernel` and `shm` backends ship with a documented
+contract ("spurious wakes possible, missed wakes possible") plus a
+dead-man's switch for file replacement. That covers the headline
+correctness story but leaves a long tail of edge cases where the
+three backends behave differently. Users opt in to "experimental";
+they deserve tests that characterize *exactly* what they're opting
+in to.
+
+This phase doesn't fix anything — it pins down behavior so users
+know what to expect, and so future regressions are visible.
+
+### Scope: behavioral characterization tests
+
+For each scenario, write a test per backend that asserts the actual
+observed behavior. Document the results in
+`honker-core/src/{kernel,shm}_watcher.rs` module docs + the README
+"Experimental wake backends" section.
+
+1. **Rollback handling** — `BEGIN IMMEDIATE; INSERT; ROLLBACK`.
+   Polling: 0 wakes. SHM: 0 wakes. Kernel: ≥ 1 wake (DELETE mode
+   creates+deletes -journal; WAL mode may write to -wal even on
+   rollback).
+
+2. **Checkpoint wake counts** — `wal_checkpoint(TRUNCATE)` after
+   N committed writes. Count distinct wakes. Polling: 1 (data_version
+   bump). Kernel: ≥ 1 (-wal truncated, -shm modified). SHM: 1
+   (iChange advances).
+
+3. **External non-SQLite writes** — `dd` or `truncate` against the
+   db file. Polling: 0 wakes (data_version unchanged). SHM: 0 wakes
+   (iChange unchanged). Kernel: ≥ 1 wake (filesystem event fires).
+
+4. **Multiple databases in the same directory** — open `db1.db` with
+   kernel watcher, commit to `db2.db` in the same dir. Kernel: spurious
+   wake on db1's watcher. Polling/SHM: no spurious wake.
+
+5. **VACUUM** — VACUUM rewrites the db with a new inode. All three
+   backends should panic via the dead-man's switch ("Restart required").
+   Verify the panic message is identical across backends.
+
+6. **Mid-flight `journal_mode` change** — open in WAL with shm
+   backend, change `PRAGMA journal_mode=DELETE` from another connection.
+   SHM: -shm unlinked → dead-man's switch panics. Polling: keeps
+   working. Kernel: keeps working.
+
+7. **System suspend / hibernate** — hard to test in CI but possible
+   on a developer machine. Document expected behavior:
+   - Polling: resumes correctly.
+   - Kernel: events queued during suspend may be dropped by the OS;
+     missed wakes possible.
+   - SHM: resumes correctly.
+
+8. **Symlink for the db path** — open `/tmp/symlink.db` →
+   `/var/data/real.db`. Polling: works. Kernel: behavior varies by
+   platform — Linux follows by default, macOS may not. SHM: follows
+   to target.
+
+9. **Fork without exec** — spawn a watcher, then `fork()`. Document:
+   not supported; child process should re-open the database with its
+   own watcher. Test that the parent's watcher continues to work.
+
+10. **NFS / SMB / FUSE filesystem** — in CI, mount tmpfs or use a
+    `bindfs` shim to simulate. Polling: works (slow but correct).
+    Kernel: notifications don't fire on remote modifications from
+    other clients — missed wakes from non-local writers. SHM:
+    SQLite WAL is unsupported on network FS, the probe at `open()`
+    should refuse rather than start a broken backend. Add the refusal
+    if not already there.
+
+11. **Crash recovery** — kill the writer mid-INSERT (SIGKILL).
+    Reopen, drive new commits. All three backends should detect
+    post-restart commits. Polling: works (trivially). Kernel/SHM:
+    after the dead-man's switch panic, the watcher needs restart;
+    test that restarting recovers cleanly.
+
+### Non-goals
+
+- Don't *fix* the differences. The contract says "experimental";
+  the tests *characterize* what experimental means. If a behavior
+  is unacceptable, that's a separate phase.
+- Don't add backend-specific de-duplication to make kernel match
+  polling on rollback wakes. That's just rebuilding the conservative
+  version we already nuked.
+- Don't suppress the panic on VACUUM. The user really does need to
+  restart.
+
+### Verification
+
+- One Rust unit test per (backend, scenario) cell, gated on the
+  appropriate Cargo feature. ~30 new tests total.
+- `tests/test_watcher_backends.py` and the Node equivalent get a
+  short cross-language test for the most user-facing differences
+  (rollback, external writes, multi-db).
+- README + module docs updated with a "behavior matrix" table that
+  cites the test name for each cell, so docs and tests can't drift.
+
 ## Phase Cadence — Time-Based Watcher Ticks
 
 > After: Phase Wake Parity · Before: 1.0 release prep
