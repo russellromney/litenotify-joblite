@@ -6,25 +6,12 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Cancel in-progress runs for a branch when a new commit lands.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Drop the default-write GITHUB_TOKEN. Only checkout (contents:read)
-# is needed across these jobs. If a job ever needs more, it should
-# request it explicitly at the job level.
 permissions:
   contents: read
-
-# Swatinem/rust-cache@v2 derives its cache key from Cargo.lock + rustc
-# version by default. That's good for dependency bumps but NOT for edits
-# to .rs files in our own crates — a source-only change produces the same
-# key, which let an older compiled extension stick around under a later
-# commit (caused a real CI false-pass once). Hash core + extension source
-# trees into each job's prefix-key so any source change invalidates the
-# cache. hashFiles() runs after checkout, so the pattern lives per-job
-# rather than at workflow-level (where the workspace isn't populated yet).
 
 jobs:
   rust:
@@ -42,7 +29,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
@@ -65,8 +52,6 @@ jobs:
           fi
       - name: Build loadable extension
         run: cargo build --release -p honker-extension
-      # Windows stock Python ships sqlite without load_extension support.
-      # Use python-build-standalone (via setup-python) which has it.
       - name: Sanity-load via Python sqlite3
         shell: bash
         run: |
@@ -108,12 +93,6 @@ jobs:
           PY
 
   perf-regression:
-    # Run bench/wal_index_methods and assert mmap-shm is meaningfully
-    # faster than PRAGMA. The threshold is intentionally loose (50×)
-    # — observed delta is ~3000× on real hardware, so anything
-    # within 60× of that means something has fundamentally changed.
-    # Catches "I removed the cached prepared stmt and now PRAGMA is
-    # 5µs/call" or "I broke the mmap reader" — not micro-regressions.
     name: bench · wal_index_methods (regression check)
     if: github.event_name != 'pull_request'
     timeout-minutes: 5
@@ -128,16 +107,12 @@ jobs:
       - name: Run wal_index_methods bench
         working-directory: bench/wal_index_methods
         run: cargo run --release | tee /tmp/bench.out
-      - name: Assert mmap-shm beats cached PRAGMA by ≥50×
+      - name: Assert mmap-shm beats cached PRAGMA by >=50x
         run: |
           set -euo pipefail
-          # Output lines look like:
-          #   "  shm iChange (safe dual-read + barrier)                             0.6 ns/poll"
-          #   "  PRAGMA data_version via cached prepared stmt                    1543.9 ns/poll"
-          # Extract the numeric ns/poll value from each.
           SHM=$(awk '/shm iChange \(safe dual-read/ {print $(NF-1)}' /tmp/bench.out)
           PRAGMA=$(awk '/PRAGMA data_version via cached prepared stmt/ {print $(NF-1)}' /tmp/bench.out)
-          test -n "$SHM"    || { echo "could not parse shm iChange line"; cat /tmp/bench.out; exit 1; }
+          test -n "$SHM" || { echo "could not parse shm iChange line"; cat /tmp/bench.out; exit 1; }
           test -n "$PRAGMA" || { echo "could not parse cached PRAGMA line"; cat /tmp/bench.out; exit 1; }
           python3 -c "
           shm = float('$SHM')
@@ -185,19 +160,16 @@ jobs:
       - name: Build honker-extension
         run: cargo build --release -p honker-extension
       - name: Build PyO3 _honker_native (maturin develop)
-        # The `honker` Python package exposes a PyO3 cdylib named
-        # `_honker_native`. setuptools in pyproject.toml only handles
-        # the pure-Python files; maturin is what compiles + installs
-        # the Rust cdylib into the venv's site-packages.
         working-directory: packages/honker
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
             . ../../.venv/Scripts/activate
+            maturin develop --release --features bundled-sqlite
           else
             . ../../.venv/bin/activate
+            maturin develop --release
           fi
-          maturin develop --release
       - name: Run pytest
         shell: bash
         run: |
@@ -206,9 +178,6 @@ jobs:
           else
             . .venv/bin/activate
           fi
-          # Cross-process wake latency tests are scheduler-sensitive;
-          # pytest-xdist adds enough process noise to produce CI-only
-          # outliers. Keep the Python job single-process on every OS.
           python -m pytest tests/ -q -n 0 --tb=short
 
   dotnet:
@@ -266,7 +235,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Need the node submodule + core crate it path-deps.
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -275,20 +243,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-      # The cross-language Node proof files spawn the venv's Python to
-      # verify Python ↔ Node share the same .db. So the node job also
-      # needs Python with the honker package + _honker_native cdylib
-      # installed.
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
       - name: Create venv + build Python extension
         shell: bash
         run: |
-          uv venv --python "3.12" .venv
+          uv venv --python "3.14" .venv
           if [ "${{ runner.os }}" = "Windows" ]; then
             VENV_PY=.venv/Scripts/python.exe
             ACTIVATE=.venv/Scripts/activate
@@ -299,7 +263,11 @@ jobs:
           uv pip install --python "$VENV_PY" maturin
           cd packages/honker
           . "../../$ACTIVATE"
-          maturin develop --release
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            maturin develop --release --features bundled-sqlite
+          else
+            maturin develop --release
+          fi
       - name: Build .node binary
         working-directory: packages/honker-node
         shell: bash
@@ -343,14 +311,14 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: "3.3"
+          ruby-version: "3.4"
       - uses: erlef/setup-beam@v1
         with:
           otp-version: "27"
-          elixir-version: "1.17"
+          elixir-version: "1.19"
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
@@ -359,7 +327,7 @@ jobs:
       - name: Build Python binding
         shell: bash
         run: |
-          uv venv --python "3.12" .venv
+          uv venv --python "3.14" .venv
           . .venv/bin/activate
           uv pip install pytest pytest-xdist maturin
           cd packages/honker
@@ -374,6 +342,8 @@ jobs:
         run: zig build test -Dhonker-ext="${GITHUB_WORKSPACE}/target/release/libhonker_ext.so"
       - name: Bun
         working-directory: packages/honker-bun
+        env:
+          HONKER_EXT_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
         run: |
           bun install --frozen-lockfile
           bun test

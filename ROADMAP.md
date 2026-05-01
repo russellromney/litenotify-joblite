@@ -128,7 +128,7 @@ native packaging, cancellation semantics, and cross-platform behavior.
 - Scheduler add / remove / tick / soonest / run.
 - Canonical `schedule` naming with `cron` kept as a compatibility alias.
 - `@every <n><unit>`, 6-field cron, and delayed `run_at` tests matching
-  PR #29 binding parity.
+  the shipped parity bar from PR #29.
 
 ### Follow-up parity
 
@@ -163,19 +163,19 @@ native packaging, cancellation semantics, and cross-platform behavior.
 - CI builds and tests on Linux, macOS, and Windows for the supported RIDs
   included in the NuGet package.
 
-## Phase Wake Parity — Binding Update Events
+## Completed — Time-trigger scheduler and wake parity
 
-> After: Phase Ballmer · Before: Phase Cadence
+Shipped in PR #29, with follow-up release prep in PR #33.
 
-Make every maintained binding explicit about its wake/listen behavior,
-then converge them on the shared update-event semantics where the host
-runtime can support it.
-
-### Current split
-
-- Python, Node, and Rust use `honker-core::SharedUpdateWatcher`.
-- Go and C++ reimplement the same `PRAGMA data_version` watcher locally.
-- Bun async iterators poll target tables on short timers.
+- `run_at` jobs now wake workers at their deadline instead of waiting
+  for a later fallback poll.
+- Reclaim deadlines now wake sleeping workers on time too.
+- Scheduler expressions now support 5-field cron, 6-field cron, and
+  `@every <n><unit>`.
+- Maintained bindings converged on the same basic time-trigger shape:
+  update wake or next deadline, with fallback polling only as backup.
+- Canonical recurring name is now `schedule`, with legacy `cron` kept
+  as a compatibility alias where needed.
 - Ruby and Elixir expose extension-backed `notify` and table APIs but do
   not yet expose async listen/update-watcher APIs.
 

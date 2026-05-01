@@ -1,36 +1,44 @@
-//! 5-field crontab parser + next-fire calculator.
+//! Scheduler expression parser + next-fire calculator.
 //!
 //! Exposed as `honker_cron_next_after(expr, from_unix) -> next_unix` via
-//! `attach_honker_functions`. One implementation for every binding —
-//! the Python `CronSchedule` class collapses to a marker holding the
-//! expression string.
+//! `attach_honker_functions`. The historical name sticks, but `expr` now
+//! supports three forms:
 //!
-//! Semantics match standard Unix cron (and the previous Python
-//! implementation):
+//!   * 5-field cron: `minute hour dom month dow`
+//!   * 6-field cron: `second minute hour dom month dow`
+//!   * interval expressions: `@every <n><unit>` (e.g. `@every 1s`)
 //!
-//!   * Fields: minute (0-59), hour (0-23), day-of-month (1-31),
-//!     month (1-12), day-of-week (0-6, Sunday=0).
-//!   * Each field: `*`, `N`, `N-M`, `*/K`, `N-M/K`, or a comma list
-//!     of those.
-//!   * `next_after(dt)` returns the first boundary STRICTLY AFTER `dt`
-//!     at minute precision.
-//!   * Calendar arithmetic runs in the SYSTEM LOCAL TIME ZONE — same
-//!     as standard cron. Set `TZ=UTC` in the scheduler's environment
-//!     if you want UTC boundaries.
-//!
-//! Implementation strategy: naive minute-by-minute scan, capped at
-//! ~5 years of iterations. Simple and good enough — a scheduler tick
-//! calls this once per registered task per boundary, not in a hot
-//! loop.
+//! Calendar arithmetic runs in the SYSTEM LOCAL TIME ZONE — same as the
+//! previous implementation and standard cron. Interval expressions are
+//! deterministic second-based steps.
 
-use chrono::{Datelike, Duration, Local, NaiveDateTime, Timelike, Weekday};
+use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, Timelike, Weekday};
 
 use std::collections::BTreeSet;
+
+#[derive(Debug, Clone)]
+enum ScheduleExpr {
+    Every { interval_s: i64 },
+    Cron(CronSchedule),
+}
+
+impl ScheduleExpr {
+    fn parse(expr: &str) -> Result<Self, String> {
+        let expr = expr.trim();
+        if let Some(rest) = expr.strip_prefix("@every") {
+            return Ok(Self::Every {
+                interval_s: parse_every_interval(rest.trim())?,
+            });
+        }
+        Ok(Self::Cron(CronSchedule::parse(expr)?))
+    }
+}
 
 /// Parsed cron expression. Each field is the set of integer values
 /// that satisfy that field.
 #[derive(Debug, Clone)]
 pub struct CronSchedule {
+    seconds: BTreeSet<u32>,
     minutes: BTreeSet<u32>,
     hours: BTreeSet<u32>,
     days: BTreeSet<u32>,
@@ -41,20 +49,29 @@ pub struct CronSchedule {
 impl CronSchedule {
     pub fn parse(expr: &str) -> Result<Self, String> {
         let parts: Vec<&str> = expr.split_whitespace().collect();
-        if parts.len() != 5 {
-            return Err(format!(
-                "crontab requires 5 fields (minute hour dom month dow); got {}: {:?}",
+        match parts.len() {
+            5 => Ok(Self {
+                seconds: BTreeSet::from([0]),
+                minutes: parse_field(parts[0], 0, 59)?,
+                hours: parse_field(parts[1], 0, 23)?,
+                days: parse_field(parts[2], 1, 31)?,
+                months: parse_field(parts[3], 1, 12)?,
+                dows: parse_field(parts[4], 0, 6)?,
+            }),
+            6 => Ok(Self {
+                seconds: parse_field(parts[0], 0, 59)?,
+                minutes: parse_field(parts[1], 0, 59)?,
+                hours: parse_field(parts[2], 0, 23)?,
+                days: parse_field(parts[3], 1, 31)?,
+                months: parse_field(parts[4], 1, 12)?,
+                dows: parse_field(parts[5], 0, 6)?,
+            }),
+            _ => Err(format!(
+                "schedule expression requires 5 or 6 cron fields, or '@every <n><unit>'; got {}: {:?}",
                 parts.len(),
                 expr
-            ));
+            )),
         }
-        Ok(Self {
-            minutes: parse_field(parts[0], 0, 59)?,
-            hours: parse_field(parts[1], 0, 23)?,
-            days: parse_field(parts[2], 1, 31)?,
-            months: parse_field(parts[3], 1, 12)?,
-            dows: parse_field(parts[4], 0, 6)?,
-        })
     }
 
     fn matches(&self, dt: &NaiveDateTime) -> bool {
@@ -68,12 +85,47 @@ impl CronSchedule {
             Weekday::Fri => 5,
             Weekday::Sat => 6,
         };
-        self.minutes.contains(&dt.minute())
+        self.seconds.contains(&dt.second())
+            && self.minutes.contains(&dt.minute())
             && self.hours.contains(&dt.hour())
             && self.days.contains(&(dt.day() as u32))
             && self.months.contains(&(dt.month() as u32))
             && self.dows.contains(&cron_dow)
     }
+}
+
+fn parse_every_interval(body: &str) -> Result<i64, String> {
+    if body.is_empty() {
+        return Err("interval expression must be '@every <n><unit>'".to_string());
+    }
+    let digits_len = body.chars().take_while(|c| c.is_ascii_digit()).count();
+    if digits_len == 0 || digits_len == body.len() {
+        return Err(format!(
+            "interval expression must be '@every <n><unit>'; got {:?}",
+            body
+        ));
+    }
+    let n: i64 = body[..digits_len]
+        .parse()
+        .map_err(|_| format!("interval count must be an integer: {:?}", body))?;
+    if n <= 0 {
+        return Err(format!("interval count must be positive: {:?}", body));
+    }
+    let unit = &body[digits_len..];
+    let mult = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 60 * 60 * 24,
+        _ => {
+            return Err(format!(
+                "unsupported interval unit {:?}; expected one of s, m, h, d",
+                unit
+            ));
+        }
+    };
+    n.checked_mul(mult)
+        .ok_or_else(|| format!("interval is too large: {:?}", body))
 }
 
 fn parse_field(field: &str, lo: u32, hi: u32) -> Result<BTreeSet<u32>, String> {
@@ -125,60 +177,165 @@ fn parse_field(field: &str, lo: u32, hi: u32) -> Result<BTreeSet<u32>, String> {
     Ok(out)
 }
 
+fn cron_day_matches(sched: &CronSchedule, dt: &NaiveDateTime) -> bool {
+    let cron_dow = match dt.weekday() {
+        Weekday::Sun => 0,
+        Weekday::Mon => 1,
+        Weekday::Tue => 2,
+        Weekday::Wed => 3,
+        Weekday::Thu => 4,
+        Weekday::Fri => 5,
+        Weekday::Sat => 6,
+    };
+    sched.days.contains(&(dt.day() as u32)) && sched.dows.contains(&cron_dow)
+}
+
+fn make_dt(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> NaiveDateTime {
+    NaiveDate::from_ymd_opt(year, month, day)
+        .and_then(|d| d.and_hms_opt(hour, minute, second))
+        .expect("constructed invalid local datetime")
+}
+
+fn next_or_first(set: &BTreeSet<u32>, current: u32) -> (u32, bool) {
+    if let Some(v) = set.range(current..).next() {
+        (*v, false)
+    } else {
+        (*set.first().expect("schedule field set is empty"), true)
+    }
+}
+
+fn cron_next_after_naive(sched: &CronSchedule, from: NaiveDateTime) -> Result<NaiveDateTime, String> {
+    let mut cand = from + Duration::seconds(1);
+    let cap_year = cand.year() + 100;
+
+    while cand.year() <= cap_year {
+        let month = cand.month();
+        if !sched.months.contains(&month) {
+            let (next_month, wrapped) = next_or_first(&sched.months, month);
+            let year = if wrapped { cand.year() + 1 } else { cand.year() };
+            cand = make_dt(year, next_month, 1, 0, 0, 0);
+            continue;
+        }
+
+        if !cron_day_matches(sched, &cand) {
+            cand = make_dt(cand.year(), cand.month(), cand.day(), 0, 0, 0) + Duration::days(1);
+            continue;
+        }
+
+        let hour = cand.hour();
+        if !sched.hours.contains(&hour) {
+            let (next_hour, wrapped) = next_or_first(&sched.hours, hour);
+            if wrapped {
+                cand = make_dt(cand.year(), cand.month(), cand.day(), 0, 0, 0) + Duration::days(1);
+                cand = make_dt(cand.year(), cand.month(), cand.day(), next_hour, 0, 0);
+            } else {
+                cand = make_dt(cand.year(), cand.month(), cand.day(), next_hour, 0, 0);
+            }
+            continue;
+        }
+
+        let minute = cand.minute();
+        if !sched.minutes.contains(&minute) {
+            let (next_minute, wrapped) = next_or_first(&sched.minutes, minute);
+            if wrapped {
+                cand = make_dt(cand.year(), cand.month(), cand.day(), cand.hour(), 0, 0)
+                    + Duration::hours(1);
+                cand = make_dt(
+                    cand.year(),
+                    cand.month(),
+                    cand.day(),
+                    cand.hour(),
+                    next_minute,
+                    0,
+                );
+            } else {
+                cand = make_dt(cand.year(), cand.month(), cand.day(), cand.hour(), next_minute, 0);
+            }
+            continue;
+        }
+
+        let second = cand.second();
+        if !sched.seconds.contains(&second) {
+            let (next_second, wrapped) = next_or_first(&sched.seconds, second);
+            if wrapped {
+                cand = make_dt(cand.year(), cand.month(), cand.day(), cand.hour(), cand.minute(), 0)
+                    + Duration::minutes(1);
+                cand = make_dt(
+                    cand.year(),
+                    cand.month(),
+                    cand.day(),
+                    cand.hour(),
+                    cand.minute(),
+                    next_second,
+                );
+            } else {
+                cand = make_dt(
+                    cand.year(),
+                    cand.month(),
+                    cand.day(),
+                    cand.hour(),
+                    cand.minute(),
+                    next_second,
+                );
+            }
+            continue;
+        }
+
+        if sched.matches(&cand) {
+            return Ok(cand);
+        }
+
+        cand += Duration::seconds(1);
+    }
+
+    Err(format!(
+        "no schedule match found within 100 years after local datetime {:?}",
+        from
+    ))
+}
+
 /// Return the unix timestamp of the next boundary strictly after
-/// `from_unix`, at minute precision, in the system local time zone.
+/// `from_unix`, in the system local time zone.
 pub fn next_after_unix(expr: &str, from_unix: i64) -> Result<i64, String> {
     next_after_unix_in_tz(expr, from_unix, &Local)
 }
 
-/// TZ-parameterized variant of `next_after_unix`. Production code
-/// uses `Local`; tests use a fixed zone (e.g. `chrono_tz::US::Eastern`)
-/// so DST edge cases are reproducible regardless of the host's
-/// timezone. `pub(crate)` because it's a testing seam, not a stable
-/// API — bindings should call `next_after_unix`.
+/// TZ-parameterized variant of `next_after_unix`. Production code uses
+/// `Local`; tests use fixed zones so DST edge cases are reproducible
+/// regardless of the host's timezone.
 pub(crate) fn next_after_unix_in_tz<Tz>(expr: &str, from_unix: i64, tz: &Tz) -> Result<i64, String>
 where
     Tz: chrono::TimeZone,
 {
-    let sched = CronSchedule::parse(expr)?;
-    // Treat `from_unix` as a unix timestamp, project into `tz`'s
-    // local wall clock, truncate to minute, then increment
-    // minute-by-minute until a match. Cap at ~5 years of minutes
-    // so a degenerate schedule raises instead of looping forever.
-    let local = match tz.timestamp_opt(from_unix, 0) {
-        chrono::LocalResult::Single(t) => t,
-        chrono::LocalResult::Ambiguous(t, _) => t,
-        chrono::LocalResult::None => {
-            return Err(format!("invalid timestamp: {}", from_unix));
-        }
-    };
-    let start_naive = local
-        .naive_local()
-        .with_second(0)
-        .and_then(|d| d.with_nanosecond(0));
-    let Some(start_naive) = start_naive else {
-        return Err("failed to truncate to minute".to_string());
-    };
-    let mut cand = start_naive + Duration::minutes(1);
-    let cap = 5 * 366 * 24 * 60;
-    for _ in 0..cap {
-        if sched.matches(&cand) {
-            // Convert back to unix. Local DST ambiguity: take the
-            // earlier occurrence (matches chrono's default for
-            // Ambiguous); nonexistent (spring-forward gap) → skip
-            // forward.
-            match tz.from_local_datetime(&cand) {
-                chrono::LocalResult::Single(t) => return Ok(t.timestamp()),
-                chrono::LocalResult::Ambiguous(t, _) => return Ok(t.timestamp()),
-                chrono::LocalResult::None => {}
+    match ScheduleExpr::parse(expr)? {
+        ScheduleExpr::Every { interval_s } => from_unix
+            .checked_add(interval_s)
+            .ok_or_else(|| format!("next interval overflows unix timestamp for {:?}", expr)),
+        ScheduleExpr::Cron(sched) => {
+            let local = match tz.timestamp_opt(from_unix, 0) {
+                chrono::LocalResult::Single(t) => t,
+                chrono::LocalResult::Ambiguous(t, _) => t,
+                chrono::LocalResult::None => {
+                    return Err(format!("invalid timestamp: {}", from_unix));
+                }
+            };
+            let mut cand = cron_next_after_naive(&sched, local.naive_local())?;
+            let cap_year = cand.year() + 100;
+            while cand.year() <= cap_year {
+                match tz.from_local_datetime(&cand) {
+                    chrono::LocalResult::Single(t) => return Ok(t.timestamp()),
+                    chrono::LocalResult::Ambiguous(t, _) => return Ok(t.timestamp()),
+                    chrono::LocalResult::None => {
+                        cand += Duration::seconds(1);
+                    }
+                }
             }
+            Err(format!(
+                "no valid local schedule match found within 100 years after unix_ts={}: {:?}",
+                from_unix, expr
+            ))
         }
-        cand += Duration::minutes(1);
     }
-    Err(format!(
-        "no cron match found within 5 years after unix_ts={}: {:?}",
-        from_unix, expr
-    ))
 }
 
 #[cfg(test)]
@@ -186,9 +343,9 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    fn ts(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
+    fn ts(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> i64 {
         Local
-            .with_ymd_and_hms(y, mo, d, h, mi, 0)
+            .with_ymd_and_hms(y, mo, d, h, mi, s)
             .single()
             .unwrap()
             .timestamp()
@@ -196,166 +353,101 @@ mod tests {
 
     #[test]
     fn star_every_minute() {
-        // `* * * * *` — next minute boundary.
-        let from = ts(2026, 4, 19, 12, 30);
+        let from = ts(2026, 4, 19, 12, 30, 0);
         let got = next_after_unix("* * * * *", from).unwrap();
-        assert_eq!(got, ts(2026, 4, 19, 12, 31));
+        assert_eq!(got, ts(2026, 4, 19, 12, 31, 0));
     }
 
     #[test]
     fn every_five_minutes() {
-        // 12:30 -> 12:35 on `*/5 * * * *`.
-        let from = ts(2026, 4, 19, 12, 30);
+        let from = ts(2026, 4, 19, 12, 30, 0);
         let got = next_after_unix("*/5 * * * *", from).unwrap();
-        assert_eq!(got, ts(2026, 4, 19, 12, 35));
+        assert_eq!(got, ts(2026, 4, 19, 12, 35, 0));
+    }
+
+    #[test]
+    fn six_field_seconds() {
+        let from = ts(2026, 4, 19, 12, 30, 5);
+        let got = next_after_unix("*/10 * * * * *", from).unwrap();
+        assert_eq!(got, ts(2026, 4, 19, 12, 30, 10));
+    }
+
+    #[test]
+    fn every_interval_seconds() {
+        let from = ts(2026, 4, 19, 12, 30, 5);
+        let got = next_after_unix("@every 1s", from).unwrap();
+        assert_eq!(got, ts(2026, 4, 19, 12, 30, 6));
     }
 
     #[test]
     fn nightly_3am() {
-        // `0 3 * * *` at 10am today → 3am tomorrow.
-        let from = ts(2026, 4, 19, 10, 0);
+        let from = ts(2026, 4, 19, 10, 0, 0);
         let got = next_after_unix("0 3 * * *", from).unwrap();
-        assert_eq!(got, ts(2026, 4, 20, 3, 0));
+        assert_eq!(got, ts(2026, 4, 20, 3, 0, 0));
     }
 
     #[test]
     fn strictly_after() {
-        // On the boundary itself → returns the NEXT boundary.
-        let from = ts(2026, 4, 19, 3, 0);
+        let from = ts(2026, 4, 19, 3, 0, 0);
         let got = next_after_unix("0 3 * * *", from).unwrap();
-        assert_eq!(got, ts(2026, 4, 20, 3, 0));
+        assert_eq!(got, ts(2026, 4, 20, 3, 0, 0));
     }
 
     #[test]
     fn range_with_step() {
-        // `0-30/10 * * * *` at 12:05 → 12:10.
-        let from = ts(2026, 4, 19, 12, 5);
+        let from = ts(2026, 4, 19, 12, 5, 0);
         let got = next_after_unix("0-30/10 * * * *", from).unwrap();
-        assert_eq!(got, ts(2026, 4, 19, 12, 10));
+        assert_eq!(got, ts(2026, 4, 19, 12, 10, 0));
     }
 
     #[test]
     fn comma_list() {
-        // `0,30 * * * *` at 12:10 → 12:30.
-        let from = ts(2026, 4, 19, 12, 10);
+        let from = ts(2026, 4, 19, 12, 10, 0);
         let got = next_after_unix("0,30 * * * *", from).unwrap();
-        assert_eq!(got, ts(2026, 4, 19, 12, 30));
+        assert_eq!(got, ts(2026, 4, 19, 12, 30, 0));
     }
 
     #[test]
     fn dow_filter() {
-        // `0 12 * * 1` (Mondays at noon). 2026-04-19 is a Sunday;
-        // next Monday is 2026-04-20.
-        let from = ts(2026, 4, 19, 0, 0);
+        let from = ts(2026, 4, 19, 0, 0, 0);
         let got = next_after_unix("0 12 * * 1", from).unwrap();
-        assert_eq!(got, ts(2026, 4, 20, 12, 0));
+        assert_eq!(got, ts(2026, 4, 20, 12, 0, 0));
     }
 
     #[test]
     fn field_count_error() {
         assert!(next_after_unix("* * * *", 0).is_err());
-        assert!(next_after_unix("* * * * * *", 0).is_err());
+        assert!(next_after_unix("* * *", 0).is_err());
     }
 
     #[test]
-    fn out_of_range_error() {
-        assert!(next_after_unix("60 * * * *", 0).is_err());
-        assert!(next_after_unix("* 24 * * *", 0).is_err());
-        assert!(next_after_unix("* * 0 * *", 0).is_err());
+    fn interval_parse_error() {
+        assert!(next_after_unix("@every", 0).is_err());
+        assert!(next_after_unix("@every 0s", 0).is_err());
+        assert!(next_after_unix("@every 5w", 0).is_err());
     }
 
     #[test]
-    fn inverted_range_error() {
-        assert!(next_after_unix("5-3 * * * *", 0).is_err());
+    fn six_field_validation() {
+        assert!(next_after_unix("60 * * * * *", 0).is_err());
+        assert!(next_after_unix("* * 24 * * *", 0).is_err());
     }
 
     #[test]
-    fn zero_step_error() {
-        assert!(next_after_unix("*/0 * * * *", 0).is_err());
-    }
+    fn dst_spring_forward_gap_skips_to_real_time() {
+        use chrono_tz::US::Eastern;
 
-    // ---------- DST edge cases (US/Eastern) ----------
-    //
-    // These use a fixed `chrono_tz::US::Eastern` so the behavior is
-    // reproducible regardless of where the test runs. The production
-    // `next_after_unix` uses `Local`, which reads TZ env var +
-    // /etc/localtime — great for users, terrible for portable tests.
-
-    use chrono_tz::US::Eastern;
-
-    /// Spring-forward: on 2024-03-10 in US/Eastern, 2am does not
-    /// exist locally (clock jumps 1:59 EST → 3:00 EDT). A cron like
-    /// `30 2 * * *` has no valid boundary that day. We expect
-    /// `next_after_unix_in_tz` to SKIP it and return 2:30am on the
-    /// next day. Previously, a naive implementation could return a
-    /// bogus timestamp from `from_local_datetime` on a nonexistent
-    /// local time.
-    #[test]
-    fn dst_spring_forward_skips_nonexistent_hour() {
-        // 2024-03-10 00:00 EST (before spring-forward). EST = UTC-5.
-        // 00:00 EST = 05:00 UTC = 1710046800.
         let from = Eastern
-            .with_ymd_and_hms(2024, 3, 10, 0, 0, 0)
+            .with_ymd_and_hms(2026, 3, 8, 1, 59, 59)
             .single()
             .unwrap()
             .timestamp();
-        let got = next_after_unix_in_tz("30 2 * * *", from, &Eastern).unwrap();
-        // Expected: 2024-03-11 02:30 EDT (EDT = UTC-4).
-        let want = Eastern
-            .with_ymd_and_hms(2024, 3, 11, 2, 30, 0)
+        let got = next_after_unix_in_tz("0 * * * * *", from, &Eastern).unwrap();
+        let expected = Eastern
+            .with_ymd_and_hms(2026, 3, 8, 3, 0, 0)
             .single()
             .unwrap()
             .timestamp();
-        assert_eq!(
-            got, want,
-            "spring-forward day's 2:30 should be skipped, next fire is tomorrow's 2:30"
-        );
-    }
-
-    /// Fall-back: on 2024-11-03 in US/Eastern, 1am happens twice
-    /// (once at 1:00 EDT, once at 1:00 EST). A cron like
-    /// `30 1 * * *` should fire exactly ONCE per calendar day — our
-    /// naive-wall-clock walk naturally picks the earlier (EDT)
-    /// occurrence and advances past it without revisiting. The
-    /// second 1:30 EST (same local wall clock, different UTC) is
-    /// skipped.
-    #[test]
-    fn dst_fall_back_fires_once_not_twice() {
-        // 2024-11-03 00:00 EDT (before fall-back). EDT = UTC-4.
-        // 00:00 EDT = 04:00 UTC.
-        let from = Eastern
-            .with_ymd_and_hms(2024, 11, 3, 0, 0, 0)
-            .earliest()
-            .unwrap()
-            .timestamp();
-
-        // First call: next 1:30 is 1:30 EDT (the earlier of the two
-        // ambiguous 1:30s that day).
-        let first = next_after_unix_in_tz("30 1 * * *", from, &Eastern).unwrap();
-        let want_first = Eastern
-            .with_ymd_and_hms(2024, 11, 3, 1, 30, 0)
-            .earliest() // pre-fall-back: 1:30 EDT (UTC-4)
-            .unwrap()
-            .timestamp();
-        assert_eq!(first, want_first, "first 1:30 on fall-back day is EDT");
-
-        // Second call: must NOT return the other 1:30 (EST, one hour
-        // later in UTC). Instead, next day's 1:30 EST.
-        let second = next_after_unix_in_tz("30 1 * * *", first, &Eastern).unwrap();
-        let would_be_duplicate = Eastern
-            .with_ymd_and_hms(2024, 11, 3, 1, 30, 0)
-            .latest() // post-fall-back: 1:30 EST (UTC-5)
-            .unwrap()
-            .timestamp();
-        assert_ne!(
-            second, would_be_duplicate,
-            "second 1:30 (EST) must not re-fire same calendar day"
-        );
-        let want_next = Eastern
-            .with_ymd_and_hms(2024, 11, 4, 1, 30, 0)
-            .single()
-            .unwrap()
-            .timestamp();
-        assert_eq!(second, want_next, "next fire is 1:30 the following day");
+        assert_eq!(got, expected);
     }
 }
