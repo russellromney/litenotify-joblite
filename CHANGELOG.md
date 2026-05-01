@@ -1,5 +1,31 @@
 # CHANGELOG
 
+## Unreleased — time-trigger scheduler and wake parity
+
+Moved the completed Phase Timekeeper / time-trigger scheduler work out
+of the roadmap.
+
+- `run_at` jobs now wake workers when their deadline arrives instead of
+  waiting for a later fallback poll.
+- Claim reclaim deadlines now wake sleeping workers on time too, using
+  the same next-deadline path as delayed jobs.
+- Scheduler expressions now support three forms through the same
+  surface:
+  - 5-field cron
+  - 6-field cron with leading seconds
+  - `@every <n><unit>` interval expressions
+- Recurring scheduler APIs now converge on `schedule` as the canonical
+  name, with legacy `cron` aliases kept where needed for compatibility.
+- Maintained bindings now use the same basic time-trigger model:
+  update wake or next deadline, with fallback polling only as backup.
+- Added real proof for the user-facing behavior:
+  live scheduler loop tests, cross-process delayed-job wake tests,
+  reclaim-deadline tests, and binding parity coverage across the
+  maintained language bindings.
+- Simplified binding READMEs so each one teaches the local basics and
+  points back to the main Honker docs instead of duplicating the whole
+  product README.
+
 ## Unreleased — watcher rename and roadmap cleanup
 
 - Finished the public `WalWatcher` -> `UpdateWatcher` rename in the
