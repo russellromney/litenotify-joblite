@@ -3,7 +3,7 @@
 ## Unreleased — time-trigger scheduler and wake parity
 
 Moved the completed Phase Timekeeper / time-trigger scheduler work out
-of the roadmap.
+of the roadmap and into the changelog.
 
 - `run_at` jobs now wake workers when their deadline arrives instead of
   waiting for a later fallback poll.

@@ -194,42 +194,63 @@ language packages published from one tree.
   registry ergonomics). Other bindings mostly expose the underlying
   primitives, not that whole product layer yet.
 
-## Completed — Time-trigger scheduler and wake parity
+## Phase Near-Parity — Common Runtime, Selective Framework Layer
 
-Shipped in PR #29, with follow-up release prep in PR #33.
+> After: Phase Herd · Before: 1.0 release prep
 
-- `run_at` jobs now wake workers at their deadline instead of waiting
-  for a later fallback poll.
-- Reclaim deadlines now wake sleeping workers on time too.
-- Scheduler expressions now support 5-field cron, 6-field cron, and
-  `@every <n><unit>`.
-- Maintained bindings converged on the same basic time-trigger shape:
-  update wake or next deadline, with fallback polling only as backup.
-- Canonical recurring name is now `schedule`, with legacy `cron` kept
-  as a compatibility alias where needed.
-- Ruby and Elixir expose extension-backed `notify` and table APIs but do
-  not yet expose async listen/update-watcher APIs.
+Honker should make switching languages feel boring in the good way:
+same core nouns, same queue/scheduler behavior, same wake semantics,
+and the same documentation shape. But that does not necessarily mean
+every binding must grow the full Python task-framework layer.
 
-### Scope
+### Core parity target
 
-- Add binding docs that name whether each package uses update events or
-  timer polling.
-- Add Bun `updateEvents()` / listen bridge, or explicitly defer it with
-  tests proving current poll behavior.
-- Add Ruby and Elixir listener APIs only if their runtime integrations
-  can support a clean cancellation story.
-- Decide whether Go and C++ should keep local watcher implementations or
-  grow a shared C ABI around the core watcher.
-- Add parity tests that exercise a cross-process notification wake in
-  every binding with a listener API.
+Every maintained binding should converge on:
 
-### Non-goals
+- the same queue/job/stream/scheduler/lock/result primitives
+- canonical recurring name `schedule`, with `cron` kept only as a
+  compatibility alias
+- delayed `run_at` jobs that wake on deadline, not just fallback poll
+- recurring schedule support for:
+  - 5-field cron
+  - 6-field cron
+  - `@every <n><unit>`
+- the same basic update-wake mental model in docs and tests
 
-- Do not make the SQLite loadable extension itself push events. Plain SQL
-  clients can write/read the shared tables, but need a host-language
-  watcher to sleep efficiently.
-- Do not block 1.0 on bindings that are explicitly marked poll-based or
-  partial, as long as the docs and tests say so.
+### Near-parity rule
+
+- Full Python-style task-framework parity is not required for every
+  language binding.
+- It is acceptable for some bindings to stop at "excellent core
+  runtime wrapper" as long as that is clear in docs.
+- A smaller set of first-class bindings can carry the richer task layer
+  (`@task`, `TaskResult`, worker CLI, decorator ergonomics) if there is
+  real user demand.
+
+### Likely split
+
+- First-class "task framework" candidates:
+  - Python
+  - .NET
+  - maybe Node
+- Core-runtime-first bindings:
+  - Go
+  - Rust
+  - Ruby
+  - Elixir
+  - Bun
+  - C++
+
+### Verification
+
+- Each maintained binding has a parity checklist in-repo:
+  names, wake semantics, `run_at`, `schedule`, notify/listen or
+  explicit update-watcher story, and cross-language interop.
+- Docs say plainly whether a binding is:
+  - core-runtime complete
+  - or task-framework complete
+- We do not describe a binding as "full parity" unless it meets the
+  chosen parity bar for its tier.
 
 ## Phase Cadence — Time-Based Watcher Ticks
 
