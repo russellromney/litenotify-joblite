@@ -419,6 +419,8 @@ jobs:
       - name: Bun
         if: matrix.binding == 'honker-bun'
         working-directory: packages/honker-bun
+        env:
+          HONKER_EXT_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
         run: |
           bun install --frozen-lockfile
           bun test
