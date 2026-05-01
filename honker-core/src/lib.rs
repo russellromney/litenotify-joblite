@@ -2497,6 +2497,80 @@ while True:
         );
     }
 
+    /// Parity with `update_watcher_panics_on_file_replacement` for the
+    /// kernel-watcher backend. The polling backend panics when it sees
+    /// the db file replaced; the kernel watcher must do the same so a
+    /// stale per-file watch fails loudly instead of silently missing
+    /// wakes after a litestream-style restore.
+    #[test]
+    #[cfg(feature = "kernel-watcher")]
+    fn kernel_watcher_panics_on_file_replacement() {
+        replacement_panic_test(WatcherBackend::KernelWatch);
+    }
+
+    /// Parity for the SHM fast path. SHM has it worse than kernel
+    /// watcher: a stale mmap silently stops detecting iChange. The
+    /// dead-man's switch on db AND -shm inodes panics either case.
+    #[test]
+    #[cfg(feature = "shm-fast-path")]
+    fn shm_fast_path_panics_on_file_replacement() {
+        replacement_panic_test(WatcherBackend::ShmFastPath);
+    }
+
+    #[cfg(any(feature = "kernel-watcher", feature = "shm-fast-path"))]
+    fn replacement_panic_test(backend: WatcherBackend) {
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-replace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        // Keep an open conn so -shm exists at watcher startup. Force a
+        // write so SQLite materializes -wal and -shm — `open_conn`
+        // alone is enough for -wal but the shm fast path needs -shm to
+        // be present and large enough to mmap.
+        let writer = open_conn(tmp.to_str().unwrap(), false).unwrap();
+        writer.execute_batch("CREATE TABLE _ (x INT); INSERT INTO _ VALUES (1);")
+            .unwrap();
+        let watcher = UpdateWatcher::spawn_with_config(
+            tmp.clone(),
+            || {},
+            WatcherConfig { backend },
+        );
+        // Let the watcher snapshot the initial inode.
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Replace the db file with a different inode. SQLite-blind,
+        // mimics what an atomic rename / litestream restore looks like
+        // at the FS level.
+        let other = std::env::temp_dir().join(format!(
+            "honker-replace-other-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&other);
+        std::fs::File::create(&other).unwrap();
+        std::fs::rename(&other, &tmp).unwrap();
+        // Wait long enough for the dead-man's switch to fire.
+        std::thread::sleep(Duration::from_millis(500));
+
+        let result = watcher.join();
+        drop(writer);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        assert!(
+            result.is_err(),
+            "expected watcher thread to panic on db file replacement"
+        );
+    }
+
     #[test]
     #[cfg(feature = "kernel-watcher")]
     fn watcher_backend_kernel_probe_fails_for_inaccessible_dir() {

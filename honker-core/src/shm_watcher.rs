@@ -20,16 +20,17 @@
 //!   on every supported SQLite version. If a future SQLite version
 //!   changes the layout, this breaks silently.
 //!
-//! - **Stale mmap on WAL reset.** If the `-shm` file is deleted and
-//!   recreated mid-flight (e.g. all connections close, then reopen),
-//!   the mmap is on the deleted inode. `iChange` reads will be stale
-//!   and wakes will not fire. Consumer's `idle_poll_s` is the
-//!   backstop.
+//! - **WAL reset / db replacement: panic.** If `-shm` or the db file
+//!   is deleted and recreated mid-flight (cross-process close+reopen,
+//!   atomic rename, litestream restore), the watcher panics with a
+//!   "Restart required" message. Same dead-man's-switch shape as the
+//!   polling backend — louder failure than silent missed wakes.
 //!
 //! Tests assert that wakes fire with sub-millisecond latency in WAL
 //! mode. If a test fails, the backend is broken — not "fall back to
 //! polling and pretend it worked".
 
+use crate::stat_identity;
 use memmap2::Mmap;
 use std::fs::File;
 use std::path::PathBuf;
@@ -44,6 +45,9 @@ const ICHANGE_OFFSET: usize = 8;
 /// "1 ms → 100 µs". Going faster would just burn extra sleep syscalls
 /// for latency nobody can perceive.
 const POLL_INTERVAL_MS: u64 = 1;
+/// Cadence for the dead-man's switch (db / -shm replacement detection).
+/// Same as the polling backend.
+const IDENTITY_CHECK_TICKS: u64 = 100;
 
 pub(crate) fn run_shm_fast_path_loop<F>(db_path: PathBuf, on_change: F, stop: Arc<AtomicBool>)
 where
@@ -81,6 +85,16 @@ where
 
     let read_ichange = || u32::from_ne_bytes(mmap[ICHANGE_OFFSET..ICHANGE_OFFSET + 4].try_into().unwrap());
     let mut last = read_ichange();
+
+    // Dead-man's switch: snapshot db and -shm inodes at startup; if
+    // either changes mid-flight, panic. Both go stale silently
+    // otherwise — the mmap stays on the old -shm inode and iChange
+    // never advances again. Same cadence as the polling backend so
+    // file-replacement detection latency doesn't depend on backend.
+    let initial_db_id = stat_identity(&db_path).unwrap_or((0, 0));
+    let initial_shm_id = stat_identity(&shm_path).unwrap_or((0, 0));
+    let mut tick: u64 = 0;
+
     while !stop.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         let current = read_ichange();
@@ -88,6 +102,27 @@ where
             last = current;
             on_change();
         }
+        tick += 1;
+        if tick % IDENTITY_CHECK_TICKS == 0 {
+            check_identity(&db_path, initial_db_id, "database file");
+            check_identity(&shm_path, initial_shm_id, "-shm file");
+        }
+    }
+}
+
+/// Panics if the file at `path` has been replaced since startup. Used
+/// for both the db file (parity with polling backend's dead-man's
+/// switch) and the -shm file (specific failure mode for this backend
+/// — a recreated -shm leaves our mmap on a deleted inode).
+fn check_identity(path: &std::path::Path, initial: (u64, u64), label: &str) {
+    let Ok(current) = stat_identity(path) else { return };
+    if current != initial {
+        panic!(
+            "honker: {label} replaced: \
+             expected (dev={}, ino={}), found (dev={}, ino={}) at {:?}. \
+             Restart required.",
+            initial.0, initial.1, current.0, current.1, path
+        );
     }
 }
 

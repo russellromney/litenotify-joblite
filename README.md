@@ -262,7 +262,9 @@ If the requested backend can't initialize (e.g., shm needs WAL + open conn; kern
 |---|---|---|---|---|
 | `polling` (default) | `PRAGMA data_version` every 1 ms | never | never | any |
 | `kernel` | `notify-rs` events on dir + `-wal`/`-shm` | possible | possible (if OS drops events) | any |
-| `shm` | mmap `iChange` in WAL index every 1 ms | never | possible (stale on inode change) | WAL only |
+| `shm` | mmap `iChange` in WAL index every 1 ms | never | never (mmap inode-change → panic) | WAL only |
+
+All three backends share the same dead-man's switch: `stat(db_path)` every 100 ms, panic on inode change (atomic rename, litestream restore, NFS remount). The shm backend additionally panics on `-shm` inode change. Failure is loud — never silent missed wakes after replacement.
 
 Build wheels with `--features kernel-watcher,shm-fast-path` (or one) to include them. Without the features, `watcher_backend="kernel"` falls back to polling with a stderr warning.
 

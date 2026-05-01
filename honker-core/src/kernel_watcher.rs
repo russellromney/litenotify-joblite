@@ -28,16 +28,21 @@
 //! platforms we support. If a test fails, the backend is broken on
 //! that platform — not "fall back to polling and pretend it worked".
 
+use crate::stat_identity;
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long `recv_timeout` blocks before sampling the stop flag.
 /// Bounds graceful shutdown latency at this value.
 const RX_POLL_MS: u64 = 50;
+/// Cadence for the dead-man's switch (db-file replacement detection).
+/// Same as the polling backend so file-replacement detection latency
+/// doesn't depend on which backend the user picked.
+const IDENTITY_CHECK_MS: u64 = 100;
 
 pub(crate) fn run_kernel_watch_loop<F>(db_path: PathBuf, on_change: F, stop: Arc<AtomicBool>)
 where
@@ -80,6 +85,15 @@ where
         return;
     }
 
+    // Dead-man's switch: same as the polling backend. Snapshot the db
+    // file's inode at startup; if it changes mid-flight (atomic
+    // rename, litestream restore, NFS remount), panic with a clear
+    // message. The watcher's per-file -wal/-shm watches would be on
+    // the old inode and silently miss writes to the new one — louder
+    // failure is better than silent miss.
+    let initial_id = stat_identity(&db_path).unwrap_or((0, 0));
+    let mut last_id_check = Instant::now();
+
     while !stop.load(Ordering::Acquire) {
         match rx.recv_timeout(Duration::from_millis(RX_POLL_MS)) {
             Ok(Ok(event)) if !matches!(event.kind, EventKind::Access(_)) => on_change(),
@@ -92,6 +106,25 @@ where
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             _ => {} // timeout, or Access event — ignore
         }
+        if last_id_check.elapsed() >= Duration::from_millis(IDENTITY_CHECK_MS) {
+            check_db_identity(&db_path, initial_id);
+            last_id_check = Instant::now();
+        }
+    }
+}
+
+/// Panics if the db file at `db_path` has been replaced since startup.
+/// Same shape and same message as the polling backend's check so the
+/// failure looks identical regardless of which backend the user picked.
+fn check_db_identity(db_path: &std::path::Path, initial: (u64, u64)) {
+    let Ok(current) = stat_identity(db_path) else { return };
+    if current != initial {
+        panic!(
+            "honker: database file replaced: \
+             expected (dev={}, ino={}), found (dev={}, ino={}) at {:?}. \
+             Restart required.",
+            initial.0, initial.1, current.0, current.1, db_path
+        );
     }
 }
 
