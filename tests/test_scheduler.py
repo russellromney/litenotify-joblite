@@ -480,7 +480,7 @@ async def test_scheduler_run_proceeds_if_another_process_registered(db_path):
 def _register_with_max_runs(db, name, queue, cron_expr, max_runs):
     """Register a task via raw SQL, setting max_runs."""
     with db.transaction() as tx:
-        tx.execute(
+        tx.query(
             "SELECT honker_scheduler_register(?, ?, ?, '\"go\"', 0, NULL, ?)",
             [name, queue, cron_expr, max_runs],
         )
