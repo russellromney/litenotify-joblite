@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "honker"
+version = "0.2.2"
+description = "Durable queues, streams, pub/sub, and cron scheduler on SQLite. One file, zero servers."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Russell Romney" }]
+keywords = ["sqlite", "queue", "pubsub", "stream", "outbox", "notify", "listen"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Rust",
+  "Topic :: Database",
+  "Topic :: System :: Distributed Computing",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://honker.dev"
+Repository = "https://github.com/russellromney/honker"
+Documentation = "https://honker.dev/docs/"
+
+[tool.maturin]
+python-source = "python"
+module-name = "honker._honker_native"
+features = ["pyo3/extension-module"]
