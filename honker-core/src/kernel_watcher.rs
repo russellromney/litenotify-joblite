@@ -70,20 +70,14 @@ where
     let wal = PathBuf::from(format!("{}-wal", db_path.display()));
     let shm = PathBuf::from(format!("{}-shm", db_path.display()));
 
-    let mut attached_any = false;
-    for path in [&watch_dir, &wal, &shm] {
-        if !path.exists() {
-            continue;
-        }
-        if watcher.watch(path, RecursiveMode::NonRecursive).is_ok() {
-            attached_any = true;
-        }
-    }
-    if !attached_any {
-        eprintln!(
-            "honker: kernel-watcher couldn't attach to db dir or -wal/-shm. \
-             Backend disabled."
-        );
+    // Try each path; missing files / inaccessible dirs error here and
+    // we just skip them. As long as at least one watch attached, we go.
+    let attached = [&watch_dir, &wal, &shm]
+        .into_iter()
+        .filter(|p| watcher.watch(p, RecursiveMode::NonRecursive).is_ok())
+        .count();
+    if attached == 0 {
+        eprintln!("honker: kernel-watcher couldn't attach to db dir or -wal/-shm. Backend disabled.");
         return;
     }
 

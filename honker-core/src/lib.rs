@@ -96,63 +96,34 @@ pub struct WatcherConfig {
     pub backend: WatcherBackend,
 }
 
-/// Returned by [`WatcherBackend::parse`] alongside the chosen backend
-/// when a build-time feature was missing — bindings can surface this
-/// to the user (e.g., as a stderr warning) so an unavailable backend
-/// silently falling back to `Polling` is observable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WatcherBackendNote {
-    /// Backend is available and was selected.
-    Ok,
-    /// `kernel` was requested but the `kernel-watcher` Cargo feature
-    /// was not enabled at build time. Falling back to `Polling`.
-    KernelWatchUnavailable,
-    /// `shm` was requested but the `shm-fast-path` Cargo feature was
-    /// not enabled at build time. Falling back to `Polling`.
-    ShmFastPathUnavailable,
-}
-
 impl WatcherBackend {
-    /// Parse a public binding-level string into a backend, with a note
-    /// if the requested backend isn't compiled in. Shared across
-    /// Python/Node bindings so they can't drift on accepted aliases.
+    /// Parse a binding-level string into a backend. Shared across
+    /// Python/Node so the accepted aliases stay in lockstep. If the
+    /// requested backend isn't compiled in, prints a one-line stderr
+    /// warning and falls back to `Polling`. Unknown values return
+    /// `Err(input_string)` so bindings can raise a typed error.
     ///
-    /// Accepted values:
-    /// - `None` / `"polling"` / `"poll"` — default 1 ms PRAGMA polling
-    /// - `"kernel"` / `"kernel-watcher"` — kernel filesystem notifications
-    /// - `"shm"` / `"shm-fast-path"` — mmap `-shm` fast path
-    ///
-    /// `Err(unknown_value)` for any other string so bindings can raise
-    /// a typed error.
-    pub fn parse(name: Option<&str>) -> Result<(Self, WatcherBackendNote), String> {
+    /// Accepted: `None` / `"polling"` / `"poll"`,
+    /// `"kernel"` / `"kernel-watcher"`, `"shm"` / `"shm-fast-path"`.
+    pub fn parse(name: Option<&str>) -> Result<Self, String> {
         match name {
-            None | Some("polling") | Some("poll") => {
-                Ok((WatcherBackend::Polling, WatcherBackendNote::Ok))
-            }
-            Some("kernel") | Some("kernel-watcher") => {
+            None | Some("polling" | "poll") => Ok(WatcherBackend::Polling),
+            Some("kernel" | "kernel-watcher") => {
                 #[cfg(feature = "kernel-watcher")]
-                {
-                    Ok((WatcherBackend::KernelWatch, WatcherBackendNote::Ok))
-                }
+                { Ok(WatcherBackend::KernelWatch) }
                 #[cfg(not(feature = "kernel-watcher"))]
                 {
-                    Ok((
-                        WatcherBackend::Polling,
-                        WatcherBackendNote::KernelWatchUnavailable,
-                    ))
+                    eprintln!("honker: kernel-watcher feature not compiled; using polling");
+                    Ok(WatcherBackend::Polling)
                 }
             }
-            Some("shm") | Some("shm-fast-path") => {
+            Some("shm" | "shm-fast-path") => {
                 #[cfg(feature = "shm-fast-path")]
-                {
-                    Ok((WatcherBackend::ShmFastPath, WatcherBackendNote::Ok))
-                }
+                { Ok(WatcherBackend::ShmFastPath) }
                 #[cfg(not(feature = "shm-fast-path"))]
                 {
-                    Ok((
-                        WatcherBackend::Polling,
-                        WatcherBackendNote::ShmFastPathUnavailable,
-                    ))
+                    eprintln!("honker: shm-fast-path feature not compiled; using polling");
+                    Ok(WatcherBackend::Polling)
                 }
             }
             Some(other) => Err(other.to_string()),

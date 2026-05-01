@@ -39,7 +39,6 @@ use std::time::Duration;
 
 const WALINDEX_MAX_VERSION: u32 = 3_007_000;
 const ICHANGE_OFFSET: usize = 8;
-const HDR_READ_LEN: usize = 12;
 const POLL_INTERVAL_US: u64 = 100;
 
 pub(crate) fn run_shm_fast_path_loop<F>(db_path: PathBuf, on_change: F, stop: Arc<AtomicBool>)
@@ -51,44 +50,33 @@ where
         return;
     }
     let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+    // Open + mmap. SAFETY: read-only; SQLite owns the write lock.
     let f = match File::open(&shm_path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!(
-                "honker: shm-fast-path: -shm not available ({e}). \
-                 Backend disabled (requires WAL mode + at least one open connection)."
-            );
+            eprintln!("honker: shm-fast-path disabled: -shm unavailable ({e}). Needs WAL + open conn.");
             return;
         }
     };
-    // SAFETY: mmap is read-only. SQLite owns the write lock; we observe.
     let mmap = match unsafe { Mmap::map(&f) } {
-        Ok(m) if m.len() >= HDR_READ_LEN => m,
-        Ok(_) => {
-            eprintln!("honker: shm-fast-path: -shm too small. Backend disabled.");
-            return;
-        }
-        Err(e) => {
-            eprintln!("honker: shm-fast-path: mmap failed ({e}). Backend disabled.");
+        Ok(m) if m.len() >= 12 => m,
+        _ => {
+            eprintln!("honker: shm-fast-path disabled: mmap failed or -shm too small.");
             return;
         }
     };
-    // Guard: known WAL index version. Catches a future SQLite that
-    // changes the layout — fail loudly instead of returning garbage.
-    let iversion = u32::from_ne_bytes(mmap[0..4].try_into().expect("4 bytes"));
+    // Sanity: WAL index version we know how to read. A future SQLite
+    // that bumps this fails the check instead of reading garbage.
+    let iversion = u32::from_ne_bytes(mmap[0..4].try_into().unwrap());
     if iversion != WALINDEX_MAX_VERSION {
         eprintln!(
-            "honker: shm-fast-path: unexpected WAL index version {iversion} \
-             (expected {WALINDEX_MAX_VERSION}). Backend disabled."
+            "honker: shm-fast-path disabled: WAL index version {iversion} != {WALINDEX_MAX_VERSION}."
         );
         return;
     }
 
-    let read_ichange = || {
-        u32::from_ne_bytes(mmap[ICHANGE_OFFSET..ICHANGE_OFFSET + 4].try_into().expect("4 bytes"))
-    };
+    let read_ichange = || u32::from_ne_bytes(mmap[ICHANGE_OFFSET..ICHANGE_OFFSET + 4].try_into().unwrap());
     let mut last = read_ichange();
-
     while !stop.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_micros(POLL_INTERVAL_US));
         let current = read_ichange();
