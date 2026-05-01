@@ -873,11 +873,17 @@ impl SharedUpdateWatcher {
     /// otherwise the sender stays in the map and a bridge thread
     /// blocking on `recv()` will never see a disconnect.
     ///
-    /// Channel buffer is 1024; backpressure drops additional ticks
-    /// for the slow subscriber without blocking the watcher.
+    /// Channel capacity is 1: bursts coalesce into one wake per drain
+    /// cycle. Wakes are "go re-read state" signals — the consumer's
+    /// SQL query reads current state regardless of how many wakes
+    /// were dropped, so dropped redundant wakes never cost data, only
+    /// signal redundancy. The kernel-watcher backend in particular
+    /// fires one event per filesystem write (multiple per commit);
+    /// without coalescing, consumers would run N redundant queries
+    /// per commit burst. With cap=1 they run ~1.
     pub fn subscribe(&self) -> (u64, std::sync::mpsc::Receiver<()>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = std::sync::mpsc::sync_channel(1024);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.senders.lock().insert(id, tx);
         (id, rx)
     }

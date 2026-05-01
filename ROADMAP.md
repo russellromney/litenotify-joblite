@@ -183,33 +183,6 @@ For each of `honker-bun`, `honker-go`, `honker-rs`, `honker-ruby`,
   `tests/test_watcher_backends_queue_e2e.py` continue to pass for
   Python; equivalents continue to pass for Node.
 
-## Phase Coalesce — Burst-Wake Dedup For Kernel Watcher
-
-> After: Phase Echo · Before: 1.0 release prep
-
-**Design pending — see PR #30 discussion for shape.**
-
-The kernel watcher fires `on_change()` on every filesystem event,
-which means N rapid commits produce N+ wakes for each subscriber.
-Polling and shm coalesce naturally (one PRAGMA / mmap read sees the
-batch as a single advance). The kernel watcher doesn't, and consumers
-end up running redundant SQL queries.
-
-Two candidate fixes under consideration:
-
-1. **Cap-1 channel.** Change `SyncSender<()>` capacity from 1024 to 1
-   in `SharedUpdateWatcher::subscribe`. Bursts collapse at the channel
-   level; the consumer's re-query reads the latest state regardless of
-   how many wakes were dropped. One-line change, no API impact.
-
-2. **Generation counter on each wake.** Replace `SyncSender<()>` with
-   `SyncSender<u64>` carrying a monotonic generation; consumer tracks
-   "last generation I processed" and skips wakes ≤ that. More flexible
-   (consumers can dedup at any granularity) but bigger API change.
-
-Verification: a test that runs 100 rapid commits under the kernel
-watcher and asserts ≤ 2 SQL queries on the consumer side.
-
 ## Phase Atlas — Map Experimental Backend Edge-Case Behavior
 
 > After: Phase Echo · Before: 1.0 release prep
