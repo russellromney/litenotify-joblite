@@ -58,11 +58,17 @@ dotnet test packages/honker-dotnet/tests/Honker.Tests/Honker.Tests.csproj
 
 ## Release
 
-CI now smoke-tests `dotnet pack` on every supported OS. NuGet publish
-is handled by `.github/workflows/release-dotnet.yml`:
+CI smoke-tests `dotnet pack` on every supported OS, but package publish
+is intentionally manual.
 
-- push a tag like `dotnet-v0.1.0`, or
-- run the workflow manually with a version input
+Typical local release flow:
 
-The workflow builds per-RID native extension artifacts, assembles them
-into one NuGet package, then pushes it with `NUGET_API_KEY`.
+```bash
+cargo build --release -p honker-extension
+mkdir -p packages/honker-dotnet/src/Honker/package-assets/runtimes/<rid>/native
+cp target/release/<native-lib-name> packages/honker-dotnet/src/Honker/package-assets/runtimes/<rid>/native/
+dotnet pack packages/honker-dotnet/src/Honker/Honker.csproj -c Release -p:PackageVersion=<version> -o artifacts/honker-dotnet
+dotnet nuget push artifacts/honker-dotnet/*.nupkg --source https://api.nuget.org/v3/index.json --api-key <key>
+```
+
+That keeps NuGet credentials out of GitHub Actions.
