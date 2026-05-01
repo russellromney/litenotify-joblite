@@ -91,7 +91,13 @@ where
     // message. The watcher's per-file -wal/-shm watches would be on
     // the old inode and silently miss writes to the new one — louder
     // failure is better than silent miss.
-    let initial_id = stat_identity(&db_path).unwrap_or((0, 0));
+    let initial_id = match stat_identity(&db_path) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("honker: failed to stat database for identity check: {e}");
+            (0, 0)
+        }
+    };
     let mut last_id_check = Instant::now();
 
     while !stop.load(Ordering::Acquire) {
@@ -107,24 +113,38 @@ where
             _ => {} // timeout, or Access event — ignore
         }
         if last_id_check.elapsed() >= Duration::from_millis(IDENTITY_CHECK_MS) {
-            check_db_identity(&db_path, initial_id);
+            if check_db_identity(&db_path, initial_id) {
+                on_change();
+            }
             last_id_check = Instant::now();
         }
     }
 }
 
 /// Panics if the db file at `db_path` has been replaced since startup.
-/// Same shape and same message as the polling backend's check so the
-/// failure looks identical regardless of which backend the user picked.
-fn check_db_identity(db_path: &std::path::Path, initial: (u64, u64)) {
-    let Ok(current) = stat_identity(db_path) else { return };
-    if current != initial {
-        panic!(
-            "honker: database file replaced: \
-             expected (dev={}, ino={}), found (dev={}, ino={}) at {:?}. \
-             Restart required.",
-            initial.0, initial.1, current.0, current.1, db_path
-        );
+/// Same shape, same message, and same stat-error behavior as the
+/// polling backend's check (`run_poll_loop`) so failures look
+/// identical regardless of which backend the user picked.
+///
+/// Returns `true` if the caller should fire a conservative `on_change`
+/// (matches polling's "stat error → wake consumer to re-check" path).
+fn check_db_identity(db_path: &std::path::Path, initial: (u64, u64)) -> bool {
+    match stat_identity(db_path) {
+        Ok(current) => {
+            if current != initial {
+                panic!(
+                    "honker: database file replaced: \
+                     expected (dev={}, ino={}), found (dev={}, ino={}) at {:?}. \
+                     Restart required.",
+                    initial.0, initial.1, current.0, current.1, db_path
+                );
+            }
+            false
+        }
+        Err(e) => {
+            eprintln!("honker: stat identity check failed: {e}");
+            true
+        }
     }
 }
 

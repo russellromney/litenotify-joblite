@@ -91,8 +91,20 @@ where
     // otherwise — the mmap stays on the old -shm inode and iChange
     // never advances again. Same cadence as the polling backend so
     // file-replacement detection latency doesn't depend on backend.
-    let initial_db_id = stat_identity(&db_path).unwrap_or((0, 0));
-    let initial_shm_id = stat_identity(&shm_path).unwrap_or((0, 0));
+    let initial_db_id = match stat_identity(&db_path) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("honker: failed to stat database for identity check: {e}");
+            (0, 0)
+        }
+    };
+    let initial_shm_id = match stat_identity(&shm_path) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("honker: failed to stat -shm for identity check: {e}");
+            (0, 0)
+        }
+    };
     let mut tick: u64 = 0;
 
     while !stop.load(Ordering::Acquire) {
@@ -104,8 +116,15 @@ where
         }
         tick += 1;
         if tick % IDENTITY_CHECK_TICKS == 0 {
-            check_identity(&db_path, initial_db_id, "database file");
-            check_identity(&shm_path, initial_shm_id, "-shm file");
+            // Either stat error or successful inode-unchanged result
+            // returns false; only an actual replacement panics. If
+            // either stat errored, fire a conservative on_change so
+            // the consumer re-checks state — matches polling.
+            let any_err = check_identity(&db_path, initial_db_id, "database file")
+                | check_identity(&shm_path, initial_shm_id, "-shm file");
+            if any_err {
+                on_change();
+            }
         }
     }
 }
@@ -114,15 +133,26 @@ where
 /// for both the db file (parity with polling backend's dead-man's
 /// switch) and the -shm file (specific failure mode for this backend
 /// — a recreated -shm leaves our mmap on a deleted inode).
-fn check_identity(path: &std::path::Path, initial: (u64, u64), label: &str) {
-    let Ok(current) = stat_identity(path) else { return };
-    if current != initial {
-        panic!(
-            "honker: {label} replaced: \
-             expected (dev={}, ino={}), found (dev={}, ino={}) at {:?}. \
-             Restart required.",
-            initial.0, initial.1, current.0, current.1, path
-        );
+///
+/// Returns `true` on stat error so the caller can fire a conservative
+/// `on_change` (matches polling's "stat error → wake to re-check" path).
+fn check_identity(path: &std::path::Path, initial: (u64, u64), label: &str) -> bool {
+    match stat_identity(path) {
+        Ok(current) => {
+            if current != initial {
+                panic!(
+                    "honker: {label} replaced: \
+                     expected (dev={}, ino={}), found (dev={}, ino={}) at {:?}. \
+                     Restart required.",
+                    initial.0, initial.1, current.0, current.1, path
+                );
+            }
+            false
+        }
+        Err(e) => {
+            eprintln!("honker: stat identity check failed for {label}: {e}");
+            true
+        }
     }
 }
 
