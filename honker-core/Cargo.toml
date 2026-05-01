@@ -12,6 +12,12 @@ categories = ["database", "concurrency"]
 
 [features]
 bundled-sqlite = ["rusqlite/bundled"]
+# Optional kernel-watch backend: use OS filesystem notifications as wake
+# hints (still verifies via PRAGMA data_version). Experimental.
+kernel-watcher = ["dep:notify"]
+# Optional shm fast path: read the SQLite WAL index shared-memory file
+# directly instead of running PRAGMA data_version. Experimental.
+shm-fast-path = ["dep:memmap2"]
 
 [lib]
 name = "honker_core"
@@ -23,6 +29,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 parking_lot = "0.12.5"
 rusqlite = { version = "0.39.0", features = ["functions", "hooks"] }
 thiserror = "2.0.18"
+# Optional: kernel-watch backend.
+# macos_kqueue: on macOS, use kqueue (RecommendedWatcher = KqueueWatcher) instead of
+# FSEvents. FSEvents has a 1 s batching latency — worse than 1 ms polling. kqueue
+# delivers per-event notifications immediately, matching the intent of this backend.
+notify = { version = "6", optional = true, features = ["macos_kqueue"] }
+# Optional: shm fast path.
+memmap2 = { version = "0.9", optional = true }
 
 # file-id only supports unix and windows. Other targets (WASI, Redox,
 # illumos, etc.) get the `(0, 0)` fallback in stat_identity.

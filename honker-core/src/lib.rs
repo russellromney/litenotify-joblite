@@ -36,6 +36,10 @@
 
 pub mod cron;
 mod honker_ops;
+#[cfg(feature = "kernel-watcher")]
+mod kernel_watcher;
+#[cfg(feature = "shm-fast-path")]
+mod shm_watcher;
 
 pub use honker_ops::attach_honker_functions;
 
@@ -48,6 +52,47 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::Duration;
+
+// ---------------------------------------------------------------------
+// Watcher backend configuration
+// ---------------------------------------------------------------------
+
+/// Which backend drives the update-detection loop.
+///
+/// `Polling` is the default: 1 ms `PRAGMA data_version` loop, proven
+/// correct across all platforms. The optional backends are **experimental**
+/// — they must first prove equivalence to the polling path before
+/// being relied on for correctness.
+#[derive(Debug, Clone, Default)]
+pub enum WatcherBackend {
+    /// Default: 1 ms `PRAGMA data_version` polling loop.
+    #[default]
+    Polling,
+    /// OS kernel filesystem notifications as wake hints (experimental).
+    ///
+    /// Requires the `kernel-watcher` Cargo feature. Notifications fire
+    /// the `PRAGMA data_version` check immediately; SQLite remains the
+    /// source of truth. Falls back to polling if notifications are
+    /// unavailable. A 500 ms safety-net poll runs even without events.
+    #[cfg(feature = "kernel-watcher")]
+    KernelWatch,
+    /// mmap `-shm` WAL index fast path (experimental).
+    ///
+    /// Requires the `shm-fast-path` Cargo feature. Reads `iChange` from
+    /// the WAL index shared-memory file at 100 µs cadence instead of
+    /// running a SQL query. Only active in WAL mode on little-endian
+    /// platforms when the index header passes a version guard. Falls back
+    /// to PRAGMA polling on any guard failure or missing shm file.
+    #[cfg(feature = "shm-fast-path")]
+    ShmFastPath,
+}
+
+/// Configuration passed to [`UpdateWatcher::spawn_with_config`] and
+/// [`SharedUpdateWatcher::new_with_config`].
+#[derive(Debug, Clone, Default)]
+pub struct WatcherConfig {
+    pub backend: WatcherBackend,
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -462,7 +507,7 @@ fn closed_err() -> Error {
 /// detection is disabled but the watcher still functions. Nobody is
 /// known to deploy honker there today.
 #[cfg(any(unix, windows))]
-fn stat_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+pub(crate) fn stat_identity(path: &Path) -> std::io::Result<(u64, u64)> {
     let id = file_id::get_file_id(path)?;
     match id {
         file_id::FileId::Inode {
@@ -501,7 +546,7 @@ fn fold_high_res(volume_serial_number: u64, file_id: u128) -> (u64, u64) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn stat_identity(_path: &Path) -> std::io::Result<(u64, u64)> {
+pub(crate) fn stat_identity(_path: &Path) -> std::io::Result<(u64, u64)> {
     Ok((0, 0))
 }
 
@@ -510,12 +555,13 @@ fn stat_identity(_path: &Path) -> std::io::Result<(u64, u64)> {
 /// connection (and on checkpoint). Empirically verified to detect
 /// cross-connection database updates on all SQLite versions tested.
 /// Cost: ~3.5 µs/call = ~3.5 ms/sec at 1 kHz.
-fn poll_data_version(conn: &Connection) -> Result<u32, String> {
+pub(crate) fn poll_data_version(conn: &Connection) -> Result<u32, String> {
     conn.pragma_query_value(None, "data_version", |row| row.get(0))
         .map_err(|e| e.to_string())
 }
 
-/// Background thread that polls a SQLite database file for changes.
+/// Polling loop body shared by [`UpdateWatcher`] (polling backend) and
+/// the fallback path inside [`kernel_watcher`] / [`shm_watcher`].
 ///
 /// Three-layer defensive architecture:
 ///
@@ -526,21 +572,131 @@ fn poll_data_version(conn: &Connection) -> Result<u32, String> {
 /// 3. **Identity check (every 100 ms):** `stat(db_path)` to compare
 ///    `(dev, ino)`. If the file was replaced, panic with a clear
 ///    message — continuing would silently watch stale data.
-///
-/// Why PRAGMA data_version instead of stat on the WAL? It is a
-/// counter, not a timestamp — immune to clock skew, WAL truncation,
-/// and exact-size collisions. It also ignores rolled-back transactions
-/// that touch the WAL but never commit.
+pub(crate) fn run_poll_loop<F>(db_path: PathBuf, on_change: F, stop: Arc<AtomicBool>)
+where
+    F: Fn(),
+{
+    let mut conn = match Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("honker: failed to open watcher connection: {e}");
+            None
+        }
+    };
+    let mut last_version = conn
+        .as_ref()
+        .and_then(|c| poll_data_version(c).ok())
+        .unwrap_or(0);
+    let initial_identity = match stat_identity(&db_path) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("honker: failed to stat database for identity check: {e}");
+            (0, 0)
+        }
+    };
+    let mut tick: u64 = 0;
+
+    while !stop.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(1));
+
+        // Path 1: PRAGMA data_version (fast path)
+        if let Some(ref c) = conn {
+            match poll_data_version(c) {
+                Ok(version) => {
+                    if version != last_version {
+                        last_version = version;
+                        on_change();
+                    }
+                }
+                Err(e) => {
+                    eprintln!("honker: data_version poll failed: {e}");
+                    conn = None;
+                    on_change(); // conservative wake
+                }
+            }
+        } else {
+            // Path 2: reconnect after transient failure
+            match Connection::open_with_flags(
+                &db_path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ) {
+                Ok(c) => {
+                    last_version = poll_data_version(&c).unwrap_or(0);
+                    conn = Some(c);
+                }
+                Err(e) => {
+                    eprintln!("honker: reconnect failed: {e}");
+                }
+            }
+        }
+
+        // Path 3: stat identity check (dead-man's switch).
+        //
+        // Triggers on Linux/macOS scenarios that swap the
+        // db file out from under us — atomic rename
+        // (litestream restore), volume remount, NFS
+        // server restart. On Windows the kernel rejects
+        // rename-over-open even with `FILE_SHARE_DELETE`,
+        // so the practical replacement scenarios that
+        // trigger this on unix don't happen in the same
+        // way; the dead-man's switch is effectively a
+        // no-op on Windows. Identity check still runs,
+        // it just rarely sees a difference.
+        tick += 1;
+        if tick % 100 == 0 {
+            match stat_identity(&db_path) {
+                Ok(current) => {
+                    if current != initial_identity {
+                        panic!(
+                            "honker: database file replaced: \
+                             expected (dev={}, ino={}), \
+                             found (dev={}, ino={}) at {:?}. \
+                             Restart required.",
+                            initial_identity.0,
+                            initial_identity.1,
+                            current.0,
+                            current.1,
+                            db_path
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("honker: stat identity check failed: {e}");
+                    conn = None;
+                    on_change();
+                }
+            }
+        }
+    }
+}
+
+/// Background thread that polls a SQLite database file for changes.
+/// Dispatches to the backend selected in [`WatcherConfig`].
+/// See [`run_poll_loop`] for the default polling backend's architecture.
 pub struct UpdateWatcher {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl UpdateWatcher {
-    /// Spawn a watcher thread on `db_path`. `on_change` is called
-    /// once per observed commit. The thread runs until [`UpdateWatcher`]
-    /// is dropped or [`stop`](Self::stop) is called.
+    /// Spawn a watcher thread on `db_path` using the default polling
+    /// backend. `on_change` is called once per observed commit. The
+    /// thread runs until [`UpdateWatcher`] is dropped or
+    /// [`stop`](Self::stop) is called.
     pub fn spawn<F>(db_path: PathBuf, on_change: F) -> Self
+    where
+        F: Fn() + Send + 'static,
+    {
+        Self::spawn_with_config(db_path, on_change, WatcherConfig::default())
+    }
+
+    /// Like [`spawn`](Self::spawn) but with an explicit watcher backend.
+    /// The optional `KernelWatch` and `ShmFastPath` backends are
+    /// experimental — see [`WatcherBackend`] for the safety contracts.
+    pub fn spawn_with_config<F>(db_path: PathBuf, on_change: F, config: WatcherConfig) -> Self
     where
         F: Fn() + Send + 'static,
     {
@@ -549,99 +705,15 @@ impl UpdateWatcher {
         let handle = std::thread::Builder::new()
             .name("honker-update-poll".into())
             .spawn(move || {
-                let mut conn = match Connection::open_with_flags(
-                    &db_path,
-                    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                ) {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        eprintln!("honker: failed to open watcher connection: {e}");
-                        None
+                match config.backend {
+                    WatcherBackend::Polling => run_poll_loop(db_path, on_change, stop_t),
+                    #[cfg(feature = "kernel-watcher")]
+                    WatcherBackend::KernelWatch => {
+                        kernel_watcher::run_kernel_watch_loop(db_path, on_change, stop_t);
                     }
-                };
-                let mut last_version = conn
-                    .as_ref()
-                    .and_then(|c| poll_data_version(c).ok())
-                    .unwrap_or(0);
-                let initial_identity = match stat_identity(&db_path) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        eprintln!("honker: failed to stat database for identity check: {e}");
-                        (0, 0)
-                    }
-                };
-                let mut tick: u64 = 0;
-
-                while !stop_t.load(Ordering::Acquire) {
-                    std::thread::sleep(Duration::from_millis(1));
-
-                    // Path 1: PRAGMA data_version (fast path)
-                    if let Some(ref c) = conn {
-                        match poll_data_version(c) {
-                            Ok(version) => {
-                                if version != last_version {
-                                    last_version = version;
-                                    on_change();
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("honker: data_version poll failed: {e}");
-                                conn = None;
-                                on_change(); // conservative wake
-                            }
-                        }
-                    } else {
-                        // Path 2: reconnect after transient failure
-                        match Connection::open_with_flags(
-                            &db_path,
-                            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                        ) {
-                            Ok(c) => {
-                                last_version = poll_data_version(&c).unwrap_or(0);
-                                conn = Some(c);
-                            }
-                            Err(e) => {
-                                eprintln!("honker: reconnect failed: {e}");
-                            }
-                        }
-                    }
-
-                    // Path 3: stat identity check (dead-man's switch).
-                    //
-                    // Triggers on Linux/macOS scenarios that swap the
-                    // db file out from under us — atomic rename
-                    // (litestream restore), volume remount, NFS
-                    // server restart. On Windows the kernel rejects
-                    // rename-over-open even with `FILE_SHARE_DELETE`,
-                    // so the practical replacement scenarios that
-                    // trigger this on unix don't happen in the same
-                    // way; the dead-man's switch is effectively a
-                    // no-op on Windows. Identity check still runs,
-                    // it just rarely sees a difference.
-                    tick += 1;
-                    if tick % 100 == 0 {
-                        match stat_identity(&db_path) {
-                            Ok(current) => {
-                                if current != initial_identity {
-                                    panic!(
-                                        "honker: database file replaced: \
-                                         expected (dev={}, ino={}), \
-                                         found (dev={}, ino={}) at {:?}. \
-                                         Restart required.",
-                                        initial_identity.0,
-                                        initial_identity.1,
-                                        current.0,
-                                        current.1,
-                                        db_path
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("honker: stat identity check failed: {e}");
-                                conn = None;
-                                on_change();
-                            }
-                        }
+                    #[cfg(feature = "shm-fast-path")]
+                    WatcherBackend::ShmFastPath => {
+                        shm_watcher::run_shm_fast_path_loop(db_path, on_change, stop_t);
                     }
                 }
             })
@@ -715,18 +787,28 @@ pub struct SharedUpdateWatcher {
 }
 
 impl SharedUpdateWatcher {
-    /// Spawn the shared poll thread for `db_path`.
+    /// Spawn the shared poll thread for `db_path` using the default
+    /// polling backend.
     pub fn new(db_path: PathBuf) -> Self {
+        Self::new_with_config(db_path, WatcherConfig::default())
+    }
+
+    /// Like [`new`](Self::new) but with an explicit watcher backend.
+    pub fn new_with_config(db_path: PathBuf, config: WatcherConfig) -> Self {
         let senders: Arc<Mutex<HashMap<u64, SyncSender<()>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let senders_t = senders.clone();
-        let watcher = UpdateWatcher::spawn(db_path, move || {
-            let mut list = senders_t.lock();
-            list.retain(|_id, s| match s.try_send(()) {
-                Ok(()) | Err(TrySendError::Full(_)) => true,
-                Err(TrySendError::Disconnected(_)) => false,
-            });
-        });
+        let watcher = UpdateWatcher::spawn_with_config(
+            db_path,
+            move || {
+                let mut list = senders_t.lock();
+                list.retain(|_id, s| match s.try_send(()) {
+                    Ok(()) | Err(TrySendError::Full(_)) => true,
+                    Err(TrySendError::Disconnected(_)) => false,
+                });
+            },
+            config,
+        );
         Self {
             watcher: Mutex::new(Some(watcher)),
             senders,
@@ -1752,4 +1834,146 @@ while True:
             .unwrap();
         assert_eq!(sc_cols, vec!["name", "topic", "offset"]);
     }
+
+    // -----------------------------------------------------------------
+    // Optional backend tests
+    // -----------------------------------------------------------------
+
+    /// Run the wake/listen suite against the kernel-watch backend.
+    /// Each commit separated by 20 ms ensures both the 1 ms poller
+    /// and the kernel-watch loop have time to fire before the next.
+    #[test]
+    #[cfg(feature = "kernel-watcher")]
+    fn kernel_watcher_detects_all_commits() {
+        use std::sync::atomic::{AtomicU32, Ordering as AO};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-kernel-watcher-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let writer = open_conn(tmp.to_str().unwrap(), false).unwrap();
+        writer.execute_batch("CREATE TABLE t (x INT)").unwrap();
+        // One initial write ensures the -wal file exists so the watcher
+        // can attach a per-file watch at startup (kqueue watches the file
+        // descriptor, not the directory, for write events).
+        writer.execute("INSERT INTO t VALUES (0)", []).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let count = Arc::new(AtomicU32::new(0));
+        let count_t = count.clone();
+        let watcher = UpdateWatcher::spawn_with_config(
+            tmp.clone(),
+            move || {
+                count_t.fetch_add(1, AO::Relaxed);
+            },
+            WatcherConfig { backend: WatcherBackend::KernelWatch },
+        );
+
+        // Drain any initialization wakes.
+        std::thread::sleep(Duration::from_millis(50));
+        count.store(0, AO::SeqCst);
+
+        // n commits spaced 30 ms apart — gives the event loop time to
+        // process each event individually before the next arrives.
+        let n: u32 = 5;
+        for i in 1..=n {
+            writer
+                .execute(&format!("INSERT INTO t VALUES ({i})"), [])
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        // Wait longer than both the event delivery latency and the
+        // safety-net interval to drain any pending events.
+        std::thread::sleep(Duration::from_millis(600));
+
+        let observed = count.load(AO::SeqCst);
+        drop(watcher);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+
+        assert_eq!(
+            observed, n,
+            "kernel watcher detected {observed} wakes, expected {n}"
+        );
+    }
+
+    /// Prove that the shm fast path fires on the same commits as the
+    /// baseline `PRAGMA data_version` poller.
+    ///
+    /// Phase gate: both detectors must report exactly N wakes for N
+    /// commits spaced far enough apart that neither can batch them.
+    #[test]
+    #[cfg(feature = "shm-fast-path")]
+    fn shm_fast_path_equivalence_with_pragma_baseline() {
+        use std::sync::atomic::{AtomicU32, Ordering as AO};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-shm-equiv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let writer = open_conn(tmp.to_str().unwrap(), false).unwrap();
+        writer.execute_batch("CREATE TABLE t (x INT)").unwrap();
+        // One write ensures the -shm file exists before spawning the shm watcher.
+        writer.execute("INSERT INTO t VALUES (0)", []).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let baseline_count = Arc::new(AtomicU32::new(0));
+        let baseline_t = baseline_count.clone();
+        let baseline = UpdateWatcher::spawn(tmp.clone(), move || {
+            baseline_t.fetch_add(1, AO::Relaxed);
+        });
+
+        let shm_count = Arc::new(AtomicU32::new(0));
+        let shm_t = shm_count.clone();
+        let shm = UpdateWatcher::spawn_with_config(
+            tmp.clone(),
+            move || { shm_t.fetch_add(1, AO::Relaxed); },
+            WatcherConfig { backend: WatcherBackend::ShmFastPath },
+        );
+
+        // Drain initialization wakes.
+        std::thread::sleep(Duration::from_millis(30));
+        baseline_count.store(0, AO::SeqCst);
+        shm_count.store(0, AO::SeqCst);
+
+        // Commits spaced 20 ms apart — well above both polling intervals.
+        let n: u32 = 5;
+        for i in 1..=n {
+            writer
+                .execute(&format!("INSERT INTO t VALUES ({i})"), [])
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+
+        let b = baseline_count.load(AO::SeqCst);
+        let s = shm_count.load(AO::SeqCst);
+
+        drop(baseline);
+        drop(shm);
+        drop(writer);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+
+        assert_eq!(b, n, "baseline detected {b} wakes, expected {n}");
+        assert_eq!(
+            s, n,
+            "shm fast path detected {s} wakes, expected {n} (same as baseline {b})"
+        );
+    }
 }
+
