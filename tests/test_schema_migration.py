@@ -143,6 +143,55 @@ def test_legacy_scheduler_state_table_leftover_is_harmless(db_path):
     check.close()
 
 
+def test_scheduler_tasks_max_runs_columns_added_on_existing_db(db_path):
+    """Existing DBs that lack max_runs / run_count in _honker_scheduler_tasks
+    get those columns added automatically on open (ALTER TABLE migration)."""
+    # Build a DB with the old scheduler-tasks schema (no max_runs/run_count).
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        PRAGMA journal_mode=WAL;
+        CREATE TABLE _honker_scheduler_tasks (
+          name TEXT PRIMARY KEY,
+          queue TEXT NOT NULL,
+          cron_expr TEXT NOT NULL,
+          payload TEXT NOT NULL,
+          priority INTEGER NOT NULL DEFAULT 0,
+          expires_s INTEGER,
+          next_fire_at INTEGER NOT NULL
+        );
+        INSERT INTO _honker_scheduler_tasks
+          (name, queue, cron_expr, payload, next_fire_at)
+          VALUES ('old-task', 'q', '* * * * *', '"go"', 9999999999);
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    # Opening with current honker should run the migration.
+    db = honker.open(db_path)
+    db.queue("q")
+
+    check = sqlite3.connect(db_path)
+    cols = {
+        r[1]
+        for r in check.execute(
+            "PRAGMA table_info(_honker_scheduler_tasks)"
+        ).fetchall()
+    }
+    check.close()
+
+    assert "max_runs" in cols, "max_runs column missing after migration"
+    assert "run_count" in cols, "run_count column missing after migration"
+
+    # Existing row must still be readable and have sensible defaults.
+    rows = db.query(
+        "SELECT max_runs, run_count FROM _honker_scheduler_tasks WHERE name='old-task'"
+    )
+    assert rows[0]["max_runs"] is None
+    assert rows[0]["run_count"] == 0
+
+
 def test_fresh_db_has_all_current_tables(db_path):
     """Sanity: a fresh (non-legacy) DB boots with every table the
     current schema expects. Catches regressions where a table is

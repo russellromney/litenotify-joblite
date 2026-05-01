@@ -203,7 +203,9 @@ pub const BOOTSTRAP_HONKER_SQL: &str = "
       payload TEXT NOT NULL,
       priority INTEGER NOT NULL DEFAULT 0,
       expires_s INTEGER,
-      next_fire_at INTEGER NOT NULL
+      next_fire_at INTEGER NOT NULL,
+      max_runs INTEGER,
+      run_count INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS _honker_results (
       job_id INTEGER PRIMARY KEY,
@@ -237,6 +239,25 @@ pub const BOOTSTRAP_HONKER_SQL: &str = "
 /// DELETE-journal database. Cross-process wake is their responsibility.
 pub fn bootstrap_honker_schema(conn: &Connection) -> Result<(), Error> {
     conn.execute_batch(BOOTSTRAP_HONKER_SQL)?;
+    // Migrations for existing DBs that predate new columns.
+    // ALTER TABLE ADD COLUMN is not idempotent in SQLite, so we check
+    // pragma_table_info first and skip if the column already exists.
+    for (col, def) in [
+        ("max_runs", "INTEGER"),
+        ("run_count", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        let exists: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('_honker_scheduler_tasks') WHERE name = ?1",
+            rusqlite::params![col],
+            |r| r.get(0),
+        )?;
+        if !exists {
+            conn.execute_batch(&format!(
+                "ALTER TABLE _honker_scheduler_tasks ADD COLUMN {} {}",
+                col, def
+            ))?;
+        }
+    }
     Ok(())
 }
 
@@ -1716,6 +1737,8 @@ while True:
                 "priority",
                 "expires_s",
                 "next_fire_at",
+                "max_runs",
+                "run_count",
             ],
         );
         let res_cols: Vec<String> = conn

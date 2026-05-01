@@ -189,7 +189,7 @@ SELECT honker_rate_limit_try('api', 10, 60);                 -- 1 = under, 0 = a
 SELECT honker_rate_limit_sweep(3600);                        -- drop windows >1h old
 SELECT honker_cron_next_after('0 3 * * *', unixepoch());     -- unix ts of next fire
 SELECT honker_scheduler_register('nightly', 'backups',
-  '0 3 * * *', '"go"', 0, NULL);                         -- register periodic task
+  '0 3 * * *', '"go"', 0, NULL, NULL);                   -- register periodic task (max_runs=NULL = unlimited)
 SELECT honker_scheduler_tick(unixepoch());                   -- JSON: fires due
 SELECT honker_scheduler_soonest();                           -- min next_fire_at
 SELECT honker_scheduler_unregister('nightly');               -- 1 = deleted

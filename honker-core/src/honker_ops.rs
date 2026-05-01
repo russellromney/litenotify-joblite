@@ -116,13 +116,15 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     )?;
 
     // honker_scheduler_register(name, queue, cron_expr, payload_json,
-    //                       priority, expires_s_or_null) -> 1.
+    //                       priority, expires_s_or_null, max_runs_or_null) -> 1.
     // Upserts the task row. `next_fire_at` is recomputed as the next
     // cron boundary strictly after `unixepoch()`. Calling twice with
     // the same name replaces the first registration entirely.
+    // `max_runs` limits how many times the task fires before being
+    // automatically unregistered; NULL means unlimited.
     conn.create_scalar_function(
         "honker_scheduler_register",
-        6,
+        7,
         FunctionFlags::SQLITE_UTF8,
         |ctx| {
             let name: String = ctx.get(0)?;
@@ -131,9 +133,10 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
             let payload: String = ctx.get(3)?;
             let priority: i64 = ctx.get(4)?;
             let expires_s: Option<i64> = ctx.get(5)?;
+            let max_runs: Option<i64> = ctx.get(6)?;
             let db = unsafe { ctx.get_connection() }?;
             scheduler_register(
-                &db, &name, &queue, &cron_expr, &payload, priority, expires_s,
+                &db, &name, &queue, &cron_expr, &payload, priority, expires_s, max_runs,
             )
             .map_err(to_sql_err)
         },
@@ -797,7 +800,8 @@ pub fn rate_limit_sweep(conn: &Connection, older_than_s: i64) -> rusqlite::Resul
 /// Register (or re-register) a periodic task. `next_fire_at` is
 /// computed as the next cron boundary strictly after
 /// `unixepoch()`. Calling twice with the same name replaces the
-/// first registration entirely.
+/// first registration entirely. `max_runs` limits total fires before
+/// automatic unregistration; `None` means unlimited.
 pub fn scheduler_register(
     conn: &Connection,
     name: &str,
@@ -806,20 +810,23 @@ pub fn scheduler_register(
     payload: &str,
     priority: i64,
     expires_s: Option<i64>,
+    max_runs: Option<i64>,
 ) -> rusqlite::Result<i64> {
     let now = now_unix(conn)?;
     let next_fire_at = super::cron::next_after_unix(cron_expr, now).map_err(to_sql_err)?;
     conn.execute(
         "INSERT INTO _honker_scheduler_tasks
-           (name, queue, cron_expr, payload, priority, expires_s, next_fire_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+           (name, queue, cron_expr, payload, priority, expires_s, next_fire_at, max_runs, run_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0)
          ON CONFLICT(name) DO UPDATE SET
            queue = excluded.queue,
            cron_expr = excluded.cron_expr,
            payload = excluded.payload,
            priority = excluded.priority,
            expires_s = excluded.expires_s,
-           next_fire_at = excluded.next_fire_at",
+           next_fire_at = excluded.next_fire_at,
+           max_runs = excluded.max_runs,
+           run_count = 0",
         rusqlite::params![
             name,
             queue,
@@ -827,7 +834,8 @@ pub fn scheduler_register(
             payload,
             priority,
             expires_s,
-            next_fire_at
+            next_fire_at,
+            max_runs,
         ],
     )?;
     // Wake any sleeping scheduler leader so it re-computes
@@ -874,9 +882,10 @@ fn scheduler_wake(conn: &Connection) -> rusqlite::Result<()> {
 /// Returns a JSON array of `{name, queue, fire_at, job_id}` fires.
 pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<String> {
     #[allow(clippy::type_complexity)]
-    let tasks: Vec<(String, String, String, String, i64, Option<i64>, i64)> = {
+    let tasks: Vec<(String, String, String, String, i64, Option<i64>, i64, Option<i64>, i64)> = {
         let mut stmt = conn.prepare_cached(
-            "SELECT name, queue, cron_expr, payload, priority, expires_s, next_fire_at
+            "SELECT name, queue, cron_expr, payload, priority, expires_s, next_fire_at,
+                    max_runs, run_count
              FROM _honker_scheduler_tasks
              WHERE next_fire_at <= ?1",
         )?;
@@ -889,20 +898,30 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
                 r.get::<_, i64>(4)?,
                 r.get::<_, Option<i64>>(5)?,
                 r.get::<_, i64>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+                r.get::<_, i64>(8)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?
     };
     let mut out = String::from("[");
     let mut first = true;
-    for (name, queue, cron_expr, payload, priority, expires_s, mut next_fire_at) in tasks {
+    for (name, queue, cron_expr, payload, priority, expires_s, mut next_fire_at, max_runs, run_count) in tasks {
+        let mut local_run_count = run_count;
         while next_fire_at <= now_unix {
+            // Stop if this task has hit its run limit.
+            if let Some(limit) = max_runs {
+                if local_run_count >= limit {
+                    break;
+                }
+            }
             // Enqueue at this boundary. `run_at` is NULL (claimable
             // immediately); `expires` is the task's expires_s if set.
             let job_id = enqueue(
                 conn, &queue, &payload, None, None, priority, 3, /* max_attempts default */
                 expires_s,
             )?;
+            local_run_count += 1;
             if !first {
                 out.push(',');
             }
@@ -918,12 +937,20 @@ pub fn scheduler_tick(conn: &Connection, now_unix: i64) -> rusqlite::Result<Stri
             next_fire_at =
                 super::cron::next_after_unix(&cron_expr, next_fire_at).map_err(to_sql_err)?;
         }
-        // Persist the advanced next_fire_at.
-        conn.execute(
-            "UPDATE _honker_scheduler_tasks
-             SET next_fire_at = ?2 WHERE name = ?1",
-            rusqlite::params![name, next_fire_at],
-        )?;
+        // If the run limit is exhausted, unregister the task entirely.
+        // Otherwise persist the advanced next_fire_at and updated run_count.
+        if max_runs.is_some_and(|limit| local_run_count >= limit) {
+            conn.execute(
+                "DELETE FROM _honker_scheduler_tasks WHERE name = ?1",
+                rusqlite::params![name],
+            )?;
+        } else {
+            conn.execute(
+                "UPDATE _honker_scheduler_tasks
+                 SET next_fire_at = ?2, run_count = ?3 WHERE name = ?1",
+                rusqlite::params![name, next_fire_at, local_run_count],
+            )?;
+        }
     }
     out.push(']');
     Ok(out)

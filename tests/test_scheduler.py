@@ -467,3 +467,118 @@ async def test_scheduler_run_proceeds_if_another_process_registered(db_path):
         "scheduler silently returned without acquiring the lock — "
         "regression of Phase Shakedown (b)"
     )
+
+
+# ---------- max_runs ----------
+#
+# These tests use honker_scheduler_register SQL directly (same pattern
+# as test_scheduler_tick_*) rather than sched.add(max_runs=...) because
+# the Python Scheduler.add() binding in packages/honker needs a separate
+# update to expose the max_runs parameter.
+
+
+def _register_with_max_runs(db, name, queue, cron_expr, max_runs):
+    """Register a task via raw SQL, setting max_runs."""
+    with db.transaction() as tx:
+        tx.execute(
+            "SELECT honker_scheduler_register(?, ?, ?, '\"go\"', 0, NULL, ?)",
+            [name, queue, cron_expr, max_runs],
+        )
+    return int(
+        db.query(
+            "SELECT next_fire_at FROM _honker_scheduler_tasks WHERE name=?", [name]
+        )[0]["next_fire_at"]
+    )
+
+
+def test_scheduler_max_runs_unregisters_after_limit(db_path):
+    """A task with max_runs=3 fires exactly 3 times then removes itself
+    from _honker_scheduler_tasks."""
+    db = honker.open(db_path)
+    db.queue("limited-q")
+    boundary = _register_with_max_runs(db, "limited", "limited-q", "0 * * * *", 3)
+
+    # Rewind next_fire_at so 3 boundaries are overdue.
+    with db.transaction() as tx:
+        tx.execute(
+            "UPDATE _honker_scheduler_tasks SET next_fire_at=? WHERE name='limited'",
+            [boundary - 2 * 3600],  # 3 hourly boundaries: -2h, -1h, now
+        )
+
+    # Tick past all three boundaries.
+    with db.transaction() as tx:
+        result = tx.query("SELECT honker_scheduler_tick(?) AS j", [boundary + 1])
+    fires = json.loads(result[0]["j"])
+    assert len(fires) == 3
+
+    # Task must be gone from the scheduler table.
+    rows = db.query(
+        "SELECT COUNT(*) AS c FROM _honker_scheduler_tasks WHERE name='limited'"
+    )
+    assert rows[0]["c"] == 0, "task should be unregistered after max_runs exhausted"
+
+    # But all 3 jobs landed in the queue.
+    rows = db.query("SELECT COUNT(*) AS c FROM _honker_live WHERE queue='limited-q'")
+    assert rows[0]["c"] == 3
+
+
+def test_scheduler_max_runs_one(db_path):
+    """max_runs=1 fires exactly once then self-destructs."""
+    db = honker.open(db_path)
+    db.queue("once-q")
+    boundary = _register_with_max_runs(db, "once", "once-q", "* * * * *", 1)
+
+    with db.transaction() as tx:
+        result = tx.query("SELECT honker_scheduler_tick(?) AS j", [boundary + 1])
+    fires = json.loads(result[0]["j"])
+    assert len(fires) == 1
+
+    rows = db.query(
+        "SELECT COUNT(*) AS c FROM _honker_scheduler_tasks WHERE name='once'"
+    )
+    assert rows[0]["c"] == 0
+
+
+def test_scheduler_max_runs_none_fires_indefinitely(db_path):
+    """A task with no max_runs (NULL) stays registered after firing."""
+    db = honker.open(db_path)
+    db.queue("forever-q")
+    sched = Scheduler(db)
+    sched.add(name="forever", queue="forever-q", schedule=crontab("0 * * * *"))
+    row = db.query(
+        "SELECT next_fire_at FROM _honker_scheduler_tasks WHERE name='forever'"
+    )[0]
+    boundary = int(row["next_fire_at"])
+
+    with db.transaction() as tx:
+        tx.query("SELECT honker_scheduler_tick(?) AS j", [boundary + 1])
+
+    rows = db.query(
+        "SELECT COUNT(*) AS c FROM _honker_scheduler_tasks WHERE name='forever'"
+    )
+    assert rows[0]["c"] == 1, "unlimited task must remain registered after firing"
+
+
+def test_scheduler_max_runs_stops_catchup_at_limit(db_path):
+    """When catching up after downtime, max_runs caps the total fires
+    even if more boundaries are overdue."""
+    db = honker.open(db_path)
+    db.queue("cap-q")
+    boundary = _register_with_max_runs(db, "cap", "cap-q", "0 * * * *", 2)
+
+    # Rewind so 5 boundaries are overdue, but max_runs=2.
+    with db.transaction() as tx:
+        tx.execute(
+            "UPDATE _honker_scheduler_tasks SET next_fire_at=? WHERE name='cap'",
+            [boundary - 4 * 3600],
+        )
+
+    with db.transaction() as tx:
+        result = tx.query("SELECT honker_scheduler_tick(?) AS j", [boundary + 1])
+    fires = json.loads(result[0]["j"])
+    assert len(fires) == 2, f"expected 2 fires (max_runs cap), got {len(fires)}"
+
+    rows = db.query(
+        "SELECT COUNT(*) AS c FROM _honker_scheduler_tasks WHERE name='cap'"
+    )
+    assert rows[0]["c"] == 0

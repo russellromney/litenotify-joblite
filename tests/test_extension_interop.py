@@ -426,7 +426,7 @@ def test_extension_scheduler_register_and_tick(ext_db_path):
     conn.execute("SELECT honker_bootstrap()")
     conn.execute(
         "SELECT honker_scheduler_register('nightly', 'backups', '0 3 * * *', "
-        "'\"go\"', 0, NULL)"
+        "'\"go\"', 0, NULL, NULL)"
     )
     conn.commit()
     row = conn.execute(
