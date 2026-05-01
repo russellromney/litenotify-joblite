@@ -466,7 +466,7 @@ pub fn queue_next_claim_at(conn: &Connection, queue: &str) -> rusqlite::Result<i
                WHERE queue = ?1
                  AND state = 'processing'
                  AND (expires_at IS NULL OR expires_at > unixepoch())
-                 AND claim_expires_at > unixepoch()
+                 AND claim_expires_at >= unixepoch()
              )",
             rusqlite::params![queue],
             |r| r.get(0),

@@ -417,6 +417,33 @@ async def test_worker_wakes_on_reclaim_deadline(db_path):
     )
 
 
+def test_next_claim_at_includes_exact_reclaim_boundary(db_path):
+    """If a claim expires exactly at `unixepoch()`, the queue should
+    still report a future reclaim deadline instead of dropping into the
+    idle-poll fallback path.
+    """
+    db = honker.open(db_path)
+    q = db.queue("work", visibility_timeout_s=30)
+    q.enqueue({"n": 1})
+    first = q.claim_one("owner")
+    assert first is not None
+
+    with db.transaction() as tx:
+        tx.execute(
+            "UPDATE _honker_live SET claim_expires_at = unixepoch() WHERE id = ?",
+            [first.id],
+        )
+        rows = tx.query(
+            "SELECT honker_queue_next_claim_at(?) AS t",
+            ["work"],
+        )
+        now_rows = tx.query("SELECT unixepoch() AS now")
+
+    next_claim_at = int(rows[0]["t"])
+    now = int(now_rows[0]["now"])
+    assert next_claim_at == now + 1
+
+
 def test_worker_wakes_on_delayed_job_deadline_cross_process(db_path):
     """A real worker process should wake around `run_at` even when no
     new commit lands at the due moment.
