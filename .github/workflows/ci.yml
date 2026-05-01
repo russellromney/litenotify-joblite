@@ -254,10 +254,11 @@ jobs:
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
             . ../../.venv/Scripts/activate
+            maturin develop --release --features bundled-sqlite
           else
             . ../../.venv/bin/activate
+            maturin develop --release
           fi
-          maturin develop --release
       - name: Run pytest
         shell: bash
         run: |
@@ -324,7 +325,11 @@ jobs:
           uv pip install --python "$VENV_PY" maturin
           cd packages/honker
           . "../../$ACTIVATE"
-          maturin develop --release
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            maturin develop --release --features bundled-sqlite
+          else
+            maturin develop --release
+          fi
       - name: Build .node binary
         working-directory: packages/honker-node
         shell: bash

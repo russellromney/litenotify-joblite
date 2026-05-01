@@ -494,7 +494,7 @@ def test_extension_scheduler_interval_expression(ext_db_path):
     conn.execute("SELECT honker_bootstrap()")
     conn.execute(
         "SELECT honker_scheduler_register('fast', 'backups', '@every 1s', "
-        "'\"go\"', 0, NULL, NULL)"
+        "'\"go\"', 0, NULL)"
     )
     conn.commit()
 
