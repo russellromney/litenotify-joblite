@@ -1975,5 +1975,294 @@ while True:
             "shm fast path detected {s} wakes, expected {n} (same as baseline {b})"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Journal-mode coverage for the experimental backends
+    //
+    // honker's `open_conn` always sets WAL, so the public Python/Node
+    // surface is WAL-only. These tests poke the watchers directly at
+    // databases pre-set to non-WAL modes so we can prove behavior when
+    // the file is in DELETE / TRUNCATE / PERSIST. Justification per
+    // backend:
+    //
+    // - Polling — universally works because `PRAGMA data_version`
+    //   advances on every commit regardless of journal mode. Already
+    //   exercised by `poll_data_version_works_in_*`.
+    //
+    // - Kernel watcher — in non-WAL modes there is no `-wal` file to
+    //   watch directly; we must rely on the parent-directory watch to
+    //   pick up `-journal` create / modify / delete events around each
+    //   commit. The PRAGMA verification step still gates `on_change()`,
+    //   so spurious events (e.g. another file in the dir) just produce
+    //   harmless no-op checks.
+    //
+    // - SHM fast path — in non-WAL modes there is no `-shm` file;
+    //   `read_ichange` returns `None` and the loop falls back to the
+    //   PRAGMA check on every iteration. Effectively becomes a 100 µs
+    //   PRAGMA poller — correct, just CPU-heavier than the polling
+    //   backend.
+    // -----------------------------------------------------------------
+
+    /// Drive `n` committed inserts through `writer`, spaced
+    /// `spacing_ms` apart, and return how many `on_change()` calls the
+    /// watcher observed (with the initial drain already deducted).
+    fn drive_and_count_wakes(
+        backend: WatcherBackend,
+        db_path: PathBuf,
+        n: u32,
+        spacing_ms: u64,
+    ) -> u32 {
+        use std::sync::atomic::{AtomicU32, Ordering as AO};
+
+        let count = Arc::new(AtomicU32::new(0));
+        let count_t = count.clone();
+        let watcher = UpdateWatcher::spawn_with_config(
+            db_path.clone(),
+            move || {
+                count_t.fetch_add(1, AO::Relaxed);
+            },
+            WatcherConfig { backend },
+        );
+
+        // Drain initialization wakes. The interval needs to cover the
+        // shm-fast-path's first PRAGMA fallback round and the kernel
+        // watcher's setup before we lock in the baseline.
+        std::thread::sleep(Duration::from_millis(80));
+        count.store(0, AO::SeqCst);
+
+        // Use a fresh writer connection — the watcher's reader connection
+        // already inherits the on-disk journal mode of the file.
+        let writer = Connection::open(&db_path).unwrap();
+        for i in 1..=n {
+            writer
+                .execute(&format!("INSERT INTO t VALUES ({i})"), [])
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(spacing_ms));
+        }
+        // Wait long enough to drain the slowest backend's safety net
+        // (kernel watcher = 500 ms) plus one extra cycle for any
+        // delayed event delivery.
+        std::thread::sleep(Duration::from_millis(700));
+
+        let observed = count.load(AO::SeqCst);
+        drop(watcher);
+        drop(writer);
+        observed
+    }
+
+    /// Set up a fresh database file in `mode` and verify the watcher
+    /// detects every committed insert. Tolerates +1 wake (a commit
+    /// straddling the drain boundary) but does not tolerate misses.
+    fn watcher_works_in_journal_mode(backend: WatcherBackend, mode: &str) {
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-watcher-{}-{}-{}-{}",
+            mode.to_ascii_lowercase(),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos(),
+            // Distinguish backends so two parameterized tests in the
+            // same process can't collide on the temp path.
+            match backend {
+                WatcherBackend::Polling => "poll",
+                #[cfg(feature = "kernel-watcher")]
+                WatcherBackend::KernelWatch => "kw",
+                #[cfg(feature = "shm-fast-path")]
+                WatcherBackend::ShmFastPath => "shm",
+            },
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        // Establish the journal mode on the file before the watcher opens
+        // its read-only connection (which inherits the file's mode).
+        let setup = Connection::open(&tmp).unwrap();
+        setup
+            .execute_batch(&format!("PRAGMA journal_mode = {mode};"))
+            .unwrap();
+        let actual: String = setup
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            actual.to_ascii_uppercase(),
+            mode.to_ascii_uppercase(),
+            "PRAGMA journal_mode = {mode} silently fell back to {actual}"
+        );
+        setup.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
+        // For the SHM fast path: even in WAL we want one prior write so
+        // the -shm exists at watcher startup. In non-WAL modes this is a
+        // no-op for the shm path (no file ever exists), but it does
+        // ensure the directory has at least one prior journal life-cycle
+        // so the kernel watcher's directory watch is attached cleanly.
+        setup.execute("INSERT INTO t VALUES (0)", []).unwrap();
+        drop(setup);
+
+        let n: u32 = 5;
+        let observed = drive_and_count_wakes(backend, tmp.clone(), n, 30);
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-journal", tmp.display()));
+
+        // Each commit must produce at least one wake. Allow up to n+1
+        // to absorb a commit that straddles the drain boundary.
+        assert!(
+            observed >= n,
+            "journal_mode={mode}: observed {observed} wakes for {n} commits \
+             (missed at least one)"
+        );
+        assert!(
+            observed <= n + 1,
+            "journal_mode={mode}: observed {observed} wakes for {n} commits \
+             (more than expected — runaway watcher?)"
+        );
+    }
+
+    // ---- Polling × every supported journal mode (regression coverage) ----
+
+    #[test]
+    fn polling_watcher_works_in_wal() {
+        watcher_works_in_journal_mode(WatcherBackend::Polling, "WAL");
+    }
+
+    #[test]
+    fn polling_watcher_works_in_delete() {
+        watcher_works_in_journal_mode(WatcherBackend::Polling, "DELETE");
+    }
+
+    #[test]
+    fn polling_watcher_works_in_truncate() {
+        watcher_works_in_journal_mode(WatcherBackend::Polling, "TRUNCATE");
+    }
+
+    #[test]
+    fn polling_watcher_works_in_persist() {
+        watcher_works_in_journal_mode(WatcherBackend::Polling, "PERSIST");
+    }
+
+    // ---- Kernel watcher × every supported journal mode ----
+
+    #[test]
+    #[cfg(feature = "kernel-watcher")]
+    fn kernel_watcher_works_in_delete() {
+        watcher_works_in_journal_mode(WatcherBackend::KernelWatch, "DELETE");
+    }
+
+    #[test]
+    #[cfg(feature = "kernel-watcher")]
+    fn kernel_watcher_works_in_truncate() {
+        watcher_works_in_journal_mode(WatcherBackend::KernelWatch, "TRUNCATE");
+    }
+
+    #[test]
+    #[cfg(feature = "kernel-watcher")]
+    fn kernel_watcher_works_in_persist() {
+        watcher_works_in_journal_mode(WatcherBackend::KernelWatch, "PERSIST");
+    }
+
+    // ---- SHM fast path × every supported journal mode ----
+
+    #[test]
+    #[cfg(feature = "shm-fast-path")]
+    fn shm_fast_path_works_in_delete() {
+        watcher_works_in_journal_mode(WatcherBackend::ShmFastPath, "DELETE");
+    }
+
+    #[test]
+    #[cfg(feature = "shm-fast-path")]
+    fn shm_fast_path_works_in_truncate() {
+        watcher_works_in_journal_mode(WatcherBackend::ShmFastPath, "TRUNCATE");
+    }
+
+    #[test]
+    #[cfg(feature = "shm-fast-path")]
+    fn shm_fast_path_works_in_persist() {
+        watcher_works_in_journal_mode(WatcherBackend::ShmFastPath, "PERSIST");
+    }
+
+    // -----------------------------------------------------------------
+    // Checkpoint-cycle survival — kernel watcher must re-attach the
+    // -wal file watch after a full WAL truncation. Without this the
+    // first post-checkpoint commit goes undetected until the 500 ms
+    // safety-net fires.
+    // -----------------------------------------------------------------
+
+    #[test]
+    #[cfg(feature = "kernel-watcher")]
+    fn kernel_watcher_survives_wal_truncate_checkpoint() {
+        use std::sync::atomic::{AtomicU32, Ordering as AO};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-kw-checkpoint-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let writer = open_conn(tmp.to_str().unwrap(), false).unwrap();
+        writer.execute_batch("CREATE TABLE t (x INTEGER)").unwrap();
+        writer.execute("INSERT INTO t VALUES (0)", []).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+
+        let count = Arc::new(AtomicU32::new(0));
+        let count_t = count.clone();
+        let watcher = UpdateWatcher::spawn_with_config(
+            tmp.clone(),
+            move || {
+                count_t.fetch_add(1, AO::Relaxed);
+            },
+            WatcherConfig { backend: WatcherBackend::KernelWatch },
+        );
+
+        std::thread::sleep(Duration::from_millis(80));
+        count.store(0, AO::SeqCst);
+
+        // Pre-checkpoint commits.
+        for i in 1..=3 {
+            writer
+                .execute(&format!("INSERT INTO t VALUES ({i})"), [])
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+        }
+
+        // Force a TRUNCATE checkpoint — wipes the -wal file. Some
+        // SQLite builds keep the empty file rather than unlinking it,
+        // some unlink it; the kernel watcher must cope with both via
+        // the directory watch + safety net.
+        let _: i32 = writer
+            .pragma_query_value(None, "wal_checkpoint(TRUNCATE)", |r| r.get(0))
+            .unwrap_or(0);
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Post-checkpoint commits — these must still produce wakes.
+        for i in 4..=6 {
+            writer
+                .execute(&format!("INSERT INTO t VALUES ({i})"), [])
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        // Wait for the safety net to absorb any delayed re-attach.
+        std::thread::sleep(Duration::from_millis(700));
+
+        let observed = count.load(AO::SeqCst);
+        drop(watcher);
+        drop(writer);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+
+        // 6 commits + the checkpoint itself bumps data_version, so we
+        // expect ≥ 6 wakes. Tolerate +2 for the checkpoint and any
+        // straggler.
+        assert!(
+            observed >= 6,
+            "kernel watcher missed commits across checkpoint: \
+             observed {observed} wakes, expected ≥ 6"
+        );
+    }
 }
 
