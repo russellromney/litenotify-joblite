@@ -47,7 +47,7 @@ jobs:
       # up Python on every OS so the test runs cross-platform.
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
@@ -81,7 +81,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
@@ -156,7 +156,7 @@ jobs:
       # Use python-build-standalone (via setup-python) which has it.
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - name: Sanity-load via Python sqlite3
         shell: bash
         run: |
@@ -216,7 +216,7 @@ jobs:
         # cleanup. Tests must call db.close() in finally / __exit__
         # before the tempdir scope ends.
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.12", "3.14"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -254,10 +254,11 @@ jobs:
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
             . ../../.venv/Scripts/activate
+            maturin develop --release --features bundled-sqlite
           else
             . ../../.venv/bin/activate
+            maturin develop --release
           fi
-          maturin develop --release
       - name: Run pytest
         shell: bash
         run: |
@@ -287,7 +288,7 @@ jobs:
         # Node tests spawn the repo venv's Python, so we branch on
         # runner.os below for the venv path.
         os: [ubuntu-latest, macos-latest, windows-latest]
-        node-version: ["20", "22"]
+        node-version: ["22", "24"]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -306,14 +307,14 @@ jobs:
       # installed.
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
       - name: Create venv + build Python extension
         shell: bash
         run: |
-          uv venv --python "3.12" .venv
+          uv venv --python "3.14" .venv
           if [ "${{ runner.os }}" = "Windows" ]; then
             VENV_PY=.venv/Scripts/python.exe
             ACTIVATE=.venv/Scripts/activate
@@ -324,7 +325,11 @@ jobs:
           uv pip install --python "$VENV_PY" maturin
           cd packages/honker
           . "../../$ACTIVATE"
-          maturin develop --release
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            maturin develop --release --features bundled-sqlite
+          else
+            maturin develop --release
+          fi
       - name: Build .node binary
         working-directory: packages/honker-node
         shell: bash
@@ -389,12 +394,13 @@ jobs:
       - uses: ruby/setup-ruby@v1
         if: matrix.binding == 'honker-ruby'
         with:
-          ruby-version: "3.3"
+          ruby-version: "3.4"
+
       - uses: erlef/setup-beam@v1
         if: matrix.binding == 'honker-ex'
         with:
           otp-version: "27"
-          elixir-version: "1.17"
+          elixir-version: "1.19"
 
       - name: Build honker-extension
         if: matrix.binding != 'honker-rs'
@@ -414,6 +420,8 @@ jobs:
       - name: Bun
         if: matrix.binding == 'honker-bun'
         working-directory: packages/honker-bun
+        env:
+          HONKER_EXT_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
         run: |
           bun install --frozen-lockfile
           bun test
@@ -447,19 +455,19 @@ jobs:
           prefix-key: "v1-ruby-python-interop-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml', 'packages/honker/src/**/*.rs', 'packages/honker/Cargo.toml') }}"
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: "3.3"
+          ruby-version: "3.4"
       - name: Build honker-extension
         run: cargo build --release -p honker-extension
       - name: Install Python binding
         shell: bash
         run: |
-          uv venv --python "3.12" .venv
+          uv venv --python "3.14" .venv
           . .venv/bin/activate
           uv pip install pytest pytest-xdist maturin
           cd packages/honker

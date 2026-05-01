@@ -5,12 +5,111 @@ max_attempts→dead, rollback-drops-enqueue, and worker-wakes-on-NOTIFY.
 """
 
 import asyncio
+import json
+import os
+import queue as queue_mod
+import subprocess
+import sys
 import threading
 import time
 
 import pytest
 
 import honker
+
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PACKAGES_ROOT = os.path.join(REPO_ROOT, "packages")
+HONKER_PYTHON_ROOT = os.path.join(PACKAGES_ROOT, "honker", "python")
+
+_CLAIM_ONCE_SCRIPT = r"""
+import asyncio
+import json
+import sys
+import time
+
+sys.path.insert(0, {honker_python!r})
+sys.path.insert(0, {packages!r})
+import honker
+
+db = honker.open({db_path!r})
+q = db.queue({queue_name!r}{queue_args})
+
+
+async def main():
+    it = q.claim({worker_id!r}, idle_poll_s={idle_poll_s})
+    print("READY", flush=True)
+    job = await asyncio.wait_for(it.__anext__(), timeout={timeout_s})
+    claimed_at = time.time()
+    payload = job.payload
+    attempts = job.attempts
+    job_id = job.id
+    job.ack()
+    print(json.dumps({{
+        "claimed_at": claimed_at,
+        "payload": payload,
+        "attempts": attempts,
+        "job_id": job_id,
+    }}), flush=True)
+
+
+asyncio.run(main())
+"""
+
+
+def _spawn_claim_once(
+    db_path: str,
+    queue_name: str,
+    worker_id: str,
+    *,
+    idle_poll_s: float = 30.0,
+    timeout_s: float = 20.0,
+    queue_kwargs_sql: str = "",
+) -> subprocess.Popen:
+    script = _CLAIM_ONCE_SCRIPT.format(
+        honker_python=HONKER_PYTHON_ROOT,
+        packages=PACKAGES_ROOT,
+        db_path=db_path,
+        queue_name=queue_name,
+        worker_id=worker_id,
+        idle_poll_s=idle_poll_s,
+        timeout_s=timeout_s,
+        queue_args=queue_kwargs_sql,
+    )
+    return subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+
+
+def _wait_for_child_line(proc: subprocess.Popen, timeout: float = 5.0) -> str:
+    lines: queue_mod.Queue[str] = queue_mod.Queue()
+
+    def reader():
+        if proc.stdout is None:
+            return
+        line = proc.stdout.readline()
+        if line:
+            lines.put(line.strip())
+
+    threading.Thread(target=reader, daemon=True).start()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            out = proc.stdout.read() if proc.stdout else ""
+            err = proc.stderr.read() if proc.stderr else ""
+            raise AssertionError(
+                "child exited early: "
+                f"rc={proc.returncode}, stdout={out!r}, stderr={err!r}"
+            )
+        try:
+            return lines.get(timeout=0.1)
+        except queue_mod.Empty:
+            pass
+    raise AssertionError("timed out waiting for child output")
 
 
 def _drain_state(db):
@@ -262,6 +361,176 @@ async def test_worker_wakes_on_notify_fast_path(db_path):
 
     got_at = await asyncio.wait_for(task, timeout=3.0)
     assert got_at - t0 < 2.0, f"worker woke after {got_at - t0:.2f}s; NOTIFY path broken"
+
+
+async def test_worker_wakes_on_delayed_job_deadline(db_path):
+    """A sleeping worker should wake when `run_at` arrives even if no
+    new commit lands at the due moment.
+    """
+    db = honker.open(db_path)
+    q = db.queue("work")
+    q.enqueue({"n": 1}, run_at=int(time.time()) + 2)
+    assert q.claim_one("precheck") is None
+
+    loop = asyncio.get_running_loop()
+
+    async def consume():
+        async for job in q.claim("w", idle_poll_s=30.0):
+            job.ack()
+            return loop.time(), job.payload
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0.1)
+    t0 = loop.time()
+    got_at, payload = await asyncio.wait_for(task, timeout=5.0)
+    assert payload == {"n": 1}
+    assert got_at - t0 < 4.0, (
+        f"worker woke after {got_at - t0:.2f}s; delayed-job deadline path broken"
+    )
+
+
+async def test_worker_wakes_on_reclaim_deadline(db_path):
+    """A sleeping worker should wake when another worker's claim
+    expires, without waiting for idle_poll_s.
+    """
+    db = honker.open(db_path)
+    q = db.queue("work", visibility_timeout_s=1)
+    q.enqueue({"n": 1})
+    first = q.claim_one("owner")
+    assert first is not None
+
+    loop = asyncio.get_running_loop()
+
+    async def consume():
+        async for job in q.claim("rescuer", idle_poll_s=30.0):
+            job.ack()
+            return loop.time(), job.id, job.attempts
+
+    task = asyncio.create_task(consume())
+    await asyncio.sleep(0.1)
+    t0 = loop.time()
+    got_at, job_id, attempts = await asyncio.wait_for(task, timeout=5.0)
+    assert job_id == first.id
+    assert attempts == 2
+    assert got_at - t0 < 4.0, (
+        f"worker woke after {got_at - t0:.2f}s; reclaim deadline path broken"
+    )
+
+
+def test_next_claim_at_includes_exact_reclaim_boundary(db_path):
+    """If a claim expires exactly at `unixepoch()`, the queue should
+    still report a future reclaim deadline instead of dropping into the
+    idle-poll fallback path.
+    """
+    db = honker.open(db_path)
+    q = db.queue("work", visibility_timeout_s=30)
+    q.enqueue({"n": 1})
+    first = q.claim_one("owner")
+    assert first is not None
+
+    with db.transaction() as tx:
+        tx.execute(
+            "UPDATE _honker_live SET claim_expires_at = unixepoch() WHERE id = ?",
+            [first.id],
+        )
+        rows = tx.query(
+            "SELECT honker_queue_next_claim_at(?) AS t",
+            ["work"],
+        )
+        now_rows = tx.query("SELECT unixepoch() AS now")
+
+    next_claim_at = int(rows[0]["t"])
+    now = int(now_rows[0]["now"])
+    assert next_claim_at == now + 1
+
+
+def test_worker_wakes_on_delayed_job_deadline_cross_process(db_path):
+    """A real worker process should wake around `run_at` even when no
+    new commit lands at the due moment.
+
+    Parent process:
+      1. starts an idle worker subprocess with `idle_poll_s=30`;
+      2. waits for READY;
+      3. enqueues one delayed job due in ~2s; and
+      4. does nothing else.
+
+    If the worker secretly depends on fallback polling, this would take
+    ~30s instead of a few seconds.
+    """
+    db = honker.open(db_path)
+    q = db.queue("work")
+    run_at = int(time.time()) + 4
+    q.enqueue({"n": 1}, run_at=run_at)
+    proc = _spawn_claim_once(db_path, "work", "remote-worker")
+    try:
+        assert _wait_for_child_line(proc) == "READY"
+
+        payload_line = _wait_for_child_line(proc, timeout=15.0)
+        got = json.loads(payload_line)
+
+        assert got["payload"] == {"n": 1}
+        assert got["claimed_at"] >= run_at - 0.05, (
+            f"claimed before delayed boundary: claimed_at={got['claimed_at']}, "
+            f"run_at={run_at}"
+        )
+        assert got["claimed_at"] <= run_at + 3.0, (
+            f"claim lagged too far past delayed boundary: "
+            f"claimed_at={got['claimed_at']}, run_at={run_at}"
+        )
+    finally:
+        try:
+            proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+def test_worker_wakes_on_reclaim_deadline_cross_process(db_path):
+    """A real worker process should wake when another worker's claim
+    expires, without any new commit arriving at reclaim time.
+    """
+    db = honker.open(db_path)
+    q = db.queue("work")
+    q.enqueue({"n": 1})
+    first = q.claim_one("owner")
+    assert first is not None
+    reclaim_at = int(time.time()) + 4
+    expected_claimable_at = reclaim_at + 1
+    with db.transaction() as tx:
+        tx.execute(
+            "UPDATE _honker_live SET claim_expires_at = ? WHERE id = ?",
+            [reclaim_at, first.id],
+        )
+
+    proc = _spawn_claim_once(
+        db_path,
+        "work",
+        "rescuer",
+    )
+    try:
+        assert _wait_for_child_line(proc) == "READY"
+
+        payload_line = _wait_for_child_line(proc, timeout=15.0)
+        got = json.loads(payload_line)
+
+        assert got["job_id"] == first.id
+        assert got["attempts"] == 2
+        assert got["payload"] == {"n": 1}
+        assert got["claimed_at"] >= expected_claimable_at - 0.05, (
+            f"reclaimed before claim expiry window opened: "
+            f"claimed_at={got['claimed_at']}, "
+            f"expected_claimable_at={expected_claimable_at}"
+        )
+        assert got["claimed_at"] <= expected_claimable_at + 3.0, (
+            f"reclaim lagged too far past expiry: claimed_at={got['claimed_at']}, "
+            f"expected_claimable_at={expected_claimable_at}"
+        )
+    finally:
+        try:
+            proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
 
 async def test_worker_processes_multiple_jobs(db_path):

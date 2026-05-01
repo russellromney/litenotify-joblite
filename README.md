@@ -51,7 +51,8 @@ Today:
 - Single-digit millisecond cross-process reaction time, no polling
 - Handler timeouts, declarative retries with exponential backoff
 - Delayed jobs, task expiration, named locks, rate-limiting
-- Crontab-style periodic tasks with a leader-elected scheduler
+- Time-trigger scheduling with a leader-elected scheduler:
+  5-field cron, 6-field cron, and `@every <n><unit>`
 - Opt-in task result storage (`enqueue` returns an id, worker persists the
   return value, caller awaits `queue.wait_result(id)`)
 - Durable streams with per-consumer offsets and configurable flush interval
@@ -79,14 +80,14 @@ with db.transaction() as tx:
     emails.enqueue({"to": "alice@example.com"}, tx=tx)   # atomic with order
 
 # Then in a worker, do: 
-async for job in emails.claim("worker-1"):               # wakes on any commit to the db
+async for job in emails.claim("worker-1"):               # wakes on updates or due deadlines
     try:
         send(job.payload); job.ack()
     except Exception as e:
         job.retry(delay_s=60, error=str(e))
 ```
 
-`claim()` is an async iterator. Each iteration is one `claim_batch(worker_id, 1)`. Wakes on any commit to the db, falls back to a 5 s paranoia poll only if the commit watcher can't fire. For batched work, call `claim_batch(worker_id, n)` explicitly and ack with `queue.ack_batch(ids, worker_id)`. Defaults: visibility 300 s.
+`claim()` is an async iterator. Each iteration is one `claim_batch(worker_id, 1)`. Wakes on any database update, or when the next claim-relevant deadline arrives (`run_at` for delayed jobs, or `claim_expires_at` for reclaims). Falls back to a 5 s paranoia poll only if the update watcher can't fire. For batched work, call `claim_batch(worker_id, n)` explicitly and ack with `queue.ack_batch(ids, worker_id)`. Defaults: visibility 300 s.
 
 ### Python: tasks (Huey-style decorators)
 
@@ -167,12 +168,9 @@ while (running) {
 }
 ```
 
-Current cross-language direct proof is intended to run on every platform:
+Current cross-language direct proof runs on every platform:
 Python -> Node wake through Node `updateEvents()`, and Node -> Python
-listener wake through Python `listen()`. Today, Windows reverse listener
-parity is still a real gap. The CI suite keeps the supporting shared-row
-interop and close/cleanup proofs, but the direct reverse-listener proof
-is allowed to fail until parity is fixed.
+listener wake through Python `listen()`.
 
 ### SQLite extension (any SQLite 3.9+ client)
 
@@ -187,12 +185,17 @@ SELECT honker_lock_acquire('backup', 'me', 60);              -- 1 = got it, 0 = 
 SELECT honker_lock_release('backup', 'me');                  -- 1 = released
 SELECT honker_rate_limit_try('api', 10, 60);                 -- 1 = under, 0 = at limit
 SELECT honker_rate_limit_sweep(3600);                        -- drop windows >1h old
-SELECT honker_cron_next_after('0 3 * * *', unixepoch());     -- unix ts of next fire
+SELECT honker_cron_next_after('0 3 * * *', unixepoch());     -- 5-field cron
+SELECT honker_cron_next_after('*/2 * * * * *', unixepoch()); -- 6-field cron
+SELECT honker_cron_next_after('@every 5s', unixepoch());     -- interval schedule
 SELECT honker_scheduler_register('nightly', 'backups',
   '0 3 * * *', '"go"', 0, NULL);                         -- register periodic task
+SELECT honker_scheduler_register('fast', 'backups',
+  '@every 5s', '"go"', 0, NULL);                         -- interval schedule
 SELECT honker_scheduler_tick(unixepoch());                   -- JSON: fires due
 SELECT honker_scheduler_soonest();                           -- min next_fire_at
 SELECT honker_scheduler_unregister('nightly');               -- 1 = deleted
+SELECT honker_queue_next_claim_at('emails');                 -- next run_at / reclaim deadline
 SELECT honker_stream_publish('orders', 'k', '{"id":42}');    -- returns offset
 SELECT honker_stream_read_since('orders', 0, 1000);          -- JSON array
 SELECT honker_stream_save_offset('worker', 'orders', 42);    -- monotonic upsert
@@ -257,7 +260,8 @@ Partial-index on state means the claim hot path is bounded by the *working-set* 
 
 - `async for job in q.claim(id)` yields one job at a time via `claim_batch(id, 1)`
 - `Job.ack()` is one `DELETE` in its own transaction. Return is an honest bool: `True` iff the claim was still valid, `False` if the visibility window elapsed and another worker reclaimed.
-- Wakes on any commit to the db from any process; a 5 s paranoia poll is the only fallback.
+- Wakes on database update from any process, or when the next `run_at` /
+  reclaim deadline arrives; a 5 s paranoia poll is the only fallback.
 
 For batched work, call `claim_batch(worker_id, n)` directly and ack with `queue.ack_batch(ids, worker_id)`. The library doesn't hide batching behind the iterator. The per-tx cost and the at-most-once visibility semantics are easier to reason about when the API doesn't try to be clever.
 

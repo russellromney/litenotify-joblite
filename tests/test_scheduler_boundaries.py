@@ -1,4 +1,4 @@
-"""Real-time cron boundary tests.
+"""Real-time scheduler boundary tests.
 
 The unit tests in `test_scheduler.py` mock `now_unix` and tick
 `honker_scheduler_tick(now)` with fabricated timestamps — fast, but
@@ -7,9 +7,10 @@ If `_main_loop` sleeps one second too long or
 `honker_scheduler_soonest()` returns a value in the past (causing a
 busy-loop), the unit tests won't catch it.
 
-These tests wait for a real wall-clock cron boundary. Marked
-`@pytest.mark.slow` so the default CI run skips them; invoke
-explicitly via `pytest -m slow`.
+This module has two layers:
+  * short, default-on tests that prove second-level schedules fire via
+    the real `Scheduler.run()` loop; and
+  * slower minute-boundary tests marked `@pytest.mark.slow`.
 """
 
 import asyncio
@@ -18,7 +19,83 @@ import time
 import pytest
 
 import honker
-from honker import Scheduler, crontab
+from honker import Scheduler, crontab, every_s
+
+
+@pytest.mark.parametrize(
+    ("label", "schedule"),
+    [
+        ("every-1s", every_s(1)),
+        ("cron-6field-1s", crontab("*/1 * * * * *")),
+    ],
+)
+async def test_scheduler_run_fires_second_level_schedule_on_time(
+    db_path, label, schedule
+):
+    """The real scheduler loop should fire second-level schedules on
+    time, not just parse/register them correctly.
+
+    We record the persisted `next_fire_at`, start `Scheduler.run()`,
+    claim exactly one enqueued job, and assert:
+      1. the fire arrives close to the persisted boundary; and
+      2. no duplicate jobs were enqueued before shutdown.
+    """
+    db = honker.open(db_path)
+    q = db.queue(f"second-level-{label}")
+    sched = Scheduler(db)
+    sched.add(
+        name=f"tick-{label}",
+        queue=f"second-level-{label}",
+        schedule=schedule,
+        payload={"kind": label},
+    )
+
+    row = db.query(
+        "SELECT next_fire_at FROM _honker_scheduler_tasks WHERE name=?",
+        [f"tick-{label}"],
+    )[0]
+    expected_boundary = int(row["next_fire_at"])
+
+    stop_event = asyncio.Event()
+
+    async def consume_one():
+        async for job in q.claim("worker-1", idle_poll_s=30.0):
+            claimed_at = time.time()
+            payload = job.payload
+            job.ack()
+            return claimed_at, payload
+
+    worker_task = asyncio.create_task(consume_one())
+    run_task = asyncio.create_task(sched.run(stop_event))
+
+    try:
+        timeout_s = max(6.0, (expected_boundary - time.time()) + 4.0)
+        claimed_at, payload = await asyncio.wait_for(
+            worker_task,
+            timeout=timeout_s,
+        )
+    finally:
+        stop_event.set()
+        await asyncio.wait_for(run_task, timeout=5.0)
+
+    assert payload == {"kind": label}
+    assert claimed_at >= expected_boundary - 0.05, (
+        f"job for {label} claimed before next_fire_at boundary: "
+        f"claimed_at={claimed_at:.3f}, expected={expected_boundary}"
+    )
+    assert claimed_at <= expected_boundary + 2.0, (
+        f"job for {label} claimed too late: "
+        f"claimed_at={claimed_at:.3f}, expected={expected_boundary}"
+    )
+
+    rows = db.query(
+        "SELECT COUNT(*) AS c FROM _honker_live WHERE queue=?",
+        [f"second-level-{label}"],
+    )
+    assert rows[0]["c"] == 0, (
+        f"expected no duplicate enqueues for {label}, found {rows[0]['c']} "
+        "left in the queue after first fire"
+    )
 
 
 @pytest.mark.slow
