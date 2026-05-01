@@ -104,13 +104,16 @@ native packaging, cancellation semantics, and cross-platform behavior.
 
 - Create a standalone `honker-dotnet` / `Honker` package repo and pin it
   here as a submodule once the first parity slice is usable.
+- Choose and lock the managed SQLite provider early, including its
+  native-library loading story and supported runtime matrix.
 - Target modern .NET first, using `Microsoft.Data.Sqlite` as the default
   managed SQLite layer.
 - Load `honker-extension` on each opened connection and call
   `honker_bootstrap()` during `Honker.Database.Open(...)`.
 - Package native `honker-extension` binaries under NuGet
   `runtimes/<rid>/native/` paths, with explicit resolver tests for
-  Linux, macOS, and Windows.
+  Linux, macOS, and Windows, including a deliberate Windows SQLite
+  compatibility story.
 - Prefer typed wrappers over a Rust/C ABI: `Database`, `Transaction`,
   `Queue`, `Job`, `Stream`, `Scheduler`, `Lock`, and result helpers all
   call `SELECT honker_*(...)`.
@@ -120,6 +123,8 @@ native packaging, cancellation semantics, and cross-platform behavior.
 - Queue enqueue / claim / ack / retry / fail / heartbeat.
 - `IAsyncEnumerable<Job>` claim loop with `CancellationToken`.
 - Deadline-aware worker sleep using `honker_queue_next_claim_at(queue)`.
+- Deterministic cleanup for cancelled claim loops and watcher-backed
+  waits so abandoned subscriptions do not leak.
 - Scheduler add / remove / tick / soonest / run.
 - Canonical `schedule` naming with `cron` kept as a compatibility alias.
 - `@every <n><unit>`, 6-field cron, and delayed `run_at` tests matching
@@ -128,7 +133,8 @@ native packaging, cancellation semantics, and cross-platform behavior.
 ### Follow-up parity
 
 - Durable streams with per-consumer offsets.
-- Ephemeral listen / notify once an update-event bridge exists.
+- Ephemeral listen / notify once a clean update-event bridge or
+  pluggable watcher backend story exists.
 - Rate limits, locks, task results, and batch helpers.
 - EF Core recipe showing how to load the extension on an application
   connection and enqueue inside an existing transaction.
@@ -148,6 +154,8 @@ native packaging, cancellation semantics, and cross-platform behavior.
   bindings.
 - Cross-process delayed `run_at` and reclaim-deadline tests prove the
   async worker does not wait for a fallback poll.
+- Cancellation and disposal tests prove abandoned claim loops or other
+  watcher-backed waits release subscriptions cleanly.
 - Scheduler tests prove `@every 1s`, 6-field cron, `schedule`, and
   legacy `cron` alias behavior.
 - Cross-language interop test proves Python writes can be claimed by C#
