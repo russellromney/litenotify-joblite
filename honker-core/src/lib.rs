@@ -94,6 +94,70 @@ pub struct WatcherConfig {
     pub backend: WatcherBackend,
 }
 
+/// Returned by [`WatcherBackend::parse`] alongside the chosen backend
+/// when a build-time feature was missing — bindings can surface this
+/// to the user (e.g., as a stderr warning) so an unavailable backend
+/// silently falling back to `Polling` is observable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatcherBackendNote {
+    /// Backend is available and was selected.
+    Ok,
+    /// `kernel` was requested but the `kernel-watcher` Cargo feature
+    /// was not enabled at build time. Falling back to `Polling`.
+    KernelWatchUnavailable,
+    /// `shm` was requested but the `shm-fast-path` Cargo feature was
+    /// not enabled at build time. Falling back to `Polling`.
+    ShmFastPathUnavailable,
+}
+
+impl WatcherBackend {
+    /// Parse a public binding-level string into a backend, with a note
+    /// if the requested backend isn't compiled in. Shared across
+    /// Python/Node bindings so they can't drift on accepted aliases.
+    ///
+    /// Accepted values:
+    /// - `None` / `"polling"` / `"poll"` — default 1 ms PRAGMA polling
+    /// - `"kernel"` / `"kernel-watcher"` — kernel filesystem notifications
+    /// - `"shm"` / `"shm-fast-path"` — mmap `-shm` fast path
+    ///
+    /// `Err(unknown_value)` for any other string so bindings can raise
+    /// a typed error.
+    pub fn parse(name: Option<&str>) -> Result<(Self, WatcherBackendNote), String> {
+        match name {
+            None | Some("polling") | Some("poll") => {
+                Ok((WatcherBackend::Polling, WatcherBackendNote::Ok))
+            }
+            Some("kernel") | Some("kernel-watcher") => {
+                #[cfg(feature = "kernel-watcher")]
+                {
+                    Ok((WatcherBackend::KernelWatch, WatcherBackendNote::Ok))
+                }
+                #[cfg(not(feature = "kernel-watcher"))]
+                {
+                    Ok((
+                        WatcherBackend::Polling,
+                        WatcherBackendNote::KernelWatchUnavailable,
+                    ))
+                }
+            }
+            Some("shm") | Some("shm-fast-path") => {
+                #[cfg(feature = "shm-fast-path")]
+                {
+                    Ok((WatcherBackend::ShmFastPath, WatcherBackendNote::Ok))
+                }
+                #[cfg(not(feature = "shm-fast-path"))]
+                {
+                    Ok((
+                        WatcherBackend::Polling,
+                        WatcherBackendNote::ShmFastPathUnavailable,
+                    ))
+                }
+            }
+            Some(other) => Err(other.to_string()),
+        }
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("Database error: {0}")]
@@ -2256,12 +2320,477 @@ while True:
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
 
         // 6 commits + the checkpoint itself bumps data_version, so we
-        // expect ≥ 6 wakes. Tolerate +2 for the checkpoint and any
-        // straggler.
+        // expect 6-7 wakes (the checkpoint may or may not register as a
+        // distinct wake depending on timing). The upper bound catches a
+        // runaway watcher that fires spuriously — important because
+        // without it, the previous version of this test passed even
+        // when the post-checkpoint commits were detected only by the
+        // 500 ms safety net (wake count was right, latency was wrong).
+        // The latency-based check is in
+        // `kernel_watcher_post_checkpoint_wake_is_event_driven` below.
         assert!(
-            observed >= 6,
-            "kernel watcher missed commits across checkpoint: \
-             observed {observed} wakes, expected ≥ 6"
+            (6..=8).contains(&observed),
+            "kernel watcher commits across checkpoint: observed {observed} wakes, \
+             expected 6-8 (6 commits + checkpoint ± straggler)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Wake-latency invariants — the meta-test class.
+    //
+    // The previous test suite asserted *count* (right number of wakes)
+    // but not *latency* (wake arrived via the fast path, not via the
+    // safety-net fallback). A backend silently degraded to
+    // safety-net-only delivery passes count tests but is functionally
+    // broken for the fast-wake claim it makes. These tests measure the
+    // wall-clock interval between commit and wake and assert it's well
+    // below the safety-net interval, proving the kernel events / shm
+    // mmap reads are actually doing the work.
+    // -----------------------------------------------------------------
+
+    /// Helper: spawn a watcher with the given backend, commit `n` writes
+    /// spaced `spacing_ms` apart, return the per-commit wake latency in
+    /// milliseconds. Caller asserts on the distribution.
+    #[cfg(any(feature = "kernel-watcher", feature = "shm-fast-path"))]
+    fn measure_wake_latencies_ms(
+        backend: WatcherBackend,
+        db_path: PathBuf,
+        n: usize,
+        spacing_ms: u64,
+    ) -> Vec<f64> {
+        use std::sync::Mutex as StdMutex;
+
+        let writer = open_conn(db_path.to_str().unwrap(), false).unwrap();
+        writer.execute_batch("CREATE TABLE t (x INTEGER)").unwrap();
+        // First write so -wal exists at watcher startup.
+        writer.execute("INSERT INTO t VALUES (0)", []).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let wake_times: Arc<StdMutex<Vec<std::time::Instant>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let wake_times_t = wake_times.clone();
+        let watcher = UpdateWatcher::spawn_with_config(
+            db_path.clone(),
+            move || {
+                wake_times_t
+                    .lock()
+                    .expect("wake_times mutex poisoned")
+                    .push(std::time::Instant::now());
+            },
+            WatcherConfig { backend },
+        );
+
+        // Drain initialization wakes.
+        std::thread::sleep(Duration::from_millis(100));
+        wake_times.lock().expect("wake_times").clear();
+
+        // Commit each write, recording the commit time. Pair with the
+        // first wake timestamp that arrives after that commit time.
+        let mut commit_times: Vec<std::time::Instant> = Vec::with_capacity(n);
+        for i in 1..=n {
+            let t0 = std::time::Instant::now();
+            writer
+                .execute(&format!("INSERT INTO t VALUES ({i})"), [])
+                .unwrap();
+            commit_times.push(t0);
+            std::thread::sleep(Duration::from_millis(spacing_ms));
+        }
+        // Wait long enough for any in-flight wakes to land. The
+        // backend-specific safety nets are 500 ms (kernel-watcher) and
+        // 100 ms (shm-fast-path); 700 ms covers either.
+        std::thread::sleep(Duration::from_millis(700));
+
+        let wakes = wake_times.lock().expect("wake_times").clone();
+        drop(watcher);
+        drop(writer);
+
+        // Pair each commit with the first wake at-or-after its commit
+        // time. Wakes are monotonic; commits are monotonic; so a single
+        // forward pass suffices.
+        let mut latencies = Vec::with_capacity(n);
+        let mut wake_cursor = 0;
+        for &commit_t in &commit_times {
+            while wake_cursor < wakes.len() && wakes[wake_cursor] < commit_t {
+                wake_cursor += 1;
+            }
+            if wake_cursor >= wakes.len() {
+                latencies.push(f64::INFINITY); // missed wake — caller will assert
+            } else {
+                let dt = wakes[wake_cursor].duration_since(commit_t);
+                latencies.push(dt.as_secs_f64() * 1000.0);
+                wake_cursor += 1;
+            }
+        }
+        latencies
+    }
+
+    #[cfg(any(feature = "kernel-watcher", feature = "shm-fast-path"))]
+    fn percentile(mut samples: Vec<f64>, pct: f64) -> f64 {
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let idx = ((samples.len() as f64) * pct) as usize;
+        samples[idx.min(samples.len() - 1)]
+    }
+
+    /// Kernel watcher: wakes must come via kernel events, not the
+    /// 500 ms safety net. p90 < 200 ms is way below half of the
+    /// safety-net interval, so a backend stuck on the safety net would
+    /// have p90 ≈ 250 ms (mean half of 500) and fail this assertion.
+    #[test]
+    #[cfg(feature = "kernel-watcher")]
+    fn kernel_watcher_wake_latency_is_event_driven() {
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-kw-lat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let lats = measure_wake_latencies_ms(
+            WatcherBackend::KernelWatch,
+            tmp.clone(),
+            10,
+            50,
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+
+        assert!(
+            lats.iter().all(|&l| l.is_finite()),
+            "kernel watcher missed at least one wake: {lats:?}"
+        );
+        let p90 = percentile(lats.clone(), 0.90);
+        assert!(
+            p90 < 200.0,
+            "kernel watcher p90 wake latency = {p90:.1} ms, expected < 200 \
+             (safety-net interval is 500 ms — high latency means events \
+             aren't being delivered and the safety net is doing all the work). \
+             Samples: {lats:?}"
+        );
+    }
+
+    /// **Regression test for the WAL-watch-stale-after-recreation bug.**
+    ///
+    /// `wal_checkpoint(TRUNCATE)` truncates `-wal` to zero bytes but
+    /// preserves the inode, so the per-file watch survives that. The
+    /// scenario where the per-file watch actually goes stale is when
+    /// the WAL+SHM files are unlinked and recreated:
+    ///
+    ///  - The last connection closes (SQLite cleans up `-wal`/`-shm`).
+    ///  - A new writer process opens the db (recreates them with a
+    ///    fresh inode).
+    ///
+    /// This is the realistic cross-process workflow (e.g., a CLI tool
+    /// runs against a db, exits, runs again). Without
+    /// `reattach_wal_watch_if_needed`, the per-file watch points at
+    /// the deleted inode and post-recreation commits are picked up
+    /// only by the 500 ms safety net.
+    ///
+    /// We force the bug by manually unlinking `-wal` and `-shm` mid
+    /// flight — the kernel-event observable behavior is identical to
+    /// the close+reopen scenario.
+    #[test]
+    #[cfg(feature = "kernel-watcher")]
+    fn kernel_watcher_wake_survives_wal_inode_change() {
+        use std::sync::Mutex as StdMutex;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-kw-walreset-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let wal_path = format!("{}-wal", tmp.display());
+        let shm_path = format!("{}-shm", tmp.display());
+
+        // Phase 1: writer #1 creates db + WAL.
+        {
+            let writer = open_conn(tmp.to_str().unwrap(), false).unwrap();
+            writer.execute_batch("CREATE TABLE t (x INTEGER)").unwrap();
+            writer.execute("INSERT INTO t VALUES (0)", []).unwrap();
+            // Drop the writer so SQLite finalizes the WAL.
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let wake_times: Arc<StdMutex<Vec<std::time::Instant>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let wake_times_t = wake_times.clone();
+        let watcher = UpdateWatcher::spawn_with_config(
+            tmp.clone(),
+            move || {
+                wake_times_t.lock().unwrap().push(std::time::Instant::now());
+            },
+            WatcherConfig { backend: WatcherBackend::KernelWatch },
+        );
+
+        // Let the watcher attach to the existing -wal inode (call it A).
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Force the WAL+SHM to be deleted, simulating the
+        // last-connection-close cleanup. The next write recreates them
+        // with a new inode (B). The watcher's per-file watch on inode A
+        // is now pointing at a deleted inode and will never see writes
+        // to inode B — unless `reattach_wal_watch_if_needed` notices
+        // the identity change and re-attaches.
+        let _ = std::fs::remove_file(&wal_path);
+        let _ = std::fs::remove_file(&shm_path);
+
+        // Give the watcher one safety-net cycle (>500 ms) to notice
+        // the inode change via the directory event (or the safety-net
+        // identity check) and re-attach to inode B as it gets created.
+        std::thread::sleep(Duration::from_millis(600));
+        wake_times.lock().unwrap().clear();
+
+        // Phase 2: writer #2 opens fresh, recreates WAL on inode B,
+        // emits commits we want to detect via kernel events.
+        let writer2 = open_conn(tmp.to_str().unwrap(), false).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        wake_times.lock().unwrap().clear();
+
+        let n = 5;
+        let mut commit_times = Vec::with_capacity(n);
+        for i in 1..=n {
+            let t0 = std::time::Instant::now();
+            writer2
+                .execute(&format!("INSERT INTO t VALUES (1{i:02})"), [])
+                .unwrap();
+            commit_times.push(t0);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(700));
+
+        let wakes = wake_times.lock().unwrap().clone();
+        drop(watcher);
+        drop(writer2);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&wal_path);
+        let _ = std::fs::remove_file(&shm_path);
+
+        let mut lats = Vec::with_capacity(n);
+        let mut wake_cursor = 0;
+        for &commit_t in &commit_times {
+            while wake_cursor < wakes.len() && wakes[wake_cursor] < commit_t {
+                wake_cursor += 1;
+            }
+            assert!(
+                wake_cursor < wakes.len(),
+                "post-recreation commit produced no wake (cursor at {wake_cursor} of {})",
+                wakes.len()
+            );
+            lats.push(
+                wakes[wake_cursor]
+                    .duration_since(commit_t)
+                    .as_secs_f64()
+                    * 1000.0,
+            );
+            wake_cursor += 1;
+        }
+        let p90 = percentile(lats.clone(), 0.90);
+        assert!(
+            p90 < 200.0,
+            "kernel watcher post-WAL-recreation p90 wake latency = {p90:.1} ms, \
+             expected < 200 (safety net is 500 ms; latency at ~250 ms means \
+             the per-file -wal watch went stale across the recreation and \
+             never re-attached). Samples: {lats:?}"
+        );
+    }
+
+    /// SHM fast path: wakes must come via the mmap tickle, not via the
+    /// 100 ms safety net.
+    #[test]
+    #[cfg(feature = "shm-fast-path")]
+    fn shm_fast_path_wake_latency_is_event_driven() {
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-shm-lat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let lats = measure_wake_latencies_ms(
+            WatcherBackend::ShmFastPath,
+            tmp.clone(),
+            10,
+            50,
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+
+        assert!(
+            lats.iter().all(|&l| l.is_finite()),
+            "shm fast path missed at least one wake: {lats:?}"
+        );
+        // Safety net is 100 ms; mean of safety-net-only delivery ≈ 50 ms.
+        // p90 < 50 ms proves the mmap tickle is doing the work.
+        let p90 = percentile(lats.clone(), 0.90);
+        assert!(
+            p90 < 50.0,
+            "shm fast path p90 wake latency = {p90:.1} ms, expected < 50 \
+             (safety net is 100 ms — high latency means iChange isn't \
+             being read via mmap). Samples: {lats:?}"
+        );
+    }
+
+    /// **Note on the SHM stale-mmap scenario (issue #2 from the
+    /// code review).** Tried writing a test that unlinks `-shm` to
+    /// force the watcher's mmap stale, but unlinking `-shm` while
+    /// SQLite has connections open breaks the writer (SystemIoFailure
+    /// on subsequent INSERTs). The realistic version of this scenario
+    /// — a writer process closing its last connection, SQLite cleaning
+    /// up `-shm`, then a new writer reopening — doesn't actually
+    /// produce a stale mmap when honker is the watcher: the watcher
+    /// holds its own read-only connection, which keeps `-shm` alive
+    /// across the writer cycle. The safety-net PRAGMA layer is
+    /// defense-in-depth for theoretical edge cases (a future SQLite
+    /// version that changes shm layout, an external tool that deletes
+    /// the file with no connections open, etc.).
+    ///
+    /// The latency-based tests
+    /// (`shm_fast_path_wake_latency_is_event_driven`) and the
+    /// equivalence test (`shm_fast_path_equivalence_with_pragma_baseline`)
+    /// would both fail if the safety-net layer were removed AND
+    /// `read_ichange()` started returning stale data — so the bug is
+    /// indirectly covered by existing tests. A direct unit test for
+    /// `ShmReader::read_ichange` semantics is below.
+
+    /// Direct unit test for `ShmReader`'s mmap re-attach behavior on
+    /// inode change. Drives `try_open` / `read_ichange` /
+    /// `refresh_identity` directly so we can assert the contract
+    /// without fighting SQLite's WAL machinery.
+    #[test]
+    #[cfg(feature = "shm-fast-path")]
+    fn shm_reader_handles_inode_change() {
+        // We use the (private) `ShmReader` via a fresh shm-like file
+        // we control — write a 12-byte header that mimics the real
+        // shm format, change it across inode swaps, and assert the
+        // reader picks up the changes.
+        //
+        // The reader doesn't care that the file is a "real" SQLite
+        // shm; only that the first 12 bytes look right.
+
+        use std::io::Write;
+
+        // The ShmReader type is `pub(crate)` — testable from inside
+        // the crate.
+        use crate::shm_watcher::ShmReader;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-shm-reader-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+
+        // Helper: write a 12-byte header (iVersion @ 0, zero @ 4..8,
+        // iChange @ 8..12) at `path`, atomically replacing whatever
+        // was there before so the inode changes.
+        let write_header = |ichange: u32| {
+            const WALINDEX_MAX_VERSION: u32 = 3_007_000;
+            let mut buf = [0u8; 12];
+            buf[0..4].copy_from_slice(&WALINDEX_MAX_VERSION.to_ne_bytes());
+            buf[8..12].copy_from_slice(&ichange.to_ne_bytes());
+            let _ = std::fs::remove_file(&tmp);
+            let mut f = std::fs::File::create(&tmp).unwrap();
+            f.write_all(&buf).unwrap();
+        };
+
+        // Phase 1: file present with iChange=42.
+        write_header(42);
+        let mut reader = ShmReader::new(tmp.clone());
+        assert_eq!(reader.read_ichange(), Some(42));
+
+        // Phase 2: replace the file (different inode), new iChange.
+        write_header(99);
+        // Without refresh_identity, ShmReader still has the old mmap
+        // and would return 42. With refresh_identity, it re-mmaps
+        // and returns 99.
+        reader.refresh_identity();
+        assert_eq!(
+            reader.read_ichange(),
+            Some(99),
+            "refresh_identity didn't re-mmap on inode change"
+        );
+
+        // Phase 3: file gone entirely.
+        let _ = std::fs::remove_file(&tmp);
+        reader.refresh_identity();
+        assert_eq!(
+            reader.read_ichange(),
+            None,
+            "ShmReader didn't drop mmap when shm went away"
+        );
+
+        // Phase 4: file recreated; refresh should pick it up again.
+        write_header(123);
+        reader.refresh_identity();
+        assert_eq!(
+            reader.read_ichange(),
+            Some(123),
+            "refresh_identity didn't re-attach after gap"
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// **Regression test for kernel watcher graceful-shutdown latency.**
+    /// Before the `RX_POLL_MS` decoupling, dropping an `UpdateWatcher`
+    /// could block for up to `SAFETY_NET_MS` (500 ms) waiting on the
+    /// blocking `recv_timeout`. With `RX_POLL_MS = 50`, shutdown should
+    /// complete within ~50 ms.
+    #[test]
+    #[cfg(feature = "kernel-watcher")]
+    fn kernel_watcher_shutdown_is_responsive() {
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-kw-shutdown-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let writer = open_conn(tmp.to_str().unwrap(), false).unwrap();
+        writer.execute_batch("CREATE TABLE t (x INTEGER)").unwrap();
+        writer.execute("INSERT INTO t VALUES (0)", []).unwrap();
+
+        let watcher = UpdateWatcher::spawn_with_config(
+            tmp.clone(),
+            || {},
+            WatcherConfig { backend: WatcherBackend::KernelWatch },
+        );
+
+        // Let the watcher reach steady state (in its recv_timeout block).
+        std::thread::sleep(Duration::from_millis(200));
+
+        let t0 = std::time::Instant::now();
+        let _ = watcher.join();
+        let elapsed = t0.elapsed();
+
+        drop(writer);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "kernel watcher shutdown took {elapsed:?}, expected < 150 ms \
+             (RX_POLL_MS = 50 ms; if this exceeds 500 ms the recv_timeout \
+             is blocking on the safety-net interval again)"
         );
     }
 }

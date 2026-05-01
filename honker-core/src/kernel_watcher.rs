@@ -5,29 +5,48 @@
 //! hints only** — `PRAGMA data_version` is still called on every wake to
 //! confirm a real commit; SQLite remains the source of truth.
 //!
+//! # Watched targets
+//!
+//! Two layers of watch, both journal-mode-agnostic:
+//!
+//! 1. **Parent directory** (always). Catches `-wal`/`-journal` file
+//!    create/delete around each commit — the universal per-commit
+//!    signal in every supported journal mode (DELETE creates+deletes
+//!    `-journal` per txn; TRUNCATE/PERSIST modify it per txn; WAL
+//!    appends to `-wal` and the directory still sees `-shm` updates).
+//!
+//! 2. **`-wal` file directly** (WAL mode only, opportunistic). When
+//!    the database is in WAL mode, the `-wal` file persists across
+//!    commits, so a per-file watch picks up `pwrite(2)` events
+//!    without going through the directory. Re-attached when the
+//!    `-wal` inode changes (e.g. after `wal_checkpoint(TRUNCATE)`
+//!    deletes and recreates it).
+//!
+//! In non-WAL modes (DELETE/TRUNCATE/PERSIST) there is no persistent
+//! file to per-file-watch — the rollback journal is created at BEGIN
+//! and deleted/truncated at COMMIT — so the directory watch carries
+//! the load. Empirically verified by `kernel_watcher_works_in_*` tests.
+//!
 //! # Platform notes
 //!
-//! - **Linux** — uses `inotify`. Watches the `-wal` file directly for
-//!   `IN_MODIFY` events. Reliable, sub-millisecond wake latency.
-//! - **macOS (kqueue, via `macos_kqueue` feature)** — watches the
-//!   `-wal` file directly. kqueue `NOTE_WRITE` fires on every `pwrite(2)`
-//!   SQLite issues to the WAL. Low latency when the WAL file exists.
-//!   While the WAL is absent (between checkpoint and first post-checkpoint
-//!   write), the 500 ms safety net covers detection.
-//! - **Windows** — uses `ReadDirectoryChangesW`. Directory-level change
-//!   notifications include file modification events.
+//! - **Linux** uses `inotify` (via `notify` 6's recommended watcher).
+//! - **macOS** uses `kqueue` (`notify` 6's `macos_kqueue` feature).
+//!   Default FSEvents has a 1 s batching latency, unusable for our wake
+//!   semantics; kqueue `NOTE_WRITE` fires on every `pwrite(2)`.
+//! - **Windows** uses `ReadDirectoryChangesW`.
 //! - **Fallback** — if watcher setup fails for any reason, the loop
 //!   transparently falls back to 1 ms PRAGMA polling.
 //!
 //! # Safety contract
 //!
 //! - Kernel events can be dropped, coalesced, or arrive out of order.
-//!   A 500 ms safety-net poll fires even without an event so missed
-//!   notifications don't cause permanent wake starvation.
-//! - If the notify watcher fails to initialize or watch the target,
-//!   the loop falls back to 1 ms polling automatically.
-//! - File-replacement detection (dead-man's switch) runs every ~30 s
-//!   regardless of backend.
+//!   A 500 ms safety-net `PRAGMA data_version` check runs on its own
+//!   clock, so missed notifications stall detection by at most that.
+//! - The recv loop's blocking timeout (`RX_POLL_MS`) is independent
+//!   of the safety-net interval — it bounds graceful-shutdown latency
+//!   without changing how often the safety net actually fires.
+//! - File-replacement detection (dead-man's switch) runs every 100 ms,
+//!   matching the polling backend.
 
 use crate::{poll_data_version, run_poll_loop, stat_identity};
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -38,10 +57,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-/// How long to block waiting for a kernel event before running the
-/// safety-net data_version check. Large enough to slash idle CPU versus
-/// 1 ms polling, small enough to not stall detection on missed events.
+/// How often to fire the safety-net `PRAGMA data_version` check when
+/// no kernel event has arrived. Large enough to slash idle CPU vs
+/// 1 ms polling, small enough that missed/coalesced notifications can
+/// only stall detection by this interval.
 const SAFETY_NET_MS: u64 = 500;
+/// Maximum time we block on the event channel before sampling the stop
+/// flag. Keeps graceful-shutdown latency bounded at ~RX_POLL_MS instead
+/// of [`SAFETY_NET_MS`]. Independent of safety-net firing — that runs
+/// on its own clock.
+const RX_POLL_MS: u64 = 50;
 
 /// Run the kernel-watch loop on the calling thread.
 ///
@@ -72,44 +97,59 @@ where
     // when the database transitions from "freshly checkpointed, WAL deleted" back
     // to "WAL active". Without this, writes after a full checkpoint would be
     // invisible until the safety-net fires.
-    let mut watching_any = false;
+    // Mode-agnostic primary signal: the parent directory. In every
+    // supported journal mode something gets created or deleted in the
+    // directory around each commit (DELETE creates+removes -journal,
+    // WAL creates -wal/-shm on first write, etc.).
+    let dir_watch_ok = watcher
+        .watch(&watch_dir, RecursiveMode::NonRecursive)
+        .is_ok();
+
+    // WAL-mode-only optimization: the -wal file persists across commits,
+    // so a per-file watch picks up writes without depending on directory
+    // events. Track the file's identity so we can re-attach when it is
+    // deleted and recreated (e.g. after `wal_checkpoint(TRUNCATE)`).
+    // In non-WAL modes -wal doesn't exist; the per-file watch stays
+    // unattached and the directory watch carries the load.
+    let mut watched_wal_id: Option<(u64, u64)> = None;
     if wal_path.exists() {
         if watcher.watch(&wal_path, RecursiveMode::NonRecursive).is_ok() {
-            watching_any = true;
+            watched_wal_id = stat_identity(&wal_path).ok();
         }
     }
-    match watcher.watch(&watch_dir, RecursiveMode::NonRecursive) {
-        Ok(()) => watching_any = true,
-        Err(e) => {
-            if !watching_any {
-                eprintln!("honker: kernel watcher setup failed ({e}), using 1ms polling");
-                run_poll_loop(db_path, on_change, stop);
-                return;
-            }
-        }
+
+    if !dir_watch_ok && watched_wal_id.is_none() {
+        eprintln!("honker: kernel watcher setup failed, using 1ms polling");
+        run_poll_loop(db_path, on_change, stop);
+        return;
     }
 
     // Open a reader connection for data_version verification.
     let mut conn = open_reader(&db_path);
-    let mut last_version = conn.as_ref().and_then(|c| poll_data_version(c).ok()).unwrap_or(0);
+    let mut last_version = conn
+        .as_ref()
+        .and_then(|c| poll_data_version(c).ok())
+        .unwrap_or(0);
     let initial_identity = stat_identity(&db_path).unwrap_or((0, 0));
     // tick counts event-loop iterations (each up to SAFETY_NET_MS long).
-    // Identity check runs roughly every 30 s (60 × 500 ms).
-    let mut tick: u64 = 0;
-    // Track whether we are watching the WAL file directly; re-add the watch
-    // when the WAL is recreated after a checkpoint.
-    let mut watching_wal = watching_any && wal_path.exists();
+    // Identity check runs every ~3 s (6 × 500 ms) — slower than polling's
+    // 100 ms but the dead-man's switch only fires on rare events
+    // (atomic rename, NFS remount, etc.).
+    // Time-tracked safety-net + identity-check schedules. Decoupling
+    // them from `recv_timeout` lets us keep the recv timeout short
+    // (snappy shutdown) without changing how often the safety net or
+    // identity check actually fire.
+    let started = std::time::Instant::now();
+    let mut last_safety_net = started;
+    let mut last_identity_check = started;
 
     while !stop.load(Ordering::Acquire) {
-        let should_check = match rx.recv_timeout(Duration::from_millis(SAFETY_NET_MS)) {
+        let should_check = match rx.recv_timeout(Duration::from_millis(RX_POLL_MS)) {
             Ok(Ok(event)) => {
-                // On directory event, check if the -wal file was created and
-                // add a per-file watch if we don't have one yet.
-                if !watching_wal && wal_path.exists() {
-                    if watcher.watch(&wal_path, RecursiveMode::NonRecursive).is_ok() {
-                        watching_wal = true;
-                    }
-                }
+                // Any directory-scope event is a potential WAL identity
+                // change — re-check on every event so post-checkpoint
+                // writes wake on real events, not on the safety net.
+                reattach_wal_watch_if_needed(&mut watcher, &wal_path, &mut watched_wal_id);
                 is_relevant(&event)
             }
             Ok(Err(e)) => {
@@ -117,13 +157,20 @@ where
                 true // conservative: check on any watcher error
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Safety-net: also attempt to (re-)attach WAL watch if missing.
-                if !watching_wal && wal_path.exists() {
-                    if watcher.watch(&wal_path, RecursiveMode::NonRecursive).is_ok() {
-                        watching_wal = true;
-                    }
+                let now = std::time::Instant::now();
+                if now.duration_since(last_safety_net)
+                    >= Duration::from_millis(SAFETY_NET_MS)
+                {
+                    // Safety-net: also re-check WAL identity in case we
+                    // missed the directory event for the recreation.
+                    reattach_wal_watch_if_needed(
+                        &mut watcher, &wal_path, &mut watched_wal_id,
+                    );
+                    last_safety_net = now;
+                    true
+                } else {
+                    false
                 }
-                true
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
@@ -132,10 +179,52 @@ where
             check_data_version(&db_path, &mut conn, &mut last_version, &on_change);
         }
 
-        tick += 1;
-        if tick % 60 == 0 {
+        // Run two 100 ms-cadence checks together:
+        //   * `identity_check` on the db file — dead-man's switch
+        //     (matches polling backend's cadence so file-replacement
+        //     detection latency doesn't depend on which backend is in
+        //     use).
+        //   * `reattach_wal_watch_if_needed` on the -wal file — bounds
+        //     worst-case post-WAL-recreation latency at 100 ms even if
+        //     the directory event for the recreation was missed (e.g.
+        //     dropped due to backend overflow). Without this it would
+        //     fall back to the 500 ms safety-net cycle.
+        let now = std::time::Instant::now();
+        if now.duration_since(last_identity_check) >= Duration::from_millis(100) {
             identity_check(&db_path, initial_identity, &mut conn, &on_change);
+            reattach_wal_watch_if_needed(&mut watcher, &wal_path, &mut watched_wal_id);
+            last_identity_check = now;
         }
+    }
+}
+
+/// (Re-)attach the `-wal` per-file watch when its identity changes
+/// (created, deleted+recreated by checkpoint, etc.). Idempotent: a no-op
+/// when the watched WAL still has the same inode.
+fn reattach_wal_watch_if_needed(
+    watcher: &mut notify::RecommendedWatcher,
+    wal_path: &Path,
+    watched_wal_id: &mut Option<(u64, u64)>,
+) {
+    let current = stat_identity(wal_path).ok();
+    if current == *watched_wal_id {
+        return;
+    }
+    // Identity changed (None → Some, Some → None, or new inode).
+    // Drop the old watch first; ignore errors (the watched path may
+    // already be gone, which `unwatch` reports as an error).
+    if watched_wal_id.is_some() {
+        let _ = watcher.unwatch(wal_path);
+    }
+    if current.is_some() {
+        if watcher.watch(wal_path, RecursiveMode::NonRecursive).is_ok() {
+            *watched_wal_id = current;
+        } else {
+            // Couldn't attach to the new -wal; safety net will cover us.
+            *watched_wal_id = None;
+        }
+    } else {
+        *watched_wal_id = None;
     }
 }
 
