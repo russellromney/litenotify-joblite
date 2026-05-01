@@ -9,8 +9,10 @@ import pytest
 # tests without needing a `pip install -e`.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _PACKAGES_ROOT = os.path.join(_REPO_ROOT, "packages")
-if _PACKAGES_ROOT not in sys.path:
-    sys.path.insert(0, _PACKAGES_ROOT)
+_HONKER_PYTHON_ROOT = os.path.join(_PACKAGES_ROOT, "honker", "python")
+for path in (_HONKER_PYTHON_ROOT, _PACKAGES_ROOT):
+    if os.path.isdir(path) and path not in sys.path:
+        sys.path.insert(0, path)
 
 
 @pytest.fixture

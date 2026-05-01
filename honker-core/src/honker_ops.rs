@@ -56,6 +56,17 @@ pub fn attach_honker_functions(conn: &Connection) -> rusqlite::Result<()> {
     })?;
 
     conn.create_scalar_function(
+        "honker_queue_next_claim_at",
+        1,
+        FunctionFlags::SQLITE_UTF8,
+        |ctx| {
+            let queue: String = ctx.get(0)?;
+            let db = unsafe { ctx.get_connection() }?;
+            queue_next_claim_at(&db, &queue).map_err(to_sql_err)
+        },
+    )?;
+
+    conn.create_scalar_function(
         "honker_sweep_expired",
         1,
         FunctionFlags::SQLITE_UTF8,
@@ -430,6 +441,37 @@ pub fn ack_batch(conn: &Connection, ids_json: &str, worker_id: &str) -> rusqlite
         count += 1;
     }
     Ok(count)
+}
+
+/// Return the earliest future deadline that could make `claim_batch()`
+/// return non-empty for this queue:
+///   * a pending row's `run_at`
+///   * one second after a processing row's `claim_expires_at`
+///
+/// Returns 0 if no such future deadline exists.
+pub fn queue_next_claim_at(conn: &Connection, queue: &str) -> rusqlite::Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT COALESCE(MIN(deadline), 0)
+             FROM (
+               SELECT MIN(run_at) AS deadline
+               FROM _honker_live
+               WHERE queue = ?1
+                 AND state = 'pending'
+                 AND (expires_at IS NULL OR expires_at > unixepoch())
+                 AND run_at > unixepoch()
+               UNION ALL
+               SELECT MIN(claim_expires_at + 1) AS deadline
+               FROM _honker_live
+               WHERE queue = ?1
+                 AND state = 'processing'
+                 AND (expires_at IS NULL OR expires_at > unixepoch())
+                 AND claim_expires_at > unixepoch()
+             )",
+            rusqlite::params![queue],
+            |r| r.get(0),
+        )
+        .unwrap_or(0))
 }
 
 // ---------------------------------------------------------------------
