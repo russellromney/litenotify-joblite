@@ -88,6 +88,10 @@ jobs:
             -c Release \
             -p:PackageVersion=${{ steps.version.outputs.value }} \
             -o artifacts/honker-dotnet
+      - name: Restore and run packaged consumer smoke test
+        shell: bash
+        run: |
+          packages/honker-dotnet/scripts/smoke-consumer.sh artifacts/honker-dotnet
       - name: Publish to NuGet
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}

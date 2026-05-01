@@ -309,7 +309,11 @@ jobs:
         run: |
           mkdir -p "packages/honker-dotnet/src/Honker/package-assets/runtimes/${{ matrix.rid }}/native"
           cp "target/release/${{ matrix.native_name }}" "packages/honker-dotnet/src/Honker/package-assets/runtimes/${{ matrix.rid }}/native/${{ matrix.native_name }}"
-          dotnet pack packages/honker-dotnet/src/Honker/Honker.csproj -c Release --no-restore -o artifacts/honker-dotnet
+          dotnet pack packages/honker-dotnet/src/Honker/Honker.csproj -c Release --no-restore -p:PackageVersion=0.0.0-ci.${{ github.run_number }} -o artifacts/honker-dotnet
+      - name: Restore and run packaged consumer smoke test
+        shell: bash
+        run: |
+          packages/honker-dotnet/scripts/smoke-consumer.sh artifacts/honker-dotnet
 
   node:
     name: node · honker-node
