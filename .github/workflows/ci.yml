@@ -27,72 +27,85 @@ permissions:
 # rather than at workflow-level (where the workspace isn't populated yet).
 
 jobs:
-  rust-core:
-    name: rust · honker-core (lib tests)
-    timeout-minutes: 5
+  rust:
+    name: rust · honker-core + extension
+    timeout-minutes: 8
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # Windows job verifies the file-id integration on stable Rust
-        # (no nightly-only `windows_by_handle` feature).
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      # `writer_killed_mid_workload_leaves_db_consistent` spawns a
-      # Python child writer to test crash-recovery durability. Set
-      # up Python on every OS so the test runs cross-platform.
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
-          prefix-key: "v1-src-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
-      - shell: bash
+          prefix-key: "v1-rust-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
+      - name: Run honker-core tests (release)
+        shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
             cargo test -p honker-core --release --lib --features bundled-sqlite
           else
             cargo test -p honker-core --release --lib
           fi
-
-  rust-core-debug:
-    # Release builds catch most regressions; debug builds catch a
-    # different class — slightly different timing exposes races, and
-    # debug-assertions catch arithmetic and bounds problems that
-    # release builds skip. Run on all three OSes so a Windows-debug-
-    # only race or a macOS-debug-only assertion failure doesn't
-    # slip through.
-    name: rust · honker-core (debug build)
-    timeout-minutes: 5
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "."
-          prefix-key: "v1-debug-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
-      - shell: bash
+      - name: Run honker-core tests (debug)
+        shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
             cargo test -p honker-core --lib --features bundled-sqlite
           else
             cargo test -p honker-core --lib
           fi
+      - name: Build loadable extension
+        run: cargo build --release -p honker-extension
+      # Windows stock Python ships sqlite without load_extension support.
+      # Use python-build-standalone (via setup-python) which has it.
+      - name: Sanity-load via Python sqlite3
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import sqlite3
+
+          candidates = (
+              "target/release/libhonker_ext.dylib",
+              "target/release/libhonker_ext.so",
+              "target/release/honker_ext.dll",
+          )
+          ext = None
+          for cand in candidates:
+              if os.path.exists(cand):
+                  ext = os.path.abspath(cand)
+                  break
+          assert ext, f"extension artifact not found; tried: {candidates}"
+          print(f"loading: {ext}")
+
+          conn = sqlite3.connect(":memory:")
+          if not hasattr(conn, "enable_load_extension"):
+              print("sqlite3.Connection.enable_load_extension unavailable; skipping load test")
+              raise SystemExit(0)
+          try:
+              conn.enable_load_extension(True)
+          except sqlite3.NotSupportedError:
+              print("sqlite3 was not compiled with load_extension; skipping load test")
+              raise SystemExit(0)
+          conn.load_extension(ext)
+          conn.execute("SELECT honker_bootstrap()")
+          conn.commit()
+
+          cur = conn.execute(
+              "SELECT honker_cron_next_after('0 3 * * *', 0)"
+          ).fetchone()
+          assert cur[0] > 0
+          print(f"honker_cron_next_after -> {cur[0]}")
+          PY
 
   perf-regression:
     # Run bench/wal_index_methods and assert mmap-shm is meaningfully
@@ -102,6 +115,7 @@ jobs:
     # Catches "I removed the cached prepared stmt and now PRAGMA is
     # 5µs/call" or "I broke the mmap reader" — not micro-regressions.
     name: bench · wal_index_methods (regression check)
+    if: github.event_name != 'pull_request'
     timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
@@ -135,73 +149,6 @@ jobs:
           assert ratio >= 50, f'mmap-shm should be at least 50x faster than cached PRAGMA, got {ratio:.1f}x'
           "
 
-  rust-extension:
-    name: rust · honker-extension (build)
-    timeout-minutes: 5
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "."
-          prefix-key: "v1-src-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
-      - name: Build loadable extension
-        run: cargo build --release -p honker-extension
-      # Windows stock Python ships sqlite without load_extension support.
-      # Use python-build-standalone (via setup-python) which has it.
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Sanity-load via Python sqlite3
-        shell: bash
-        run: |
-          python - <<'PY'
-          import os
-          import sqlite3
-
-          # Order matters: dylib (macOS), so (Linux), dll (Windows).
-          # honker-extension's cdylib name is `honker_ext` — Cargo
-          # adds the platform prefix/suffix.
-          candidates = (
-              "target/release/libhonker_ext.dylib",
-              "target/release/libhonker_ext.so",
-              "target/release/honker_ext.dll",
-          )
-          ext = None
-          for cand in candidates:
-              if os.path.exists(cand):
-                  ext = os.path.abspath(cand)
-                  break
-          assert ext, f"extension artifact not found; tried: {candidates}"
-          print(f"loading: {ext}")
-
-          conn = sqlite3.connect(":memory:")
-          # Older Pythons / minimal SQLite builds don't expose
-          # enable_load_extension. Skip with a clear message there.
-          if not hasattr(conn, "enable_load_extension"):
-              print("sqlite3.Connection.enable_load_extension unavailable; skipping load test")
-              raise SystemExit(0)
-          try:
-              conn.enable_load_extension(True)
-          except sqlite3.NotSupportedError:
-              print("sqlite3 was not compiled with load_extension; skipping load test")
-              raise SystemExit(0)
-          conn.load_extension(ext)
-          conn.execute("SELECT honker_bootstrap()")
-          conn.commit()
-
-          cur = conn.execute(
-              "SELECT honker_cron_next_after('0 3 * * *', 0)"
-          ).fetchone()
-          assert cur[0] > 0
-          print(f"honker_cron_next_after -> {cur[0]}")
-          PY
-
   python:
     name: python · honker
     timeout-minutes: 5
@@ -209,14 +156,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows: enabled in #18, which adds Database.close() to the
-        # PyO3 binding so tempfile cleanup releases the watcher's
-        # file handles before unlink. Without it, Windows raises
-        # WinError 32 ("file in use by another process") on tempdir
-        # cleanup. Tests must call db.close() in finally / __exit__
-        # before the tempdir scope ends.
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.11", "3.12"]
+        include: ${{ fromJson(github.event_name == 'pull_request' && '[{"os":"ubuntu-latest","python-version":"3.12"},{"os":"ubuntu-latest","python-version":"3.14"},{"os":"macos-latest","python-version":"3.12"},{"os":"windows-latest","python-version":"3.12"}]' || '[{"os":"ubuntu-latest","python-version":"3.12"},{"os":"ubuntu-latest","python-version":"3.14"},{"os":"macos-latest","python-version":"3.12"},{"os":"macos-latest","python-version":"3.14"},{"os":"windows-latest","python-version":"3.12"},{"os":"windows-latest","python-version":"3.14"}]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -322,16 +262,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows: enabled in #18, which adds Database.close() to the
-        # napi-rs binding so the writer/reader pools and watcher poll
-        # thread release their SQLite handles synchronously. Without
-        # it, basic.js cleanup hits "EBUSY: resource busy or locked,
-        # unlink" on the temp .db file — Windows mandatory locking
-        # rejects unlink while any handle is open. The cross-language
-        # Node tests spawn the repo venv's Python, so we branch on
-        # runner.os below for the venv path.
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        node-version: ["20", "22"]
+        include: ${{ fromJson(github.event_name == 'pull_request' && '[{"os":"ubuntu-latest","node-version":"22"},{"os":"ubuntu-latest","node-version":"24"},{"os":"macos-latest","node-version":"22"},{"os":"windows-latest","node-version":"22"}]' || '[{"os":"ubuntu-latest","node-version":"22"},{"os":"ubuntu-latest","node-version":"24"},{"os":"macos-latest","node-version":"22"},{"os":"macos-latest","node-version":"24"},{"os":"windows-latest","node-version":"22"},{"os":"windows-latest","node-version":"24"}]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -393,25 +324,9 @@ jobs:
         run: node --test test/cross_lang_supporting.js
 
   binding-smoke:
-    name: binding smoke · ${{ matrix.name }}
-    timeout-minutes: 5
+    name: binding smoke · ubuntu aggregate
+    timeout-minutes: 12
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - binding: honker-rs
-            name: Rust wrapper
-          - binding: honker-go
-            name: Go
-          - binding: honker-cpp
-            name: C++
-          - binding: honker-bun
-            name: Bun
-          - binding: honker-ruby
-            name: Ruby
-          - binding: honker-ex
-            name: Elixir
     steps:
       - uses: actions/checkout@v4
         with:
@@ -420,87 +335,28 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
-          prefix-key: "v1-bindings-${{ matrix.binding }}-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
-
+          prefix-key: "v1-bindings-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml', 'packages/honker/src/**/*.rs', 'packages/honker/Cargo.toml') }}"
       - uses: actions/setup-go@v5
-        if: matrix.binding == 'honker-go'
         with:
           go-version-file: packages/honker-go/go.mod
       - uses: mlugg/setup-zig@v2
-        if: matrix.binding == 'honker-cpp'
       - uses: oven-sh/setup-bun@v2
-        if: matrix.binding == 'honker-bun'
       - uses: ruby/setup-ruby@v1
-        if: matrix.binding == 'honker-ruby'
         with:
           ruby-version: "3.3"
       - uses: erlef/setup-beam@v1
-        if: matrix.binding == 'honker-ex'
         with:
           otp-version: "27"
           elixir-version: "1.17"
-
-      - name: Build honker-extension
-        if: matrix.binding != 'honker-rs'
-        run: cargo build --release -p honker-extension
-
-      - name: Rust wrapper
-        if: matrix.binding == 'honker-rs'
-        run: cargo test --manifest-path packages/honker-rs/Cargo.toml
-      - name: Go
-        if: matrix.binding == 'honker-go'
-        working-directory: packages/honker-go
-        run: go test -tags sqlite_load_extension ./...
-      - name: C++
-        if: matrix.binding == 'honker-cpp'
-        working-directory: packages/honker-cpp
-        run: zig build test -Dhonker-ext="${GITHUB_WORKSPACE}/target/release/libhonker_ext.so"
-      - name: Bun
-        if: matrix.binding == 'honker-bun'
-        working-directory: packages/honker-bun
-        run: |
-          bun install --frozen-lockfile
-          bun test
-      - name: Ruby
-        if: matrix.binding == 'honker-ruby'
-        working-directory: packages/honker-ruby
-        run: |
-          bundle install
-          bundle exec ruby -Ilib spec/honker_spec.rb
-          bundle exec ruby -Ilib spec/smoke_spec.rb
-          bundle exec ruby -Ilib spec/parity_spec.rb
-      - name: Elixir
-        if: matrix.binding == 'honker-ex'
-        working-directory: packages/honker-ex
-        run: |
-          mix deps.get
-          mix test
-
-  ruby-python-interop:
-    name: interop · ruby ↔ python
-    timeout-minutes: 5
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "."
-          prefix-key: "v1-ruby-python-interop-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml', 'packages/honker/src/**/*.rs', 'packages/honker/Cargo.toml') }}"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: "3.3"
       - name: Build honker-extension
         run: cargo build --release -p honker-extension
-      - name: Install Python binding
+      - name: Build Python binding
         shell: bash
         run: |
           uv venv --python "3.12" .venv
@@ -508,9 +364,31 @@ jobs:
           uv pip install pytest pytest-xdist maturin
           cd packages/honker
           maturin develop --release
-      - name: Install Ruby binding dependencies
+      - name: Rust wrapper
+        run: cargo test --manifest-path packages/honker-rs/Cargo.toml
+      - name: Go
+        working-directory: packages/honker-go
+        run: go test -tags sqlite_load_extension ./...
+      - name: C++
+        working-directory: packages/honker-cpp
+        run: zig build test -Dhonker-ext="${GITHUB_WORKSPACE}/target/release/libhonker_ext.so"
+      - name: Bun
+        working-directory: packages/honker-bun
+        run: |
+          bun install --frozen-lockfile
+          bun test
+      - name: Ruby
         working-directory: packages/honker-ruby
-        run: bundle install
+        run: |
+          bundle install
+          bundle exec ruby -Ilib spec/honker_spec.rb
+          bundle exec ruby -Ilib spec/smoke_spec.rb
+          bundle exec ruby -Ilib spec/parity_spec.rb
+      - name: Elixir
+        working-directory: packages/honker-ex
+        run: |
+          mix deps.get
+          mix test
       - name: Run Ruby ↔ Python interop
         shell: bash
         run: |
