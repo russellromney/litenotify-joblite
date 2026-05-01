@@ -129,6 +129,20 @@ impl WatcherBackend {
             Some(other) => Err(other.to_string()),
         }
     }
+
+    /// Verify the backend can actually initialize for `db_path`. Bindings
+    /// call this at `honker.open()` time so a backend that can't run
+    /// errors loudly instead of silently producing no wakes. Returns a
+    /// human-readable reason on failure.
+    pub fn probe(&self, db_path: &Path) -> Result<(), String> {
+        match self {
+            WatcherBackend::Polling => Ok(()),
+            #[cfg(feature = "kernel-watcher")]
+            WatcherBackend::KernelWatch => kernel_watcher::probe(db_path),
+            #[cfg(feature = "shm-fast-path")]
+            WatcherBackend::ShmFastPath => shm_watcher::probe(db_path),
+        }
+    }
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -2445,6 +2459,55 @@ while True:
             "kernel watcher shutdown took {elapsed:?}, expected < 150 ms \
              (RX_POLL_MS = 50 ms; if this exceeds 500 ms the recv_timeout \
              is blocking on the safety-net interval again)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Probe failures must surface as Err — proving "no silent fallback"
+    // when an experimental backend can't initialize.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn watcher_backend_polling_probe_always_succeeds() {
+        // Polling never fails — works on any path, any state.
+        let nope = std::path::PathBuf::from("/nonexistent/no/way/this/exists.db");
+        assert!(WatcherBackend::Polling.probe(&nope).is_ok());
+    }
+
+    #[test]
+    #[cfg(feature = "shm-fast-path")]
+    fn watcher_backend_shm_probe_fails_when_shm_missing() {
+        // Path with no -shm file — probe must report it, not silently
+        // disable the backend at runtime.
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-shm-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let result = WatcherBackend::ShmFastPath.probe(&tmp);
+        assert!(result.is_err(), "expected probe to fail for missing -shm");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("-shm unavailable"),
+            "probe error message should explain why; got: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "kernel-watcher")]
+    fn watcher_backend_kernel_probe_fails_for_inaccessible_dir() {
+        // Path under a non-existent parent — notify can't watch it.
+        let nope = std::path::PathBuf::from(
+            "/this/parent/does/not/exist/honker-kernel-probe.db",
+        );
+        let result = WatcherBackend::KernelWatch.probe(&nope);
+        assert!(
+            result.is_err(),
+            "expected probe to fail for inaccessible dir, got Ok"
         );
     }
 }

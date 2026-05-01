@@ -20,10 +20,9 @@
 //!   `on_change()` will not fire for that commit. The consumer's
 //!   `idle_poll_s` (default 5 s) is the only backstop.
 //!
-//! - **Setup failures are silent and final.** If `notify` can't
-//!   initialize a watcher or attach to the directory, this thread
-//!   logs to stderr and exits. No wakes will fire from this backend
-//!   for the rest of the process lifetime.
+//! - **Setup failures raise at `open()`.** [`probe`] runs at
+//!   `honker.open()` time and surfaces any init failure as an error
+//!   so the user knows immediately. No silent backend disable.
 //!
 //! Tests assert that wakes do fire, with bounded latency, on the
 //! platforms we support. If a test fails, the backend is broken on
@@ -94,4 +93,20 @@ where
             _ => {} // timeout, or Access event — ignore
         }
     }
+}
+
+/// Verify the kernel watcher can run for this `db_path`. Called from
+/// `WatcherBackend::probe` at `honker.open()` time so a misconfigured
+/// backend errors immediately rather than silently producing no wakes.
+pub(crate) fn probe(db_path: &std::path::Path) -> Result<(), String> {
+    let (tx, _rx) = mpsc::channel::<notify::Result<notify::Event>>();
+    let mut w = notify::recommended_watcher(tx)
+        .map_err(|e| format!("notify init failed: {e}"))?;
+    let dir = db_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."));
+    w.watch(dir, RecursiveMode::NonRecursive)
+        .map_err(|e| format!("can't watch {dir:?}: {e}"))?;
+    // Drop the watcher; it's recreated when actually needed.
+    Ok(())
 }

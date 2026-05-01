@@ -39,7 +39,11 @@ use std::time::Duration;
 
 const WALINDEX_MAX_VERSION: u32 = 3_007_000;
 const ICHANGE_OFFSET: usize = 8;
-const POLL_INTERVAL_US: u64 = 100;
+/// Same cadence as the polling backend. Shm reads are nearly free; the
+/// win over polling is "PRAGMA → memory load" (~3.5 µs → ns), not
+/// "1 ms → 100 µs". Going faster would just burn extra sleep syscalls
+/// for latency nobody can perceive.
+const POLL_INTERVAL_MS: u64 = 1;
 
 pub(crate) fn run_shm_fast_path_loop<F>(db_path: PathBuf, on_change: F, stop: Arc<AtomicBool>)
 where
@@ -78,11 +82,35 @@ where
     let read_ichange = || u32::from_ne_bytes(mmap[ICHANGE_OFFSET..ICHANGE_OFFSET + 4].try_into().unwrap());
     let mut last = read_ichange();
     while !stop.load(Ordering::Acquire) {
-        std::thread::sleep(Duration::from_micros(POLL_INTERVAL_US));
+        std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
         let current = read_ichange();
         if current != last {
             last = current;
             on_change();
         }
     }
+}
+
+/// Verify the shm fast path can run for this `db_path`. Called from
+/// `WatcherBackend::probe` at `honker.open()` time so a misconfigured
+/// backend errors immediately rather than silently producing no wakes.
+pub(crate) fn probe(db_path: &std::path::Path) -> Result<(), String> {
+    if cfg!(target_endian = "big") {
+        return Err("shm-fast-path requires little-endian platform".into());
+    }
+    let shm = format!("{}-shm", db_path.display());
+    let f = File::open(&shm).map_err(|e| {
+        format!("-shm unavailable ({e}). WAL mode + open connection required.")
+    })?;
+    let m = unsafe { Mmap::map(&f) }.map_err(|e| format!("mmap failed: {e}"))?;
+    if m.len() < 12 {
+        return Err("-shm too small".into());
+    }
+    let iv = u32::from_ne_bytes(m[0..4].try_into().unwrap());
+    if iv != WALINDEX_MAX_VERSION {
+        return Err(format!(
+            "WAL index version {iv} != {WALINDEX_MAX_VERSION} (unsupported SQLite layout)"
+        ));
+    }
+    Ok(())
 }

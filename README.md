@@ -243,6 +243,29 @@ Idle cost is a single `PRAGMA data_version` query per millisecond per database. 
 
 `SharedUpdateWatcher` (in `honker-core`) owns the poll thread and fans out to N subscribers via bounded `SyncSender<()>` channels keyed by subscriber id. Each `db.update_events()` call registers a subscriber and returns a handle whose `Drop` auto-unsubscribes, so a dropped listener causes the bridge thread's `rx.recv() -> Err` and exits cleanly.
 
+### Experimental wake backends (opt-in)
+
+Two opt-in alternatives to PRAGMA polling, behind Cargo features. Both have **weaker correctness contracts** than the default — they exist for users who care about lower idle CPU or want to test event-driven wake on their platform.
+
+```python
+db = honker.open("app.db", watcher_backend="kernel")  # OS file notifications
+db = honker.open("app.db", watcher_backend="shm")     # mmap WAL index, WAL only
+```
+
+```javascript
+const db = honker.open('app.db', undefined, 'kernel');
+```
+
+If the requested backend can't initialize (e.g., shm needs WAL + open conn; kernel needs the OS notify API), `honker.open()` raises immediately. No silent fallback.
+
+| backend | wake source | spurious wakes | missed wakes | journal mode |
+|---|---|---|---|---|
+| `polling` (default) | `PRAGMA data_version` every 1 ms | never | never | any |
+| `kernel` | `notify-rs` events on dir + `-wal`/`-shm` | possible | possible (if OS drops events) | any |
+| `shm` | mmap `iChange` in WAL index every 1 ms | never | possible (stale on inode change) | WAL only |
+
+Build wheels with `--features kernel-watcher,shm-fast-path` (or one) to include them. Without the features, `watcher_backend="kernel"` falls back to polling with a stderr warning.
+
 ### Queue schema
 
 - `_honker_live`: pending + processing rows

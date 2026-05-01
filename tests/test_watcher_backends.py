@@ -99,3 +99,10 @@ async def test_watcher_backend_detects_commits(db_path, backend):
 async def test_unknown_watcher_backend_raises(db_path):
     with pytest.raises(ValueError):
         honker.open(db_path, watcher_backend="bogus")
+
+
+async def test_shm_backend_works_for_real_db(db_path):
+    """Sanity: the probe at honker.open() time succeeds for a normal db
+    (WAL mode + open writer connection). The failure paths are
+    exercised by the Rust unit test `watcher_backend_probe_fails_for_*`."""
+    honker.open(db_path, watcher_backend="shm")  # must not raise

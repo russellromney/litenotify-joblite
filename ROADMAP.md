@@ -127,6 +127,62 @@ runtime can support it.
 - Do not block 1.0 on bindings that are explicitly marked poll-based or
   partial, as long as the docs and tests say so.
 
+## Phase Echo — Experimental Watcher Backends Across All Bindings
+
+> After: Phase Wake Parity · Before: 1.0 release prep
+
+The experimental `kernel` and `shm` watcher backends ship in
+`honker-core` and are wired through Python and Node only. Bring the
+remaining bindings to parity so users can opt in from any language.
+
+### Scope
+
+For each of `honker-bun`, `honker-go`, `honker-rs`, `honker-ruby`,
+`honker-cpp`, `honker-ex`:
+
+- Add Cargo features `kernel-watcher` and `shm-fast-path` that forward
+  to `honker-core/<feature>` (where the binding has a Cargo.toml).
+- Accept a `watcher_backend` (or language-idiomatic equivalent) string
+  parameter on the binding's `open()`.
+- Parse via `honker_core::WatcherBackend::parse` so the accepted
+  aliases (`"polling"` / `"poll"`, `"kernel"` / `"kernel-watcher"`,
+  `"shm"` / `"shm-fast-path"`) stay in lockstep with Python/Node.
+- Call `WatcherBackend::probe(&db_path)` at `open()` time and surface
+  failures as the language's idiomatic error type. **No silent
+  fallback.**
+- Pass the `WatcherConfig` through to `SharedUpdateWatcher::new_with_config`.
+
+### Tests per binding
+
+- Direct API test: `open(backend=...)` for each backend; one returns
+  the polling default, kernel/shm raise iff the feature isn't
+  compiled into that binding's build.
+- Cross-process listener: writer subprocess + parent listener under
+  each backend. Every commit must surface to the listener.
+- Cross-process queue worker: 1×1, 1×N (workers), N×1 (writers)
+  topologies × each backend. Mirrors the existing
+  `tests/test_watcher_backends_queue_e2e.py` and
+  `packages/honker-node/test/watcher_backends_queue_e2e.js`.
+
+### Non-goals
+
+- Don't add new wire formats or per-binding watcher logic. All
+  backends live in `honker-core`; bindings only thread the param.
+- Don't auto-detect / silently substitute backends — the experimental
+  contract is "opt in, fail loud, restart".
+- Don't backport to bindings without an `update_events()` equivalent
+  (some have polling-only consumer APIs); document those as
+  polling-only and skip.
+
+### Verification
+
+- Per binding: tests above pass on Linux and macOS in CI.
+- Windows is opt-in; document expected behavior per binding.
+- All tests in `tests/test_watcher_backends.py`,
+  `tests/test_watcher_backends_e2e.py`, and
+  `tests/test_watcher_backends_queue_e2e.py` continue to pass for
+  Python; equivalents continue to pass for Node.
+
 ## Phase Cadence — Time-Based Watcher Ticks
 
 > After: Phase Wake Parity · Before: 1.0 release prep
