@@ -271,6 +271,46 @@ jobs:
           # outliers. Keep the Python job single-process on every OS.
           python -m pytest tests/ -q -n 0 --tb=short
 
+  dotnet:
+    name: dotnet · honker-dotnet
+    timeout-minutes: 8
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+            native_name: libhonker_ext.so
+          - os: macos-14
+            rid: osx-arm64
+            native_name: libhonker_ext.dylib
+          - os: windows-latest
+            rid: win-x64
+            native_name: honker_ext.dll
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          prefix-key: "v1-src-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml', 'packages/honker-dotnet/src/**/*.cs', 'packages/honker-dotnet/tests/**/*.cs', 'packages/honker-dotnet/**/*.csproj') }}"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Build honker-extension
+        run: cargo build --release -p honker-extension
+      - name: Run .NET binding tests
+        run: dotnet test packages/honker-dotnet/tests/Honker.Tests/Honker.Tests.csproj --verbosity normal
+      - name: Pack NuGet smoke test
+        shell: bash
+        run: |
+          mkdir -p "packages/honker-dotnet/src/Honker/package-assets/runtimes/${{ matrix.rid }}/native"
+          cp "target/release/${{ matrix.native_name }}" "packages/honker-dotnet/src/Honker/package-assets/runtimes/${{ matrix.rid }}/native/${{ matrix.native_name }}"
+          dotnet pack packages/honker-dotnet/src/Honker/Honker.csproj -c Release --no-restore -o artifacts/honker-dotnet
+
   node:
     name: node · honker-node
     timeout-minutes: 5

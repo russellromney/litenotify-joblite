@@ -1,0 +1,98 @@
+name: Release · NuGet
+
+on:
+  push:
+    tags:
+      - "dotnet-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "NuGet package version"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-native:
+    name: native · ${{ matrix.rid }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+            native_name: libhonker_ext.so
+          - os: macos-13
+            rid: osx-x64
+            native_name: libhonker_ext.dylib
+          - os: macos-14
+            rid: osx-arm64
+            native_name: libhonker_ext.dylib
+          - os: windows-latest
+            rid: win-x64
+            native_name: honker_ext.dll
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build honker-extension
+        run: cargo build --release -p honker-extension
+      - name: Stage native asset
+        shell: bash
+        run: |
+          mkdir -p "native/runtimes/${{ matrix.rid }}/native"
+          cp "target/release/${{ matrix.native_name }}" "native/runtimes/${{ matrix.rid }}/native/${{ matrix.native_name }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: honker-native-${{ matrix.rid }}
+          path: native/
+          if-no-files-found: error
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: build-native
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: honker-native-*
+          path: packages/honker-dotnet/src/Honker/package-assets
+          merge-multiple: true
+      - name: Determine package version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        shell: bash
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION="${REF#refs/tags/dotnet-v}"
+          fi
+          echo "value=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Pack NuGet package
+        run: |
+          dotnet pack packages/honker-dotnet/src/Honker/Honker.csproj \
+            -c Release \
+            -p:PackageVersion=${{ steps.version.outputs.value }} \
+            -o artifacts/honker-dotnet
+      - name: Publish to NuGet
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          dotnet nuget push artifacts/honker-dotnet/*.nupkg \
+            --source "https://api.nuget.org/v3/index.json" \
+            --api-key "$NUGET_API_KEY" \
+            --skip-duplicate

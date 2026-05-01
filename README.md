@@ -56,7 +56,7 @@ Today:
   return value, caller awaits `queue.wait_result(id)`)
 - Durable streams with per-consumer offsets and configurable flush interval
 - SQLite loadable extension so any SQLite client can read the same tables
-- Bindings: Python, Node.js, Rust, Go, Ruby, Bun, Elixir
+- Bindings: Python, Node.js, Rust, Go, Ruby, Bun, Elixir, .NET / C#
 - Works inside an ORM-owned SQLite connection. SQLAlchemy, SQLModel, Django, Drizzle, Kysely, sqlx, GORM, ActiveRecord, Ecto ([guide](https://honker.dev/guides/orm/))
 
 Deliberately not built: task pipelines/chains/groups/chords, multi-writer replication, workflow orchestration with DAGs.
