@@ -299,7 +299,7 @@ jobs:
           prefix-key: "v1-src-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml', 'packages/honker-dotnet/src/**/*.cs', 'packages/honker-dotnet/tests/**/*.cs', 'packages/honker-dotnet/**/*.csproj') }}"
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: "8.0.x"
+          dotnet-version: "10.0.x"
       - name: Build honker-extension
         run: cargo build --release -p honker-extension
       - name: Run .NET binding tests

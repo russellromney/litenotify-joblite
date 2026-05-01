@@ -8,6 +8,7 @@ fi
 
 PACKAGE_DIR=$(cd "$1" && pwd)
 PACKAGE_ID=${2:-Honker}
+TARGET_FRAMEWORK=${HONKER_DOTNET_SMOKE_TFM:-net10.0}
 
 PACKAGE_FILE=$(find "$PACKAGE_DIR" -maxdepth 1 -name "${PACKAGE_ID}*.nupkg" | head -n 1)
 if [[ -z "${PACKAGE_FILE:-}" ]]; then
@@ -25,7 +26,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-dotnet new console --framework net8.0 --output "$WORKDIR" >/dev/null
+dotnet new console --framework "$TARGET_FRAMEWORK" --output "$WORKDIR" >/dev/null
 dotnet add "$WORKDIR" package "$PACKAGE_ID" --version "$PACKAGE_VERSION" --source "$PACKAGE_DIR" >/dev/null
 
 cat > "$WORKDIR/Program.cs" <<'EOF'

@@ -105,14 +105,18 @@ public sealed class BindingTests
         using var db = harness.Open();
         var queue = db.Queue("work");
         using var stop = new CancellationTokenSource();
-
-        var readers = Enumerable.Range(0, 4).Select(_ => Task.Run(() =>
+        using var ready = new CountdownEvent(4);
+        var readerDbs = Enumerable.Range(0, 4).Select(_ => harness.Open()).ToList();
+        var readers = readerDbs.Select(readerDb => Task.Run(() =>
         {
+            ready.Signal();
             while (!stop.IsCancellationRequested)
             {
-                db.Query("SELECT COUNT(*) AS c FROM _honker_jobs");
+                readerDb.Query("SELECT COUNT(*) AS c FROM _honker_jobs");
             }
-        }, stop.Token)).ToList();
+        })).ToList();
+
+        Assert.True(ready.Wait(TimeSpan.FromSeconds(5)), "reader tasks did not start in time");
 
         try
         {
@@ -125,6 +129,10 @@ public sealed class BindingTests
         {
             stop.Cancel();
             await Task.WhenAll(readers);
+            foreach (var readerDb in readerDbs)
+            {
+                readerDb.Dispose();
+            }
         }
 
         var count = ScalarInt64(db, "SELECT COUNT(*) AS c FROM _honker_jobs");
