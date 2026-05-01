@@ -11,7 +11,8 @@ Python currently also carries the richest task-framework layer
 (`@task`, `TaskResult`, worker CLI). Other bindings are closer to
 "excellent thin wrapper over the shared runtime" today; that split is
 intentional until we decide which languages should also grow the richer
-application-facing layer.
+application-facing layer. See the bindings guide at
+[honker.dev/guides/bindings](https://honker.dev/guides/bindings/).
 
 `honker` works by replacing application-level polling with a single-digit-µs `PRAGMA data_version` read on the database every 1ms, achieving push-like semantics and cross-process notifications with single-digit-millisecond delivery.
 
