@@ -4,7 +4,7 @@
 
 `honker` is a SQLite extension + language bindings that add Postgres-style `NOTIFY`/`LISTEN` semantics to SQLite, with built-in durable pub/sub, task queue, and event streams, without client polling or a daemon/broker. Any language that can `SELECT load_extension('honker')` gets the same features.
 
-honker ships as a [Rust crate](https://crates.io/crates/honker) (`honker`, plus `honker-core`/`honker-extension`), a [SQLite loadable extension](#sqlite-extension-any-sqlite-39-client), and language packages: Python (`honker`), Node (`@russellthehippo/honker-node`), Bun (`@russellthehippo/honker-bun`), Ruby (`honker`), Go, Elixir, C++. The on-disk layout is defined once in Rust; every binding is a thin wrapper around the loadable extension.
+honker ships as a [Rust crate](https://crates.io/crates/honker) (`honker`, plus `honker-core`/`honker-extension`), a [SQLite loadable extension](#sqlite-extension-any-sqlite-39-client), and language packages: Python (`honker`), Node (`@russellthehippo/honker-node`), Bun (`@russellthehippo/honker-bun`), Ruby (`honker`), Go, Elixir, C++, and .NET / C# ([Honker on NuGet](https://www.nuget.org/packages/Honker)). The on-disk layout is defined once in Rust; every binding is a thin wrapper around the loadable extension.
 
 `honker` works by replacing application-level polling with a single-digit-µs `PRAGMA data_version` read on the database every 1ms, achieving push-like semantics and cross-process notifications with single-digit-millisecond delivery.
 
@@ -210,7 +210,7 @@ The extension shares `_honker_live`, `_honker_dead`, and `_honker_notifications`
 
 ## Design
 
-This repo includes the `honker` SQLite loadable extension and bindings for Python, Node, Rust, Go, Ruby, Bun, and Elixir. 
+This repo includes the `honker` SQLite loadable extension and bindings for Python, Node, Rust, Go, Ruby, Bun, Elixir, C++, and .NET / C#.
 
 For most applications, [SQLite alone is sufficient](https://www.epicweb.dev/why-you-should-probably-be-using-sqlite). There are already great libraries that leverage SQLite for durable messaging. [Huey](https://github.com/coleifer/huey) is the one honker draws the most from. This project is inspired by it and seeks to do something similar across languages and frameworks by moving package logic into a SQLite extension.
 
@@ -362,12 +362,13 @@ packages/
   honker-bun/             # Bun binding                       [git submodule]
   honker-ex/              # Elixir binding                    [git submodule]
   honker-cpp/             # C++ binding                       [git submodule]
+  honker-dotnet/          # .NET / C# binding                 [git submodule]
 tests/                    # integration tests (cross-package)
 bench/                    # benches
 site/                     # honker.dev (Astro)                [git submodule]
 ```
 
-Each binding repo is published independently (PyPI / npm / crates.io / Hex / RubyGems) and pinned here as a git submodule; `honker-core` + `honker-extension` live in-tree since they're the shared foundation every binding depends on. Clone with `git clone --recursive` or run `git submodule update --init --recursive` after a normal clone.
+Each binding repo is published independently (PyPI / npm / crates.io / Hex / RubyGems / NuGet) and pinned here as a git submodule; `honker-core` + `honker-extension` live in-tree since they're the shared foundation every binding depends on. Clone with `git clone --recursive` or run `git submodule update --init --recursive` after a normal clone.
 
 ```bash
 make test                   # default: rust + python + node (fast, ~10s)
