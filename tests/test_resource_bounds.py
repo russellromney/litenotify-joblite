@@ -35,13 +35,14 @@ async def test_listener_churn_does_not_leak_threads(db_path):
 
     for i in range(300):
         channel = f"ch-{i}"
+        listener = db.listen(channel)
 
         async def once():
-            async for n in db.listen(channel):
+            async for n in listener:
                 return n.payload
 
         task = asyncio.create_task(once())
-        await asyncio.sleep(0.002)
+        await asyncio.sleep(0)
         with db.transaction() as tx:
             tx.notify(channel, "ok")
         await asyncio.wait_for(task, timeout=2.0)

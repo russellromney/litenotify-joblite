@@ -6,157 +6,52 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Cancel in-progress runs for a branch when a new commit lands.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Drop the default-write GITHUB_TOKEN. Only checkout (contents:read)
-# is needed across these jobs. If a job ever needs more, it should
-# request it explicitly at the job level.
 permissions:
   contents: read
 
-# Swatinem/rust-cache@v2 derives its cache key from Cargo.lock + rustc
-# version by default. That's good for dependency bumps but NOT for edits
-# to .rs files in our own crates — a source-only change produces the same
-# key, which let an older compiled extension stick around under a later
-# commit (caused a real CI false-pass once). Hash core + extension source
-# trees into each job's prefix-key so any source change invalidates the
-# cache. hashFiles() runs after checkout, so the pattern lives per-job
-# rather than at workflow-level (where the workspace isn't populated yet).
-
 jobs:
-  rust-core:
-    name: rust · honker-core (lib tests)
-    timeout-minutes: 5
+  rust:
+    name: rust · honker-core + extension
+    timeout-minutes: 8
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # Windows job verifies the file-id integration on stable Rust
-        # (no nightly-only `windows_by_handle` feature).
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      # `writer_killed_mid_workload_leaves_db_consistent` spawns a
-      # Python child writer to test crash-recovery durability. Set
-      # up Python on every OS so the test runs cross-platform.
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
-          prefix-key: "v1-src-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
-      - shell: bash
+          prefix-key: "v1-rust-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
+      - name: Run honker-core tests (release)
+        shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
             cargo test -p honker-core --release --lib --features bundled-sqlite
           else
             cargo test -p honker-core --release --lib
           fi
-
-  rust-core-debug:
-    # Release builds catch most regressions; debug builds catch a
-    # different class — slightly different timing exposes races, and
-    # debug-assertions catch arithmetic and bounds problems that
-    # release builds skip. Run on all three OSes so a Windows-debug-
-    # only race or a macOS-debug-only assertion failure doesn't
-    # slip through.
-    name: rust · honker-core (debug build)
-    timeout-minutes: 5
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "."
-          prefix-key: "v1-debug-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
-      - shell: bash
+      - name: Run honker-core tests (debug)
+        shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
             cargo test -p honker-core --lib --features bundled-sqlite
           else
             cargo test -p honker-core --lib
           fi
-
-  perf-regression:
-    # Run bench/wal_index_methods and assert mmap-shm is meaningfully
-    # faster than PRAGMA. The threshold is intentionally loose (50×)
-    # — observed delta is ~3000× on real hardware, so anything
-    # within 60× of that means something has fundamentally changed.
-    # Catches "I removed the cached prepared stmt and now PRAGMA is
-    # 5µs/call" or "I broke the mmap reader" — not micro-regressions.
-    name: bench · wal_index_methods (regression check)
-    timeout-minutes: 5
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "bench/wal_index_methods"
-          prefix-key: "v1-bench-${{ hashFiles('bench/wal_index_methods/Cargo.toml', 'bench/wal_index_methods/src/**/*.rs') }}"
-      - name: Run wal_index_methods bench
-        working-directory: bench/wal_index_methods
-        run: cargo run --release | tee /tmp/bench.out
-      - name: Assert mmap-shm beats cached PRAGMA by ≥50×
-        run: |
-          set -euo pipefail
-          # Output lines look like:
-          #   "  shm iChange (safe dual-read + barrier)                             0.6 ns/poll"
-          #   "  PRAGMA data_version via cached prepared stmt                    1543.9 ns/poll"
-          # Extract the numeric ns/poll value from each.
-          SHM=$(awk '/shm iChange \(safe dual-read/ {print $(NF-1)}' /tmp/bench.out)
-          PRAGMA=$(awk '/PRAGMA data_version via cached prepared stmt/ {print $(NF-1)}' /tmp/bench.out)
-          test -n "$SHM"    || { echo "could not parse shm iChange line"; cat /tmp/bench.out; exit 1; }
-          test -n "$PRAGMA" || { echo "could not parse cached PRAGMA line"; cat /tmp/bench.out; exit 1; }
-          python3 -c "
-          shm = float('$SHM')
-          pragma = float('$PRAGMA')
-          ratio = pragma / max(shm, 0.01)
-          print(f'mmap shm iChange: {shm} ns/poll')
-          print(f'cached PRAGMA:    {pragma} ns/poll')
-          print(f'ratio:            {ratio:.0f}x')
-          assert ratio >= 50, f'mmap-shm should be at least 50x faster than cached PRAGMA, got {ratio:.1f}x'
-          "
-
-  rust-extension:
-    name: rust · honker-extension (build)
-    timeout-minutes: 5
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "."
-          prefix-key: "v1-src-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
       - name: Build loadable extension
         run: cargo build --release -p honker-extension
-      # Windows stock Python ships sqlite without load_extension support.
-      # Use python-build-standalone (via setup-python) which has it.
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
       - name: Sanity-load via Python sqlite3
         shell: bash
         run: |
@@ -164,9 +59,6 @@ jobs:
           import os
           import sqlite3
 
-          # Order matters: dylib (macOS), so (Linux), dll (Windows).
-          # honker-extension's cdylib name is `honker_ext` — Cargo
-          # adds the platform prefix/suffix.
           candidates = (
               "target/release/libhonker_ext.dylib",
               "target/release/libhonker_ext.so",
@@ -181,8 +73,6 @@ jobs:
           print(f"loading: {ext}")
 
           conn = sqlite3.connect(":memory:")
-          # Older Pythons / minimal SQLite builds don't expose
-          # enable_load_extension. Skip with a clear message there.
           if not hasattr(conn, "enable_load_extension"):
               print("sqlite3.Connection.enable_load_extension unavailable; skipping load test")
               raise SystemExit(0)
@@ -202,6 +92,38 @@ jobs:
           print(f"honker_cron_next_after -> {cur[0]}")
           PY
 
+  perf-regression:
+    name: bench · wal_index_methods (regression check)
+    if: github.event_name != 'pull_request'
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "bench/wal_index_methods"
+          prefix-key: "v1-bench-${{ hashFiles('bench/wal_index_methods/Cargo.toml', 'bench/wal_index_methods/src/**/*.rs') }}"
+      - name: Run wal_index_methods bench
+        working-directory: bench/wal_index_methods
+        run: cargo run --release | tee /tmp/bench.out
+      - name: Assert mmap-shm beats cached PRAGMA by >=50x
+        run: |
+          set -euo pipefail
+          SHM=$(awk '/shm iChange \(safe dual-read/ {print $(NF-1)}' /tmp/bench.out)
+          PRAGMA=$(awk '/PRAGMA data_version via cached prepared stmt/ {print $(NF-1)}' /tmp/bench.out)
+          test -n "$SHM" || { echo "could not parse shm iChange line"; cat /tmp/bench.out; exit 1; }
+          test -n "$PRAGMA" || { echo "could not parse cached PRAGMA line"; cat /tmp/bench.out; exit 1; }
+          python3 -c "
+          shm = float('$SHM')
+          pragma = float('$PRAGMA')
+          ratio = pragma / max(shm, 0.01)
+          print(f'mmap shm iChange: {shm} ns/poll')
+          print(f'cached PRAGMA:    {pragma} ns/poll')
+          print(f'ratio:            {ratio:.0f}x')
+          assert ratio >= 50, f'mmap-shm should be at least 50x faster than cached PRAGMA, got {ratio:.1f}x'
+          "
+
   python:
     name: python · honker
     timeout-minutes: 5
@@ -209,14 +131,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows: enabled in #18, which adds Database.close() to the
-        # PyO3 binding so tempfile cleanup releases the watcher's
-        # file handles before unlink. Without it, Windows raises
-        # WinError 32 ("file in use by another process") on tempdir
-        # cleanup. Tests must call db.close() in finally / __exit__
-        # before the tempdir scope ends.
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["3.11", "3.12"]
+        include: ${{ fromJson(github.event_name == 'pull_request' && '[{"os":"ubuntu-latest","python-version":"3.12"},{"os":"ubuntu-latest","python-version":"3.14"},{"os":"macos-latest","python-version":"3.12"},{"os":"windows-latest","python-version":"3.12"}]' || '[{"os":"ubuntu-latest","python-version":"3.12"},{"os":"ubuntu-latest","python-version":"3.14"},{"os":"macos-latest","python-version":"3.12"},{"os":"macos-latest","python-version":"3.14"},{"os":"windows-latest","python-version":"3.12"},{"os":"windows-latest","python-version":"3.14"}]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -245,19 +160,16 @@ jobs:
       - name: Build honker-extension
         run: cargo build --release -p honker-extension
       - name: Build PyO3 _honker_native (maturin develop)
-        # The `honker` Python package exposes a PyO3 cdylib named
-        # `_honker_native`. setuptools in pyproject.toml only handles
-        # the pure-Python files; maturin is what compiles + installs
-        # the Rust cdylib into the venv's site-packages.
         working-directory: packages/honker
         shell: bash
         run: |
           if [ "${{ runner.os }}" = "Windows" ]; then
             . ../../.venv/Scripts/activate
+            maturin develop --release --features bundled-sqlite
           else
             . ../../.venv/bin/activate
+            maturin develop --release
           fi
-          maturin develop --release
       - name: Run pytest
         shell: bash
         run: |
@@ -266,10 +178,51 @@ jobs:
           else
             . .venv/bin/activate
           fi
-          # Cross-process wake latency tests are scheduler-sensitive;
-          # pytest-xdist adds enough process noise to produce CI-only
-          # outliers. Keep the Python job single-process on every OS.
           python -m pytest tests/ -q -n 0 --tb=short
+
+  dotnet:
+    name: dotnet · honker-dotnet
+    timeout-minutes: 8
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+            native_name: libhonker_ext.so
+          - os: macos-14
+            rid: osx-arm64
+            native_name: libhonker_ext.dylib
+          - os: windows-latest
+            rid: win-x64
+            native_name: honker_ext.dll
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+          prefix-key: "v1-src-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml', 'packages/honker-dotnet/src/**/*.cs', 'packages/honker-dotnet/tests/**/*.cs', 'packages/honker-dotnet/**/*.csproj') }}"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Build honker-extension
+        run: cargo build --release -p honker-extension
+      - name: Run .NET binding tests
+        run: dotnet test packages/honker-dotnet/tests/Honker.Tests/Honker.Tests.csproj --verbosity normal
+      - name: Pack NuGet smoke test
+        shell: bash
+        run: |
+          mkdir -p "packages/honker-dotnet/src/Honker/package-assets/runtimes/${{ matrix.rid }}/native"
+          cp "target/release/${{ matrix.native_name }}" "packages/honker-dotnet/src/Honker/package-assets/runtimes/${{ matrix.rid }}/native/${{ matrix.native_name }}"
+          dotnet pack packages/honker-dotnet/src/Honker/Honker.csproj -c Release --no-restore -p:PackageVersion=0.0.0-ci.${{ github.run_number }} -o artifacts/honker-dotnet
+      - name: Restore and run packaged consumer smoke test
+        shell: bash
+        run: |
+          packages/honker-dotnet/scripts/smoke-consumer.sh artifacts/honker-dotnet
 
   node:
     name: node · honker-node
@@ -278,20 +231,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Windows: enabled in #18, which adds Database.close() to the
-        # napi-rs binding so the writer/reader pools and watcher poll
-        # thread release their SQLite handles synchronously. Without
-        # it, basic.js cleanup hits "EBUSY: resource busy or locked,
-        # unlink" on the temp .db file — Windows mandatory locking
-        # rejects unlink while any handle is open. The cross-language
-        # Node tests spawn the repo venv's Python, so we branch on
-        # runner.os below for the venv path.
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        node-version: ["20", "22"]
+        include: ${{ fromJson(github.event_name == 'pull_request' && '[{"os":"ubuntu-latest","node-version":"22"},{"os":"ubuntu-latest","node-version":"24"},{"os":"macos-latest","node-version":"22"},{"os":"windows-latest","node-version":"22"}]' || '[{"os":"ubuntu-latest","node-version":"22"},{"os":"ubuntu-latest","node-version":"24"},{"os":"macos-latest","node-version":"22"},{"os":"macos-latest","node-version":"24"},{"os":"windows-latest","node-version":"22"},{"os":"windows-latest","node-version":"24"}]') }}
     steps:
       - uses: actions/checkout@v4
         with:
-          # Need the node submodule + core crate it path-deps.
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -300,20 +243,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-      # The cross-language Node proof files spawn the venv's Python to
-      # verify Python ↔ Node share the same .db. So the node job also
-      # needs Python with the honker package + _honker_native cdylib
-      # installed.
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
       - name: Create venv + build Python extension
         shell: bash
         run: |
-          uv venv --python "3.12" .venv
+          uv venv --python "3.14" .venv
           if [ "${{ runner.os }}" = "Windows" ]; then
             VENV_PY=.venv/Scripts/python.exe
             ACTIVATE=.venv/Scripts/activate
@@ -324,7 +263,11 @@ jobs:
           uv pip install --python "$VENV_PY" maturin
           cd packages/honker
           . "../../$ACTIVATE"
-          maturin develop --release
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            maturin develop --release --features bundled-sqlite
+          else
+            maturin develop --release
+          fi
       - name: Build .node binary
         working-directory: packages/honker-node
         shell: bash
@@ -349,25 +292,9 @@ jobs:
         run: node --test test/cross_lang_supporting.js
 
   binding-smoke:
-    name: binding smoke · ${{ matrix.name }}
-    timeout-minutes: 5
+    name: binding smoke · ubuntu aggregate
+    timeout-minutes: 12
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - binding: honker-rs
-            name: Rust wrapper
-          - binding: honker-go
-            name: Go
-          - binding: honker-cpp
-            name: C++
-          - binding: honker-bun
-            name: Bun
-          - binding: honker-ruby
-            name: Ruby
-          - binding: honker-ex
-            name: Elixir
     steps:
       - uses: actions/checkout@v4
         with:
@@ -376,49 +303,51 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "."
-          prefix-key: "v1-bindings-${{ matrix.binding }}-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml') }}"
-
+          prefix-key: "v1-bindings-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml', 'packages/honker/src/**/*.rs', 'packages/honker/Cargo.toml') }}"
       - uses: actions/setup-go@v5
-        if: matrix.binding == 'honker-go'
         with:
           go-version-file: packages/honker-go/go.mod
       - uses: mlugg/setup-zig@v2
-        if: matrix.binding == 'honker-cpp'
       - uses: oven-sh/setup-bun@v2
-        if: matrix.binding == 'honker-bun'
       - uses: ruby/setup-ruby@v1
-        if: matrix.binding == 'honker-ruby'
         with:
-          ruby-version: "3.3"
+          ruby-version: "3.4"
       - uses: erlef/setup-beam@v1
-        if: matrix.binding == 'honker-ex'
         with:
           otp-version: "27"
-          elixir-version: "1.17"
-
+          elixir-version: "1.19"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
       - name: Build honker-extension
-        if: matrix.binding != 'honker-rs'
         run: cargo build --release -p honker-extension
-
+      - name: Build Python binding
+        shell: bash
+        run: |
+          uv venv --python "3.14" .venv
+          . .venv/bin/activate
+          uv pip install pytest pytest-xdist maturin
+          cd packages/honker
+          maturin develop --release
       - name: Rust wrapper
-        if: matrix.binding == 'honker-rs'
         run: cargo test --manifest-path packages/honker-rs/Cargo.toml
       - name: Go
-        if: matrix.binding == 'honker-go'
         working-directory: packages/honker-go
         run: go test -tags sqlite_load_extension ./...
       - name: C++
-        if: matrix.binding == 'honker-cpp'
         working-directory: packages/honker-cpp
         run: zig build test -Dhonker-ext="${GITHUB_WORKSPACE}/target/release/libhonker_ext.so"
       - name: Bun
-        if: matrix.binding == 'honker-bun'
         working-directory: packages/honker-bun
+        env:
+          HONKER_EXT_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
         run: |
           bun install --frozen-lockfile
           bun test
       - name: Ruby
-        if: matrix.binding == 'honker-ruby'
         working-directory: packages/honker-ruby
         run: |
           bundle install
@@ -426,47 +355,10 @@ jobs:
           bundle exec ruby -Ilib spec/smoke_spec.rb
           bundle exec ruby -Ilib spec/parity_spec.rb
       - name: Elixir
-        if: matrix.binding == 'honker-ex'
         working-directory: packages/honker-ex
         run: |
           mix deps.get
           mix test
-
-  ruby-python-interop:
-    name: interop · ruby ↔ python
-    timeout-minutes: 5
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "."
-          prefix-key: "v1-ruby-python-interop-${{ hashFiles('honker-core/src/**/*.rs', 'honker-core/Cargo.toml', 'honker-extension/src/**/*.rs', 'honker-extension/Cargo.toml', 'packages/honker/src/**/*.rs', 'packages/honker/Cargo.toml') }}"
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: astral-sh/setup-uv@v6
-        with:
-          enable-cache: true
-      - uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: "3.3"
-      - name: Build honker-extension
-        run: cargo build --release -p honker-extension
-      - name: Install Python binding
-        shell: bash
-        run: |
-          uv venv --python "3.12" .venv
-          . .venv/bin/activate
-          uv pip install pytest pytest-xdist maturin
-          cd packages/honker
-          maturin develop --release
-      - name: Install Ruby binding dependencies
-        working-directory: packages/honker-ruby
-        run: bundle install
       - name: Run Ruby ↔ Python interop
         shell: bash
         run: |

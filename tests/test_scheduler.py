@@ -19,7 +19,7 @@ from datetime import datetime
 import pytest
 
 import honker
-from honker import crontab, Scheduler
+from honker import Scheduler, crontab, every_s
 
 
 # ---------- crontab() / CronSchedule.next_after ----------
@@ -29,7 +29,7 @@ def test_crontab_field_count_validated():
     with pytest.raises(ValueError):
         crontab("* * * *")        # 4 fields
     with pytest.raises(ValueError):
-        crontab("* * * * * *")    # 6 fields
+        crontab("* * *")          # 3 fields
 
 
 def test_crontab_out_of_range_validated():
@@ -80,6 +80,25 @@ def test_crontab_next_after_crosses_year():
     assert nxt == datetime(2026, 1, 1, 0, 0)
 
 
+def test_crontab_six_field_next_after_seconds():
+    c = crontab("*/10 * * * * *")
+    dt = datetime(2025, 1, 1, 10, 5, 3)
+    nxt = c.next_after(dt)
+    assert nxt == datetime(2025, 1, 1, 10, 5, 10)
+
+
+def test_every_s_next_after_seconds():
+    c = every_s(1)
+    dt = datetime(2025, 1, 1, 10, 5, 3)
+    nxt = c.next_after(dt)
+    assert nxt == datetime(2025, 1, 1, 10, 5, 4)
+
+
+def test_every_s_requires_positive_integer():
+    with pytest.raises(ValueError):
+        every_s(0)
+
+
 # ---------- Scheduler.add / _fire_due ----------
 
 
@@ -100,6 +119,23 @@ def test_scheduler_add_registers_task(db_path):
     assert rows[0]["queue"] == "backups"
     assert rows[0]["cron_expr"] == "0 3 * * *"
     assert "nightly" in sched._registered
+
+
+def test_scheduler_add_registers_interval_expression(db_path):
+    db = honker.open(db_path)
+    sched = Scheduler(db)
+    sched.add(
+        name="fast",
+        queue="backups",
+        schedule=every_s(5),
+    )
+    rows = db.query(
+        "SELECT name, queue, cron_expr FROM _honker_scheduler_tasks "
+        "WHERE name='fast'"
+    )
+    assert len(rows) == 1
+    assert rows[0]["queue"] == "backups"
+    assert rows[0]["cron_expr"] == "@every 5s"
 
 
 def test_scheduler_add_replaces_by_name(db_path):

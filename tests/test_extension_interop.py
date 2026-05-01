@@ -488,6 +488,40 @@ def test_extension_scheduler_interops_with_python(ext_db_path):
     conn.close()
 
 
+@pytest.mark.skipif(_SKIP, reason=_SKIP_REASON)
+def test_extension_scheduler_interval_expression(ext_db_path):
+    conn = _open_ext(ext_db_path)
+    conn.execute("SELECT honker_bootstrap()")
+    conn.execute(
+        "SELECT honker_scheduler_register('fast', 'backups', '@every 1s', "
+        "'\"go\"', 0, NULL)"
+    )
+    conn.commit()
+
+    row = conn.execute(
+        "SELECT queue, cron_expr, next_fire_at "
+        "FROM _honker_scheduler_tasks WHERE name='fast'"
+    ).fetchone()
+    assert row[0] == "backups"
+    assert row[1] == "@every 1s"
+    boundary = int(row[2])
+
+    fires_json = conn.execute(
+        "SELECT honker_scheduler_tick(?)", (boundary,)
+    ).fetchone()[0]
+    conn.commit()
+    import json as _json
+    fires = _json.loads(fires_json)
+    assert len(fires) == 1
+    assert fires[0]["fire_at"] == boundary
+
+    new_next = int(conn.execute(
+        "SELECT next_fire_at FROM _honker_scheduler_tasks WHERE name='fast'"
+    ).fetchone()[0])
+    assert new_next == boundary + 1
+    conn.close()
+
+
 # ---------- honker_result_save / honker_result_get / honker_result_sweep ----------
 
 

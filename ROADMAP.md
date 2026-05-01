@@ -90,19 +90,92 @@ Tracked by issue #11:
 - Re-enable Windows for Node after the same close-path fix and after
   `cross_lang.js` stops hard-coding Unix venv paths.
 
-## Phase Wake Parity — Binding Update Events
+## Phase Ballmer — .NET C# Binding
 
-> After: Phase Submodule · Before: Phase Cadence
+> After: Phase Submodule · Before: Phase Wake Parity
 
-Make every maintained binding explicit about its wake/listen behavior,
-then converge them on the shared update-event semantics where the host
-runtime can support it.
+Track issue #28 by adding an idiomatic .NET binding as a thin wrapper
+around the SQLite loadable extension. The intent is to let LLM-assisted
+porting do most of the mechanical work from the existing Go, Ruby,
+Node, and Rust binding patterns, while keeping human review focused on
+native packaging, cancellation semantics, and cross-platform behavior.
 
-### Current split
+### Shape
 
-- Python, Node, and Rust use `honker-core::SharedUpdateWatcher`.
-- Go and C++ reimplement the same `PRAGMA data_version` watcher locally.
-- Bun async iterators poll target tables on short timers.
+- Create a standalone `honker-dotnet` / `Honker` package repo and pin it
+  here as a submodule once the first parity slice is usable.
+- Choose and lock the managed SQLite provider early, including its
+  native-library loading story and supported runtime matrix.
+- Target modern .NET first, using `Microsoft.Data.Sqlite` as the default
+  managed SQLite layer.
+- Load `honker-extension` on each opened connection and call
+  `honker_bootstrap()` during `Honker.Database.Open(...)`.
+- Package native `honker-extension` binaries under NuGet
+  `runtimes/<rid>/native/` paths, with explicit resolver tests for
+  Linux, macOS, and Windows, including a deliberate Windows SQLite
+  compatibility story.
+- Prefer typed wrappers over a Rust/C ABI: `Database`, `Transaction`,
+  `Queue`, `Job`, `Stream`, `Scheduler`, `Lock`, and result helpers all
+  call `SELECT honker_*(...)`.
+
+### First parity slice
+
+- Queue enqueue / claim / ack / retry / fail / heartbeat.
+- `IAsyncEnumerable<Job>` claim loop with `CancellationToken`.
+- Deadline-aware worker sleep using `honker_queue_next_claim_at(queue)`.
+- Deterministic cleanup for cancelled claim loops and watcher-backed
+  waits so abandoned subscriptions do not leak.
+- Scheduler add / remove / tick / soonest / run.
+- Canonical `schedule` naming with `cron` kept as a compatibility alias.
+- `@every <n><unit>`, 6-field cron, and delayed `run_at` tests matching
+  the shipped parity bar from PR #29.
+
+### Follow-up parity
+
+- Durable streams with per-consumer offsets.
+- Ephemeral listen / notify once a clean update-event bridge or
+  pluggable watcher backend story exists.
+- Rate limits, locks, task results, and batch helpers.
+- EF Core recipe showing how to load the extension on an application
+  connection and enqueue inside an existing transaction.
+
+### Non-goals
+
+- Do not reimplement Honker queue or scheduler logic in C#.
+- Do not make .NET the source of truth for schema or SQL behavior.
+- Do not block the first package on full EF Core integration, AOT,
+  Unity, Xamarin, or mobile support.
+- Do not promise every binding surface in the first release; mark any
+  missing wrappers clearly and keep raw SQL access available.
+
+### Verification
+
+- .NET unit tests cover the same six must-pass queue cases as the other
+  bindings.
+- Cross-process delayed `run_at` and reclaim-deadline tests prove the
+  async worker does not wait for a fallback poll.
+- Cancellation and disposal tests prove abandoned claim loops or other
+  watcher-backed waits release subscriptions cleanly.
+- Scheduler tests prove `@every 1s`, 6-field cron, `schedule`, and
+  legacy `cron` alias behavior.
+- Cross-language interop test proves Python writes can be claimed by C#
+  and C# writes can be claimed by Python.
+- CI builds and tests on Linux, macOS, and Windows for the supported RIDs
+  included in the NuGet package.
+
+## Completed — Time-trigger scheduler and wake parity
+
+Shipped in PR #29, with follow-up release prep in PR #33.
+
+- `run_at` jobs now wake workers at their deadline instead of waiting
+  for a later fallback poll.
+- Reclaim deadlines now wake sleeping workers on time too.
+- Scheduler expressions now support 5-field cron, 6-field cron, and
+  `@every <n><unit>`.
+- Maintained bindings converged on the same basic time-trigger shape:
+  update wake or next deadline, with fallback polling only as backup.
+- Canonical recurring name is now `schedule`, with legacy `cron` kept
+  as a compatibility alias where needed.
 - Ruby and Elixir expose extension-backed `notify` and table APIs but do
   not yet expose async listen/update-watcher APIs.
 

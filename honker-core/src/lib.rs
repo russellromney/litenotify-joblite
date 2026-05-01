@@ -269,6 +269,12 @@ pub const BOOTSTRAP_HONKER_SQL: &str = "
     CREATE INDEX IF NOT EXISTS _honker_live_claim
       ON _honker_live(queue, priority DESC, run_at, id)
       WHERE state IN ('pending', 'processing');
+    CREATE INDEX IF NOT EXISTS _honker_live_pending_deadline
+      ON _honker_live(queue, run_at)
+      WHERE state = 'pending';
+    CREATE INDEX IF NOT EXISTS _honker_live_processing_deadline
+      ON _honker_live(queue, claim_expires_at)
+      WHERE state = 'processing';
     CREATE TABLE IF NOT EXISTS _honker_dead (
       id INTEGER PRIMARY KEY,
       queue TEXT NOT NULL,
