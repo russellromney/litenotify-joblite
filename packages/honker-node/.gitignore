@@ -1,0 +1,10 @@
+node_modules/
+target/
+Cargo.lock
+package-lock.json
+*.log
+*.tsbuildinfo
+
+# Platform-specific napi-rs binaries are built per-platform in
+# CI/release workflows; don't commit them.
+*.node

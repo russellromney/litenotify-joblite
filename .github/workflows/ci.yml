@@ -24,8 +24,6 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
@@ -155,8 +153,6 @@ jobs:
         include: ${{ fromJson(github.event_name == 'pull_request' && '[{"os":"ubuntu-latest","python-version":"3.12"},{"os":"ubuntu-latest","python-version":"3.14"},{"os":"macos-latest","python-version":"3.12"},{"os":"windows-latest","python-version":"3.12"}]' || '[{"os":"ubuntu-latest","python-version":"3.12"},{"os":"ubuntu-latest","python-version":"3.14"},{"os":"macos-latest","python-version":"3.12"},{"os":"macos-latest","python-version":"3.14"},{"os":"windows-latest","python-version":"3.12"},{"os":"windows-latest","python-version":"3.14"}]') }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -220,8 +216,6 @@ jobs:
             native_name: honker_ext.dll
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -255,8 +249,6 @@ jobs:
         include: ${{ fromJson(github.event_name == 'pull_request' && '[{"os":"ubuntu-latest","node-version":"22"},{"os":"ubuntu-latest","node-version":"24"},{"os":"macos-latest","node-version":"22"},{"os":"windows-latest","node-version":"22"}]' || '[{"os":"ubuntu-latest","node-version":"22"},{"os":"ubuntu-latest","node-version":"24"},{"os":"macos-latest","node-version":"22"},{"os":"macos-latest","node-version":"24"},{"os":"windows-latest","node-version":"22"},{"os":"windows-latest","node-version":"24"}]') }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -318,8 +310,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -343,6 +333,8 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+      - name: Install C++ binding deps
+        run: sudo apt-get install -y libsqlite3-dev nlohmann-json3-dev
       - name: Build honker-extension
         run: cargo build --release -p honker-extension
       - name: Build Python binding

@@ -395,20 +395,24 @@ honker-core/              # Rust rlib shared across all bindings (in-tree, publi
 honker-extension/         # SQLite loadable extension (cdylib, published on crates.io)
 packages/
   honker/                 # Python package (PyO3 cdylib + Queue/Stream/Outbox/Scheduler)
-  honker-node/            # napi-rs Node.js binding           [git submodule]
-  honker-rs/              # ergonomic Rust wrapper            [git submodule]
-  honker-go/              # Go binding                        [git submodule]
-  honker-ruby/            # Ruby binding                      [git submodule]
-  honker-bun/             # Bun binding                       [git submodule]
-  honker-ex/              # Elixir binding                    [git submodule]
-  honker-cpp/             # C++ binding                       [git submodule]
-  honker-dotnet/          # .NET / C# binding                 [git submodule]
+  honker-node/            # napi-rs Node.js binding
+  honker-rs/              # ergonomic Rust wrapper
+  honker-go/              # Go binding
+  honker-ruby/            # Ruby binding
+  honker-bun/             # Bun binding
+  honker-ex/              # Elixir binding
+  honker-cpp/             # C++ binding
+  honker-dotnet/          # .NET / C# binding
 tests/                    # integration tests (cross-package)
 bench/                    # benches
 site/                     # honker.dev (Astro)                [git submodule]
 ```
 
-Each binding repo is published independently (PyPI / npm / crates.io / Hex / RubyGems / NuGet) and pinned here as a git submodule; `honker-core` + `honker-extension` live in-tree since they're the shared foundation every binding depends on. Clone with `git clone --recursive` or run `git submodule update --init --recursive` after a normal clone.
+The maintained language bindings live in-tree so one feature can update
+core behavior, docs, tests, and binding surfaces together. The core
+engine is still Rust (`honker-core` + `honker-extension`); the language
+packages are first-class wrappers published independently to their
+ecosystems. `site/` remains a separate docs-site submodule.
 
 ```bash
 make test                   # default: rust + python + node (fast, ~10s)

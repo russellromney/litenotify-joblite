@@ -1,0 +1,44 @@
+{
+  "name": "@russellthehippo/honker-node",
+  "version": "0.3.2",
+  "description": "Node binding for honker — durable queues, streams, pub/sub, and scheduler on SQLite.",
+  "main": "wrapper.js",
+  "types": "wrapper.d.ts",
+  "homepage": "https://honker.dev",
+  "publishConfig": { "access": "public" },
+  "files": [
+    "index.js",
+    "wrapper.js",
+    "api.js",
+    "wrapper.d.ts",
+    "index.d.ts",
+    "README.md",
+    "LICENSE",
+    "*.node"
+  ],
+  "napi": {
+    "binaryName": "honker",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu"
+    ]
+  },
+  "engines": {
+    "node": ">= 20"
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "test": "node --test test/basic.js test/parity.test.js test/cross_lang_python_to_node.js test/cross_lang_node_to_python.js test/cross_lang_supporting.js test/watcher_backends.js test/watcher_backends_e2e.js test/watcher_backends_queue_e2e.js"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.0.0"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/russellromney/honker"
+  }
+}

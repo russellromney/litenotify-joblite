@@ -1,0 +1,32 @@
+[package]
+name = "honker"
+version = "0.3.2"
+edition = "2024"
+description = "SQLite-native task runtime: durable queues, streams, pub/sub, and scheduler. Ergonomic Rust wrapper over honker-core."
+license = "Apache-2.0"
+repository = "https://github.com/russellromney/honker-rs"
+homepage = "https://honker.dev"
+readme = "README.md"
+keywords = ["sqlite", "queue", "pubsub", "notify", "honker"]
+categories = ["database", "concurrency"]
+
+# Not part of the root workspace — lives on its own so it can be
+# split into a submodule repo without disturbing the core build.
+[workspace]
+
+[dependencies]
+# `path` resolves when this repo is a submodule inside the main
+# honker repo; `version` is what Cargo uses when honker-rs is
+# consumed from crates.io.
+honker-core = { path = "../../honker-core", version = "0.2.2" }
+rusqlite = { version = "0.39", features = ["functions"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+parking_lot = "0.12"
+
+[target.'cfg(windows)'.dependencies]
+honker-core = { path = "../../honker-core", version = "0.2.2", features = ["bundled-sqlite"] }
+
+[dev-dependencies]
+tempfile = "3"

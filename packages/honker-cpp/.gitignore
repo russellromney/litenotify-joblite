@@ -1,0 +1,8 @@
+zig-cache/
+.zig-cache/
+zig-out/
+*.dSYM/
+*.db
+*.db-wal
+*.db-shm
+.DS_Store

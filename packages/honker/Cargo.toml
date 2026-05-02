@@ -1,0 +1,35 @@
+[package]
+name = "honker-py"
+version = "0.1.1"
+edition = "2024"
+description = "PyO3 bindings for honker — the Rust cdylib behind the `honker` PyPI package. Not published to crates.io; built by maturin."
+license = "Apache-2.0"
+publish = false
+
+# Opt out of the root workspace so this crate can live in its own
+# submodule repo without dragging workspace members along. `path`
+# resolves when this repo is submoduled inside the main honker repo;
+# `version` is the crates.io fallback for standalone builds.
+[workspace]
+
+[lib]
+name = "_honker_native"
+crate-type = ["cdylib"]
+
+[features]
+bundled-sqlite = ["honker-core/bundled-sqlite", "rusqlite/bundled"]
+# Forward to honker-core. Pass `--features kernel-watcher` (or both)
+# to maturin to ship a wheel with the experimental backends compiled
+# in. Wheels without these flags fall back to polling when a Python
+# caller passes `watcher_backend="kernel"` or `"shm"`.
+kernel-watcher = ["honker-core/kernel-watcher"]
+shm-fast-path = ["honker-core/shm-fast-path"]
+
+[dependencies]
+honker-core = { path = "../../honker-core", version = "0.2.2" }
+parking_lot = "0.12.5"
+pyo3 = { version = "0.28.3", features = ["extension-module"] }
+rusqlite = { version = "0.39.0", features = ["functions", "hooks"] }
+
+[target.'cfg(windows)'.dependencies]
+honker-core = { path = "../../honker-core", version = "0.2.2", features = ["bundled-sqlite"] }
