@@ -46,6 +46,7 @@ jobs:
             tests/test_crash_recovery.py \
             tests/test_cross_process_wake_latency.py \
             tests/test_multiprocess.py \
+            tests/test_real_e2e_scenarios.py \
             tests/test_resource_bounds.py \
             tests/test_real_app_example.py
       - name: Slow soak proofs
