@@ -57,14 +57,20 @@ where
         }
     };
 
-    // Attach watches at startup. We watch the parent directory (so
-    // file create/delete around commits in DELETE/TRUNCATE/PERSIST
-    // modes fire) AND -wal/-shm directly if they exist (because
-    // directory-level watches on macOS kqueue don't fire on writes
-    // *within* existing files — only on directory entry changes).
+    // Attach watches at startup. We watch:
+    //   - the db file itself — fires on in-place writes in every
+    //     journal mode (non-WAL especially needs this; macOS kqueue
+    //     on a parent dir does NOT fire on writes inside existing
+    //     entries, only on entry create/delete/rename, so PERSIST/
+    //     TRUNCATE produce zero dir events)
+    //   - the parent directory — catches journal/wal/shm create+
+    //     delete around commits in DELETE mode and any other entry
+    //     churn
+    //   - -wal/-shm/-journal directly if they exist — fires on writes
+    //     within these sidecar files
     //
     // No re-attach logic if files come and go mid-flight. That's the
-    // experimental tradeoff — if the WAL is unlinked and recreated,
+    // experimental tradeoff — if a sidecar is unlinked and recreated,
     // the per-file watch goes stale and the consumer's `idle_poll_s`
     // backstop catches up. Restart the process to recover the fast path.
     let watch_dir = db_path
@@ -73,10 +79,11 @@ where
         .to_path_buf();
     let wal = PathBuf::from(format!("{}-wal", db_path.display()));
     let shm = PathBuf::from(format!("{}-shm", db_path.display()));
+    let journal = PathBuf::from(format!("{}-journal", db_path.display()));
 
     // Try each path; missing files / inaccessible dirs error here and
     // we just skip them. As long as at least one watch attached, we go.
-    let attached = [&watch_dir, &wal, &shm]
+    let attached = [&watch_dir, &db_path, &wal, &shm, &journal]
         .into_iter()
         .filter(|p| watcher.watch(p, RecursiveMode::NonRecursive).is_ok())
         .count();
