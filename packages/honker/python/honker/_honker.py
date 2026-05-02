@@ -12,6 +12,17 @@ def _core_open(path, max_readers, watcher_backend=None):
     return _open(path, max_readers=max_readers, watcher_backend=watcher_backend)
 
 
+async def _raise_if_dead(awaitable):
+    """Awaits the underlying queue coroutine. If the watcher pushed a
+    BaseException sentinel (dead-man's switch fired — db file replaced
+    or watcher panic), re-raise it; otherwise return the value (None
+    on a normal commit tick)."""
+    value = await awaitable
+    if isinstance(value, BaseException):
+        raise value
+    return value
+
+
 class Notification:
     """A single row from `_honker_notifications`, as delivered to a
     `Listener`. `payload` is lazy-decoded JSON on access — matches the

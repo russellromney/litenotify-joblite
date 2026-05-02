@@ -44,8 +44,12 @@ const RX_POLL_MS: u64 = 50;
 /// doesn't depend on which backend the user picked.
 const IDENTITY_CHECK_MS: u64 = 100;
 
-pub(crate) fn run_kernel_watch_loop<F>(db_path: PathBuf, on_change: F, stop: Arc<AtomicBool>)
-where
+pub(crate) fn run_kernel_watch_loop<F>(
+    db_path: PathBuf,
+    on_change: F,
+    stop: Arc<AtomicBool>,
+    ready: std::sync::mpsc::SyncSender<()>,
+) where
     F: Fn() + Send + 'static,
 {
     let (tx, rx) = mpsc::channel::<notify::Result<notify::Event>>();
@@ -93,6 +97,9 @@ where
         }
     };
     let mut last_id_check = Instant::now();
+    // Baseline captured; signal the spawner that it's safe to return.
+    let _ = ready.send(());
+    drop(ready);
 
     while !stop.load(Ordering::Acquire) {
         match rx.recv_timeout(Duration::from_millis(RX_POLL_MS)) {

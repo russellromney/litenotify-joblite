@@ -51,8 +51,12 @@ const POLL_INTERVAL_MS: u64 = 1;
 /// up to ~15 ms.
 const IDENTITY_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
-pub(crate) fn run_shm_fast_path_loop<F>(db_path: PathBuf, on_change: F, stop: Arc<AtomicBool>)
-where
+pub(crate) fn run_shm_fast_path_loop<F>(
+    db_path: PathBuf,
+    on_change: F,
+    stop: Arc<AtomicBool>,
+    ready: std::sync::mpsc::SyncSender<()>,
+) where
     F: Fn() + Send + 'static,
 {
     if cfg!(target_endian = "big") {
@@ -105,6 +109,9 @@ where
         }
     };
     let mut next_identity_check = Instant::now() + IDENTITY_CHECK_INTERVAL;
+    // Baseline captured; signal the spawner that it's safe to return.
+    let _ = ready.send(());
+    drop(ready);
 
     while !stop.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));

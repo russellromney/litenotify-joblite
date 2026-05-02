@@ -306,3 +306,53 @@ async def test_cross_process_listener_survives_writer_restart(db_path, backend):
         f"backend={backend!r}: persisted {len(persisted)} of 10 "
         f"notifications across two writer lifetimes"
     )
+
+
+# ----------------------------------------------------------------------
+# Test 4: dead-man's switch propagates to the listener.
+#         Atomically replace the db file mid-flight; the listener must
+#         raise within ~1 s rather than hang on an empty queue.
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+async def test_listener_raises_when_watcher_dies(db_path, backend, tmp_path):
+    db = honker.open(db_path, watcher_backend=backend)
+    with db.transaction() as tx:
+        tx.execute("CREATE TABLE _warm (i INTEGER)")
+        tx.notify("dead", "warmup")  # one row so listener has something to subscribe past
+    await asyncio.sleep(0.1)
+
+    # Subscribe; the watcher's per-backend dead-man's switch fires on
+    # inode change. We use `update_events()` directly to avoid masking
+    # the death by listen()'s SQL re-query path.
+    events = db.update_events()
+    aiter = events.__aiter__()
+    # update_events() blocks until the watcher thread has captured its
+    # baseline (initial inode), so os.replace can run immediately
+    # without racing the snapshot.
+
+    # Atomic replace of the db file — fresh inode on the same path.
+    replacement = tmp_path / "replacement.db"
+    replacement.write_bytes(b"")
+    os.replace(replacement, db_path)
+
+    # File replacement can produce a few "conservative wake" None ticks
+    # (transient I/O errors before the dead-man's switch identity check
+    # fires). Drain Nones until the death exception arrives, bounded by
+    # a total deadline.
+    async def drain_until_death(deadline_s: float):
+        end = time.perf_counter() + deadline_s
+        while time.perf_counter() < end:
+            remaining = end - time.perf_counter()
+            value = await asyncio.wait_for(aiter.__anext__(), timeout=remaining)
+            assert value is None, f"unexpected non-None wake value: {value!r}"
+        raise AssertionError("deadline reached without watcher death")
+
+    with pytest.raises(Exception) as excinfo:
+        await drain_until_death(deadline_s=3.0)
+    msg = str(excinfo.value)
+    assert "watcher" in msg.lower() or "replaced" in msg.lower() or "dead" in msg.lower(), (
+        f"backend={backend!r}: expected a watcher-died-style error, "
+        f"got {msg!r}"
+    )

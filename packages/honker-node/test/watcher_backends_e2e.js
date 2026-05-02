@@ -349,3 +349,51 @@ for (const backend of [null, 'kernel', 'shm']) {
     }
   });
 }
+
+// ----------------------------------------------------------------------
+// Test 4: dead-man's switch propagates to updateEvents().next().
+//         Atomically replace the db file mid-flight; the next() promise
+//         must reject within ~2s rather than hang on a dead channel.
+// ----------------------------------------------------------------------
+
+for (const backend of [null, 'kernel', 'shm']) {
+  const label = backend === null ? 'polling' : backend;
+
+  test(`watcherBackend=${label} updateEvents().next() rejects when watcher dies`, async () => {
+    const fs = require('node:fs');
+    const { dbPath, cleanup } = await createTempDb();
+    const open = (...args) => honker.open(...args);
+    try {
+      const db = open(dbPath, undefined, backend);
+      // Pre-warm so the file actually exists with a journal.
+      const tx = db.transaction();
+      tx.execute('CREATE TABLE _warm (i INTEGER)');
+      tx.commit();
+      await new Promise((r) => setTimeout(r, 100));
+
+      const ev = db.updateEvents();
+      // Atomic replace: same path, new inode.
+      const replacement = `${dbPath}.replacement`;
+      fs.writeFileSync(replacement, '');
+      fs.renameSync(replacement, dbPath);
+
+      // Identity check fires every 100ms; 3s is generous.
+      let raised = false;
+      const racePromise = Promise.race([
+        ev.next().then(() => null, (e) => e),
+        new Promise((r) => setTimeout(() => r('TIMEOUT'), 3000)),
+      ]);
+      const result = await racePromise;
+      if (result instanceof Error || (typeof result === 'object' && result !== null && result.message)) {
+        raised = true;
+      }
+      assert.ok(
+        raised,
+        `backend=${label}: expected updateEvents.next() to reject after ` +
+          `db file replacement, got ${result}`,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+}

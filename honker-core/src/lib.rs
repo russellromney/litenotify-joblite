@@ -648,8 +648,12 @@ fn is_transient_lock_error(e: &rusqlite::Error) -> bool {
 /// 3. **Identity check (about every 100 ms):** `stat(db_path)` to compare
 ///    `(dev, ino)`. If the file was replaced, panic with a clear
 ///    message — continuing would silently watch stale data.
-pub(crate) fn run_poll_loop<F>(db_path: PathBuf, on_change: F, stop: Arc<AtomicBool>)
-where
+pub(crate) fn run_poll_loop<F>(
+    db_path: PathBuf,
+    on_change: F,
+    stop: Arc<AtomicBool>,
+    ready: std::sync::mpsc::SyncSender<()>,
+) where
     F: Fn(),
 {
     let mut conn = match Connection::open_with_flags(
@@ -676,6 +680,9 @@ where
     // Wall-clock cadence: tick counting drifts on Windows where 1 ms
     // sleeps round up to ~15 ms.
     let mut next_identity_check = Instant::now() + UPDATE_WATCHER_IDENTITY_INTERVAL;
+    // Baseline captured; signal the spawner that it's safe to return.
+    let _ = ready.send(());
+    drop(ready);
 
     while !stop.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(1));
@@ -782,22 +789,36 @@ impl UpdateWatcher {
     {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_t = stop.clone();
+        // The thread signals `ready` once it has captured its baseline
+        // (initial inode for the dead-man's switch, initial iChange for
+        // shm, etc.). spawn_with_config blocks on `ready` so the caller
+        // can do anything that mutates the file (rename, write) right
+        // after spawn without racing the baseline capture. If the
+        // thread fails to init, the sender drops and recv() returns
+        // Err — we still return so the caller can use the (no-op)
+        // watcher; the eprintln from the backend explains the failure.
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let handle = std::thread::Builder::new()
             .name("honker-update-poll".into())
             .spawn(move || {
                 match config.backend {
-                    WatcherBackend::Polling => run_poll_loop(db_path, on_change, stop_t),
+                    WatcherBackend::Polling => run_poll_loop(db_path, on_change, stop_t, ready_tx),
                     #[cfg(feature = "kernel-watcher")]
                     WatcherBackend::KernelWatch => {
-                        kernel_watcher::run_kernel_watch_loop(db_path, on_change, stop_t);
+                        kernel_watcher::run_kernel_watch_loop(
+                            db_path, on_change, stop_t, ready_tx,
+                        );
                     }
                     #[cfg(feature = "shm-fast-path")]
                     WatcherBackend::ShmFastPath => {
-                        shm_watcher::run_shm_fast_path_loop(db_path, on_change, stop_t);
+                        shm_watcher::run_shm_fast_path_loop(
+                            db_path, on_change, stop_t, ready_tx,
+                        );
                     }
                 }
             })
             .expect("spawn update-poll thread");
+        let _ = ready_rx.recv();
         Self {
             stop,
             handle: Some(handle),
@@ -851,12 +872,10 @@ impl Drop for UpdateWatcher {
 /// consumer re-reads state from SQLite on each wake — so dropping
 /// during backpressure is safe. A disconnected subscriber (receiver
 /// dropped) gets pruned on the next wake via `TrySendError::Disconnected`.
-/// Captured by the watcher thread's closure. When the closure is
-/// dropped (clean exit OR panic), this guard's Drop fires and clears
-/// every subscriber's sender, forcing their next `recv()` to return
-/// `Err(RecvError)`. That's how subscribers learn the watcher died —
-/// without this, a panicking watcher would leave subscribers blocking
-/// forever and the panic would only show up as an eprintln in stderr.
+/// Lives in the watcher thread's closure. Closure drops on clean exit
+/// or panic; this Drop clears every subscriber's sender so their next
+/// `recv()` returns Err. Without it, a panicking watcher leaves
+/// subscribers blocking forever.
 struct WatcherDeathGuard {
     senders: Arc<Mutex<HashMap<u64, SyncSender<()>>>>,
 }
@@ -894,13 +913,10 @@ impl SharedUpdateWatcher {
         let senders: Arc<Mutex<HashMap<u64, SyncSender<()>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let senders_t = senders.clone();
-        // Captured by the watcher closure: when the watcher thread
-        // exits (clean stop OR panic from the dead-man's switch), the
-        // closure is dropped, this guard's Drop fires, and we clear
-        // every subscriber's sender. Subscribers' next `recv()` then
-        // returns `Err(RecvError)` instead of blocking forever — they
-        // get a programmatic signal that the watcher died, not just an
-        // eprintln in stderr they may never see.
+        // Watcher thread exits → closure drops → this guard drops →
+        // every subscriber's sender is cleared. Their next `recv()`
+        // returns Err instead of blocking forever. Subscribers learn
+        // the watcher died programmatically, not via stderr.
         let death_guard = WatcherDeathGuard { senders: senders.clone() };
         let watcher = UpdateWatcher::spawn_with_config(
             db_path,
@@ -1392,22 +1408,12 @@ mod tests {
         assert_eq!(idx, 0);
     }
 
-    /// Verifies the `UpdateWatcher` dead-man's-switch panics when the
-    /// underlying database file is replaced under it. Joins the
-    /// watcher thread and inspects the panic payload — no global
-    /// panic-hook trickery needed because `UpdateWatcher::join()`
-    /// returns the thread's `Result`.
-    ///
-    /// Unix-only. The test triggers replacement via `std::fs::rename`
-    /// over the open SQLite file, which is a normal operation on
-    /// Linux / macOS and the actual scenario the dead-man's switch
-    /// defends against — litestream restore, atomic backup swap, NFS
-    /// remount. On Windows the kernel rejects the rename with
-    /// `ERROR_ACCESS_DENIED` even though SQLite opens with
-    /// `FILE_SHARE_DELETE`, so the test can't trigger the scenario
-    /// it's verifying. Atomic open-file replacement isn't a typical
-    /// Windows pattern in practice; the Windows behavior of the
-    /// dead-man's switch is intentionally untested.
+    /// Watcher's dead-man's switch panics when the db file is
+    /// replaced under it. Unix-only: rename-over-open works on
+    /// Linux/macOS (the litestream / NFS-remount scenario) but
+    /// Windows rejects it even with FILE_SHARE_DELETE, so the
+    /// trigger is unreachable there. Windows behavior intentionally
+    /// untested — replacement isn't a typical Windows pattern.
     #[cfg(unix)]
     #[test]
     fn update_watcher_panics_on_file_replacement() {
@@ -1556,35 +1562,17 @@ mod tests {
     // we don't test it here — flagging in case it ever becomes a
     // user-visible question.
 
-    /// Crash-recovery / durability test. Spawns a child writer
-    /// process (python3, available on every CI runner) that hammers
-    /// the DB with committed inserts. Hard-kills the child mid-flight
-    /// (SIGKILL on unix, `TerminateProcess` via std on Windows),
-    /// reopens the DB in the parent, asserts:
-    ///
-    ///   1. `PRAGMA integrity_check` returns "ok" (no corruption
-    ///      from the crash-mid-WAL state).
-    ///   2. Some rows committed before the kill are still present.
-    ///   3. Re-opening the DB succeeds (WAL replay works after a
-    ///      hard kill).
-    ///
-    /// Cross-platform: `Child::kill` is portable, `python3` and
-    /// `sqlite3.connect` work the same on all three OSes. The
-    /// scenario being tested — process dies with WAL writes
-    /// outstanding — is universal, not unix-specific. Worth running
-    /// on Windows specifically because Windows file-locking
-    /// semantics differ; if `Child::kill` doesn't release the WAL
-    /// + SHM file handles cleanly, the parent's reopen will fail
-    /// and we'll know.
+    /// Crash-recovery: python3 child commits in a loop, parent
+    /// SIGKILLs it mid-flight, reopens, asserts integrity_check=ok,
+    /// committed rows survive, and reopen works (WAL replay).
+    /// Cross-platform — Windows tests that file-handle release on
+    /// kill is clean enough for reopen to succeed.
     #[test]
     fn writer_killed_mid_workload_leaves_db_consistent() {
         use std::process::{Command, Stdio};
 
-        // Locate a Python interpreter. setup-python in CI puts both
-        // `python` and `python3` on PATH on every OS; locally
-        // either may be present. Try in order. If neither resolves,
-        // skip with a clear message rather than leaving the test
-        // mysteriously red on a stripped-down dev box.
+        // Try `python3` then `python`. CI always has one; dev boxes
+        // may not. Skip loudly rather than fail silently.
         let python = ["python3", "python"]
             .iter()
             .find(|cmd| {
@@ -1748,36 +1736,17 @@ while True:
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
     }
 
-    /// Long-running soak. Spawns an `UpdateWatcher` plus a committer
-    /// thread, lets them run for `HONKER_SOAK_DURATION_SECS` (default
-    /// 3600 = 1 hour), then asserts:
-    ///
-    ///   * `PRAGMA integrity_check` returns "ok" — DB structurally
-    ///     intact after a long stress.
-    ///   * the queue table has exactly the writer's reported row
-    ///     count — catches "writer silently lost rows" regressions.
-    ///   * the watcher observed at least 10% of the expected wake
-    ///     rate — catches "watcher silently stopped" regressions.
-    ///
-    /// What this **doesn't** verify (yet): memory / FD / thread
-    /// leaks. Real leak detection would need to read
-    /// `/proc/self/status` (Linux) or equivalent to track VmRSS, FD
-    /// count, and thread count across the soak. Not currently
-    /// implemented; running this manually under `valgrind` /
-    /// `heaptrack` is the substitute. Tracked as a follow-up under
-    /// issue #12.
-    ///
-    /// `#[ignore]`-d so it doesn't run in normal `cargo test` and
-    /// doesn't run in CI at all. Invoke manually:
+    /// Long-running soak: watcher + committer for
+    /// `HONKER_SOAK_DURATION_SECS` (default 1h). Asserts
+    /// integrity_check=ok, exact row count, and ≥10% of expected
+    /// wake rate. Doesn't track leaks (run under valgrind/heaptrack
+    /// for that — issue #12). Ignored by default; CI never runs it.
     ///
     /// ```sh
     /// HONKER_SOAK_DURATION_SECS=600 \
     ///     cargo test -p honker-core --release --lib \
     ///         soak_watcher_durability -- --ignored --nocapture
     /// ```
-    ///
-    /// Set `HONKER_SOAK_DURATION_SECS=10` for a quick local
-    /// smoke-run before pushing soak-relevant changes.
     #[test]
     #[ignore]
     fn soak_watcher_durability() {
