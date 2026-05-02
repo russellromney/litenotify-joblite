@@ -1,0 +1,37 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Honker</RootNamespace>
+    <IsPackable>true</IsPackable>
+    <PackageId>Honker</PackageId>
+    <Authors>Russell Romney</Authors>
+    <Description>SQLite queue, notify/listen, streams, scheduler, and outbox bindings for .NET via the Honker loadable extension.</Description>
+    <PackageTags>sqlite;queue;pubsub;notify;listen;stream;outbox;scheduler</PackageTags>
+    <PackageProjectUrl>https://github.com/russellromney/honker</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/russellromney/honker</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" Link="README.md" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('$(MSBuildProjectDirectory)\package-assets')">
+    <None Include="$(MSBuildProjectDirectory)\package-assets\**\*"
+          Pack="true"
+          PackagePath="%(RecursiveDir)%(Filename)%(Extension)"
+          Visible="false" />
+  </ItemGroup>
+
+</Project>

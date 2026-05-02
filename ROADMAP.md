@@ -53,13 +53,14 @@ Replace Honker's internal named-lock lease implementation with
 - New regression test proves losing the Bouncer lease causes the
   scheduler leader loop to exit before firing again.
 
-## Phase Submodule — Binding CI And Interop
+## Phase Binding CI And Interop
 
 > After: current PR #13 cleanup · Before: 1.0 release prep
 
-The remaining test-regime gaps are cross-binding and cross-platform.
-Keep them split into reviewable slices instead of growing one giant CI
-change.
+The maintained bindings now live in-tree, so binding CI no longer needs
+submodule coordination. The remaining test-regime gaps are cross-binding
+and cross-platform. Keep them split into reviewable slices instead of
+growing one giant CI change.
 
 ### Smoke-build each binding
 
@@ -102,8 +103,8 @@ native packaging, cancellation semantics, and cross-platform behavior.
 
 ### Shape
 
-- Create a standalone `honker-dotnet` / `Honker` package repo and pin it
-  here as a submodule once the first parity slice is usable.
+- Keep `packages/honker-dotnet` in-tree with the other maintained
+  bindings, and publish the package from that directory.
 - Choose and lock the managed SQLite provider early, including its
   native-library loading story and supported runtime matrix.
 - Target modern .NET first, using `Microsoft.Data.Sqlite` as the default
