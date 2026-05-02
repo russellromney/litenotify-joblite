@@ -80,7 +80,7 @@ def _run_ruby(script, db_path):
     return proc.stdout
 
 
-def test_ruby_and_python_share_queue_and_notification_tables(tmp_path):
+def test_ruby_and_python_share_queue_stream_and_notification_tables(tmp_path):
     db_path = tmp_path / "ruby-python.db"
 
     _run_ruby(
@@ -91,28 +91,46 @@ def test_ruby_and_python_share_queue_and_notification_tables(tmp_path):
           ENV.fetch("DB_PATH"),
           extension_path: ENV.fetch("HONKER_EXTENSION_PATH"),
         )
-        db.queue("emails").enqueue({"to" => "ruby@example.com"})
-        db.notify("from-ruby", {"source" => "ruby"})
+        q = db.queue("ruby-to-python")
+        25.times do |i|
+          q.enqueue({"source" => "ruby", "seq" => i, "key" => "ruby-%02d" % i})
+        end
+        db.notify("from-ruby", {"source" => "ruby", "count" => 25})
+        db.stream("interop").publish({"source" => "ruby", "kind" => "stream"})
         db.close
         ''',
         db_path,
     )
 
     py_db = honker.open(str(db_path))
-    ruby_job = py_db.queue("emails").claim_one("python-worker")
-    assert ruby_job is not None
-    assert ruby_job.payload == {"to": "ruby@example.com"}
-    assert ruby_job.ack()
+    ruby_jobs = py_db.queue("ruby-to-python").claim_batch("python-worker", 50)
+    assert len(ruby_jobs) == 25
+    assert sorted(job.payload["seq"] for job in ruby_jobs) == list(range(25))
+    assert all(job.payload["source"] == "ruby" for job in ruby_jobs)
+    assert (
+        py_db.queue("ruby-to-python").ack_batch(
+            [job.id for job in ruby_jobs],
+            "python-worker",
+        )
+        == 25
+    )
 
     ruby_notification = py_db.query(
         "SELECT payload FROM _honker_notifications "
         "WHERE channel = 'from-ruby' ORDER BY id DESC LIMIT 1"
     )
-    assert json.loads(ruby_notification[0]["payload"]) == {"source": "ruby"}
+    assert json.loads(ruby_notification[0]["payload"]) == {
+        "source": "ruby",
+        "count": 25,
+    }
+    assert len(py_db.stream("interop")._read_since(0, 10)) == 1
 
-    py_db.queue("python-jobs").enqueue({"to": "python@example.com"})
+    py_q = py_db.queue("python-to-ruby")
+    for i in range(25):
+        py_q.enqueue({"source": "python", "seq": i, "key": f"py-{i:02d}"})
     with py_db.transaction() as tx:
-        tx.notify("from-python", {"source": "python"})
+        tx.notify("from-python", {"source": "python", "count": 25})
+    py_db.stream("interop").publish({"source": "python", "kind": "stream"})
 
     out = _run_ruby(
         r'''
@@ -123,23 +141,26 @@ def test_ruby_and_python_share_queue_and_notification_tables(tmp_path):
           ENV.fetch("DB_PATH"),
           extension_path: ENV.fetch("HONKER_EXTENSION_PATH"),
         )
-        job = db.queue("python-jobs").claim_one("ruby-worker")
+        jobs = db.queue("python-to-ruby").claim_batch("ruby-worker", 50)
         note = db.db.get_first_row(
           "SELECT payload FROM _honker_notifications " \
           "WHERE channel = 'from-python' ORDER BY id DESC LIMIT 1"
         )
+        events = db.stream("interop").read_since(0, 10)
         puts JSON.generate({
-          job_payload: job.payload,
-          acked: job.ack,
+          payloads: jobs.map(&:payload),
+          acked: db.queue("python-to-ruby").ack_batch(jobs.map(&:id), "ruby-worker"),
           notification: JSON.parse(note[0]),
+          event_count: events.length,
         })
         db.close
         ''',
         db_path,
     )
     observed = json.loads(out)
-    assert observed == {
-        "job_payload": {"to": "python@example.com"},
-        "acked": True,
-        "notification": {"source": "python"},
-    }
+    assert len(observed["payloads"]) == 25
+    assert sorted(row["seq"] for row in observed["payloads"]) == list(range(25))
+    assert all(row["source"] == "python" for row in observed["payloads"])
+    assert observed["acked"] == 25
+    assert observed["notification"] == {"source": "python", "count": 25}
+    assert observed["event_count"] == 2

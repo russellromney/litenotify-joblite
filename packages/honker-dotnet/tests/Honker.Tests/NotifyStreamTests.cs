@@ -13,9 +13,10 @@ public sealed class NotifyStreamTests
 
         var got = new List<string>();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        var listener = db.Listen("orders");
         var task = Task.Run(async () =>
         {
-            await foreach (var notification in db.Listen("orders").WithCancellation(cts.Token))
+            await foreach (var notification in listener.WithCancellation(cts.Token))
             {
                 got.Add(AsString(notification.Payload));
                 if (got.Count == 2)
@@ -25,7 +26,6 @@ public sealed class NotifyStreamTests
             }
         }, cts.Token);
 
-        await Task.Delay(50, cts.Token);
         db.Notify("unrelated", "skip");
         db.Notify("orders", "one");
         db.Notify("other", "skip");

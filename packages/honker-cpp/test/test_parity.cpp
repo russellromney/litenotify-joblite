@@ -5,11 +5,14 @@
 
 #include "honker.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <filesystem>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -29,6 +32,45 @@ static void cleanup(const std::string& path) {
     fs::remove(path);
     fs::remove(path + "-wal");
     fs::remove(path + "-shm");
+}
+
+static std::string shell_quote(const std::string& s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') out += "'\\''";
+        else out += c;
+    }
+    out += "'";
+    return out;
+}
+
+static std::string repo_root() {
+    auto p = fs::canonical(fs::path(__FILE__));
+    // .../packages/honker-cpp/test/test_parity.cpp -> repo root
+    return p.parent_path().parent_path().parent_path().parent_path().string();
+}
+
+static std::string scalar_text(sqlite3* db, const char* sql) {
+    sqlite3_stmt* stmt = nullptr;
+    std::string out;
+    assert(sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char* text = sqlite3_column_text(stmt, 0);
+        if (text) out = reinterpret_cast<const char*>(text);
+    }
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+static int64_t scalar_i64(sqlite3* db, const char* sql) {
+    sqlite3_stmt* stmt = nullptr;
+    int64_t out = 0;
+    assert(sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) == SQLITE_OK);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        out = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return out;
 }
 
 #define TEST(name) void test_##name(const char* ext)
@@ -474,6 +516,98 @@ TEST(stream_key_optional) {
     cleanup(db_path);
 }
 
+TEST(python_interop_queue_stream_notify) {
+#ifdef _WIN32
+    const char* require = std::getenv("HONKER_REQUIRE_INTEROP");
+    assert(!require || std::string{require} != "1");
+    return;
+#else
+    const char* py = std::getenv("HONKER_INTEROP_PYTHON");
+    const char* require = std::getenv("HONKER_REQUIRE_INTEROP");
+    if (!py || !*py) {
+        assert(!require || std::string{require} != "1");
+        return;
+    }
+
+    auto db_path = tmp_db();
+    honker::Database db{db_path, ext};
+    auto cpp_q = db.queue("cpp-to-python");
+    for (int i = 0; i < 25; ++i) {
+        cpp_q.enqueue(
+            std::string{"{\"source\":\"cpp\",\"seq\":"} + std::to_string(i) +
+            ",\"key\":\"cpp-" + (i < 10 ? "0" : "") + std::to_string(i) + "\"}");
+    }
+    db.notify("from-cpp", R"({"source":"cpp","count":25})");
+    db.stream("interop").publish(R"({"source":"cpp","kind":"stream"})");
+
+    auto script_path = fs::path(db_path).replace_extension(".py");
+    {
+        std::ofstream py_script{script_path};
+        py_script << R"PY(
+import json
+import os
+import honker
+
+db = honker.open(os.environ["DB_PATH"])
+
+jobs = db.queue("cpp-to-python").claim_batch("python-worker", 50)
+payloads = [job.payload for job in jobs]
+assert len(payloads) == 25, payloads
+assert all(p["source"] == "cpp" for p in payloads), payloads
+assert db.queue("cpp-to-python").ack_batch([job.id for job in jobs], "python-worker") == 25
+note = db.query(
+    "SELECT payload FROM _honker_notifications "
+    "WHERE channel='from-cpp' ORDER BY id DESC LIMIT 1"
+)
+assert json.loads(note[0]["payload"]) == {"source": "cpp", "count": 25}
+assert len(db.stream("interop")._read_since(0, 10)) == 1
+
+py_q = db.queue("python-to-cpp")
+for i in range(25):
+    py_q.enqueue({"source": "python", "seq": i, "key": f"py-{i:02d}"})
+with db.transaction() as tx:
+    tx.notify("from-python", {"source": "python", "count": len(jobs)})
+db.stream("interop").publish({"source": "python", "kind": "stream"})
+)PY";
+    }
+
+    const auto pp = repo_root() + "/packages/honker/python:" + repo_root() + "/packages";
+    std::ostringstream cmd;
+    cmd << "PYTHONPATH=" << shell_quote(pp)
+        << " DB_PATH=" << shell_quote(db_path)
+        << " " << shell_quote(py)
+        << " " << shell_quote(script_path.string());
+    const int rc = std::system(cmd.str().c_str());
+    assert(rc == 0);
+
+    auto py_q = db.queue("python-to-cpp");
+    auto py_jobs = py_q.claim_batch("cpp-worker", 50);
+    assert(py_jobs.size() == 25);
+    std::vector<int> seqs;
+    std::vector<int64_t> ids;
+    for (const auto& job : py_jobs) {
+        auto payload = nlohmann::json::parse(job.payload());
+        assert(payload["source"] == "python");
+        seqs.push_back(payload["seq"].get<int>());
+        ids.push_back(job.id());
+    }
+    std::sort(seqs.begin(), seqs.end());
+    for (int i = 0; i < 25; ++i) assert(seqs[static_cast<size_t>(i)] == i);
+    assert(py_q.ack_batch(ids, "cpp-worker") == 25);
+
+    auto note = nlohmann::json::parse(scalar_text(
+        db.raw(),
+        "SELECT payload FROM _honker_notifications WHERE channel='from-python' ORDER BY id DESC LIMIT 1"));
+    assert(note["source"] == "python");
+    assert(note["count"] == 25);
+    assert(db.stream("interop").read_since(0, 10).size() == 2);
+    assert(scalar_i64(db.raw(), "SELECT COUNT(*) FROM _honker_live WHERE queue IN ('cpp-to-python', 'python-to-cpp')") == 0);
+
+    fs::remove(script_path);
+    cleanup(db_path);
+#endif
+}
+
 TEST(lock_raii_release) {
     auto db_path = tmp_db();
     honker::Database db{db_path, ext};
@@ -539,9 +673,10 @@ int main() {
     RUN(enqueue_with_priority);
     RUN(multiple_queues_isolated);
     RUN(stream_key_optional);
+    RUN(python_interop_queue_stream_notify);
     RUN(lock_raii_release);
     RUN(result_ttl_expiry);
 
-    std::cout << "ALL OK (27 tests)\n";
+    std::cout << "ALL OK (28 tests)\n";
     return 0;
 }

@@ -21,7 +21,7 @@ func findInteropPython(t *testing.T) string {
 	t.Helper()
 	repo := repoRoot(t)
 	if p := os.Getenv("HONKER_INTEROP_PYTHON"); p != "" {
-		cmd := exec.Command(p, "-c", "import honker")
+		cmd := exec.Command(p, "-c", pythonProbeScript)
 		cmd.Env = interopPythonEnv(t, "")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("HONKER_INTEROP_PYTHON cannot import honker: %v\n%s", err, string(out))
@@ -35,7 +35,7 @@ func findInteropPython(t *testing.T) string {
 		"python",
 	}
 	for _, p := range candidates {
-		cmd := exec.Command(p, "-c", "import honker")
+		cmd := exec.Command(p, "-c", pythonProbeScript)
 		cmd.Env = interopPythonEnv(t, "")
 		if err := cmd.Run(); err == nil {
 			return p
@@ -47,6 +47,21 @@ func findInteropPython(t *testing.T) string {
 	)
 	return ""
 }
+
+const pythonProbeScript = `
+import os
+import tempfile
+import honker
+
+p = tempfile.mktemp(prefix="honker-probe-", suffix=".db")
+db = honker.open(p)
+db.query("SELECT 1")
+db = None
+try:
+    os.remove(p)
+except OSError:
+    pass
+`
 
 func interopPythonEnv(t *testing.T, dbPath string) []string {
 	t.Helper()

@@ -16,6 +16,7 @@ Kept as a test because the claim is load-bearing and the bench
 """
 
 import os
+import math
 import subprocess
 import sys
 import time
@@ -116,8 +117,14 @@ def test_cross_process_wake_latency_p99_under_bound(tmp_path):
     # and p90. With 30 samples, p90 tolerates up to 3 outliers, which
     # is enough to absorb scheduler noise while still catching
     # anything that shifts the distribution.
-    p50 = times_ms[int(len(times_ms) * 0.5)]
-    p90 = times_ms[int(len(times_ms) * 0.9)]
+    def percentile(samples, pct):
+        # Nearest-rank percentile, zero-indexed. For 30 samples,
+        # p90 is sample 27, which tolerates 3 slow scheduler outliers
+        # like the comment above says.
+        return samples[math.ceil(len(samples) * pct) - 1]
+
+    p50 = percentile(times_ms, 0.5)
+    p90 = percentile(times_ms, 0.9)
     median_bound = 25.0   # real p50 ~= 1-2 ms on M-series
     p90_bound = 100.0     # real p90 rarely exceeds 30 ms
 

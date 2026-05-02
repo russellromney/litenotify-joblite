@@ -270,6 +270,10 @@ jobs:
         working-directory: packages/honker-node
         shell: bash
         run: node --test test/basic.js
+      - name: Test (parity — node API surface)
+        working-directory: packages/honker-node
+        shell: bash
+        run: node --test test/parity.test.js
       - name: Test (direct proof — python writes, node updateEvents observes)
         working-directory: packages/honker-node
         shell: bash
@@ -282,6 +286,10 @@ jobs:
         working-directory: packages/honker-node
         shell: bash
         run: node --test test/cross_lang_supporting.js
+      - name: Test (direct proof — node and python share queues, streams, notify)
+        working-directory: packages/honker-node
+        shell: bash
+        run: node --test test/cross_lang_queue_stream_notify.js
 
   binding-smoke:
     name: binding smoke · ubuntu aggregate
@@ -297,6 +305,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: packages/honker-go/go.mod
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
       - uses: mlugg/setup-zig@v2
       - uses: oven-sh/setup-bun@v2
       - uses: ruby/setup-ruby@v1
@@ -325,19 +336,31 @@ jobs:
           cd packages/honker
           maturin develop --release
       - name: Rust wrapper
+        env:
+          HONKER_INTEROP_PYTHON: ${{ github.workspace }}/.venv/bin/python
         run: cargo test --manifest-path packages/honker-rs/Cargo.toml
       - name: Go
         working-directory: packages/honker-go
         env:
           HONKER_INTEROP_PYTHON: ${{ github.workspace }}/.venv/bin/python
         run: go test -tags sqlite_load_extension ./...
+      - name: .NET Python interop
+        env:
+          HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+          HONKER_INTEROP_PYTHON: ${{ github.workspace }}/.venv/bin/python
+          HONKER_REQUIRE_INTEROP: "1"
+        run: dotnet test packages/honker-dotnet/tests/Honker.Tests/Honker.Tests.csproj --filter FullyQualifiedName~PythonInteropTests --verbosity normal
       - name: C++
         working-directory: packages/honker-cpp
+        env:
+          HONKER_INTEROP_PYTHON: ${{ github.workspace }}/.venv/bin/python
+          HONKER_REQUIRE_INTEROP: "1"
         run: zig build test -Dhonker-ext="${GITHUB_WORKSPACE}/target/release/libhonker_ext.so"
       - name: Bun
         working-directory: packages/honker-bun
         env:
           HONKER_EXT_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+          HONKER_INTEROP_PYTHON: ${{ github.workspace }}/.venv/bin/python
         run: |
           bun install --frozen-lockfile
           bun test
@@ -350,6 +373,9 @@ jobs:
           bundle exec ruby -Ilib spec/parity_spec.rb
       - name: Elixir
         working-directory: packages/honker-ex
+        env:
+          HONKER_EXTENSION_PATH: ${{ github.workspace }}/target/release/libhonker_ext.so
+          HONKER_INTEROP_PYTHON: ${{ github.workspace }}/.venv/bin/python
         run: |
           mix deps.get
           mix test
