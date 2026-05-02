@@ -315,6 +315,11 @@ async def test_cross_process_listener_survives_writer_restart(db_path, backend):
 # ----------------------------------------------------------------------
 
 
+# Windows kernel rejects rename-over-open even with FILE_SHARE_DELETE,
+# so the dead-man's switch's atomic-rename trigger is unreachable on
+# Windows. Same constraint as the Rust update_watcher_panics_on_file_
+# replacement test (#[cfg(unix)]).
+@pytest.mark.skipif(sys.platform == "win32", reason="rename-over-open denied on Windows")
 @pytest.mark.parametrize("backend", BACKENDS)
 async def test_listener_raises_when_watcher_dies(db_path, backend, tmp_path):
     db = honker.open(db_path, watcher_backend=backend)

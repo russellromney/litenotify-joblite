@@ -2465,11 +2465,12 @@ while True:
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
 
-        // The kernel watcher's documented contract allows missed wakes
-        // (kqueue/inotify can coalesce or drop events under load). What
-        // we DO assert: at least some commits got wakes, and those
-        // wakes were sub-100 ms (proving event-driven delivery, not
-        // some stuck-thread fallback).
+        // Contract allows missed wakes (kqueue/inotify/ReadDir can
+        // coalesce). Assert: some wakes arrived AND p50 is well below
+        // the 5 s `idle_poll_s` fallback — proves we're event-driven,
+        // not riding the paranoia poll. Windows ReadDirectoryChangesW
+        // under CI load can stretch past 100 ms; 500 ms threshold
+        // still rules out the fallback.
         let arrived: Vec<f64> = lats.iter().copied().filter(|l| l.is_finite()).collect();
         assert!(
             !arrived.is_empty(),
@@ -2478,11 +2479,11 @@ while True:
         );
         let p50 = percentile(arrived.clone(), 0.50);
         assert!(
-            p50 < 100.0,
-            "kernel watcher p50 wake latency (over arrived wakes only) = \
-             {p50:.1} ms, expected < 100 (high median latency means events \
-             arrive but slowly — possibly a stuck-thread fallback). \
-             Arrived: {arrived:?}, all samples (inf = no wake): {lats:?}"
+            p50 < 500.0,
+            "kernel watcher p50 wake latency = {p50:.1} ms, expected < 500 \
+             (high median latency means events arrive but slowly — possibly \
+             a stuck-thread fallback). Arrived: {arrived:?}, all samples \
+             (inf = no wake): {lats:?}"
         );
     }
 

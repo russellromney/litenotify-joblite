@@ -359,7 +359,12 @@ for (const backend of [null, 'kernel', 'shm']) {
 for (const backend of [null, 'kernel', 'shm']) {
   const label = backend === null ? 'polling' : backend;
 
-  test(`watcherBackend=${label} updateEvents().next() rejects when watcher dies`, async () => {
+  test(`watcherBackend=${label} updateEvents().next() rejects when watcher dies`, {
+    // Windows kernel rejects rename-over-open even with FILE_SHARE_DELETE,
+    // so the dead-man's switch trigger is unreachable. Skip on Windows
+    // (matches the Rust + Python tests of the same scenario).
+    skip: process.platform === 'win32' ? 'rename-over-open denied on Windows' : false,
+  }, async () => {
     const fs = require('node:fs');
     const { dbPath, cleanup } = await createTempDb();
     const open = (...args) => honker.open(...args);
