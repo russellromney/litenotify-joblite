@@ -1,0 +1,80 @@
+name: Proof · scary nightly
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekday morning UTC. Not PR-default; this is bigger proof.
+    - cron: "23 7 * * 1-5"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  scary-python-core:
+    name: scary core · ubuntu
+    timeout-minutes: 35
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Build Python binding
+        shell: bash
+        run: |
+          uv venv --python "3.14" .venv
+          . .venv/bin/activate
+          uv pip install pytest pytest-asyncio pytest-xdist maturin
+          cargo build --release -p honker-extension
+          cd packages/honker
+          maturin develop --release
+      - name: Cross-process and crash proofs
+        shell: bash
+        run: |
+          . .venv/bin/activate
+          python -m pytest -q -n 0 --tb=short \
+            tests/test_crash_recovery.py \
+            tests/test_cross_process_wake_latency.py \
+            tests/test_multiprocess.py \
+            tests/test_resource_bounds.py \
+            tests/test_real_app_example.py
+      - name: Slow soak proofs
+        shell: bash
+        run: |
+          . .venv/bin/activate
+          python -m pytest -q -n 0 -o addopts="" -m slow tests/test_soak.py --tb=short
+      - name: Linux fault-injection proofs
+        shell: bash
+        run: |
+          . .venv/bin/activate
+          python -m pytest -q -n 0 -o addopts="" -m linux_only tests/test_fault_injection.py --tb=short
+
+  packaged-installs:
+    name: packaged installs · ubuntu
+    timeout-minutes: 25
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+      - name: Run packaged install proof
+        run: scripts/proof/package-install-smoke.sh
