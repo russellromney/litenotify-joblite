@@ -241,7 +241,10 @@ jobs:
 
   node:
     name: node · honker-node
-    timeout-minutes: 5
+    # 8 min instead of 5: Windows runners spend 4+ min on the build /
+    # Test (basic — node only) step and the additional cache-cleanup
+    # at the end was tipping over the 5 min limit.
+    timeout-minutes: 8
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
