@@ -2163,11 +2163,24 @@ while True:
         // ensure the directory has at least one prior journal life-cycle
         // so the kernel watcher's directory watch is attached cleanly.
         setup.execute("INSERT INTO t VALUES (0)", []).unwrap();
-        // Hold the connection open across `drive_and_count_wakes` so
-        // SQLite doesn't clean up -wal/-shm on last-connection-close
-        // (Linux/inotify clears them; macOS often doesn't). The shm
-        // fast path needs -shm present at watcher startup.
-        let _pinning = setup;
+        // Whether to keep the setup connection open across
+        // drive_and_count_wakes:
+        //   - shm + WAL: yes — the shm backend needs -shm to exist at
+        //     startup, and Linux/Windows clean it up on
+        //     last-connection-close (macOS often doesn't).
+        //   - everything else: no — Windows hits "disk I/O error"
+        //     when two connections share a non-WAL db.
+        #[cfg(feature = "shm-fast-path")]
+        let keep_setup_open =
+            matches!(backend, WatcherBackend::ShmFastPath) && mode.eq_ignore_ascii_case("WAL");
+        #[cfg(not(feature = "shm-fast-path"))]
+        let keep_setup_open = false;
+        let _pinning = if keep_setup_open {
+            Some(setup)
+        } else {
+            drop(setup);
+            None
+        };
 
         let n: u32 = 5;
         let observed = drive_and_count_wakes(backend.clone(), tmp.clone(), n, 30);
