@@ -352,6 +352,8 @@ jobs:
         run: cargo test --manifest-path packages/honker-rs/Cargo.toml
       - name: Go
         working-directory: packages/honker-go
+        env:
+          HONKER_INTEROP_PYTHON: ${{ github.workspace }}/.venv/bin/python
         run: go test -tags sqlite_load_extension ./...
       - name: C++
         working-directory: packages/honker-cpp

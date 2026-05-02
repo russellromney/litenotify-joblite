@@ -12,7 +12,7 @@ ordering matters.
 
 ## Phase Ranger — Delegate Locks To Bouncer
 
-> After: pre-1.0 cleanup · Before: 1.0 release prep
+> Later architecture work
 
 Replace Honker's internal named-lock lease implementation with
 `bouncer-core` while preserving Honker's public lock APIs.
@@ -53,116 +53,42 @@ Replace Honker's internal named-lock lease implementation with
 - New regression test proves losing the Bouncer lease causes the
   scheduler leader loop to exit before firing again.
 
-## Phase Binding CI And Interop
+## Phase Test Depth And Interop
 
-> After: current PR #13 cleanup · Before: 1.0 release prep
+> Near-term hardening
 
-The maintained bindings now live in-tree, so binding CI no longer needs
-submodule coordination. The remaining test-regime gaps are cross-binding
-and cross-platform. Keep them split into reviewable slices instead of
-growing one giant CI change.
+The maintained bindings now live in-tree, and root CI owns the default
+checks. The remaining test-regime gaps are about depth, not basic
+"does this binding build?" coverage.
 
-### Smoke-build each binding
-
-- `packages/honker-bun`
-- `packages/honker-cpp`
-- `packages/honker-ex`
-- `packages/honker-go`
-- `packages/honker-rs`
-- `packages/honker-ruby`
-
-Start with build-only jobs on Linux. Add full test jobs only where the
-per-binding setup is cheap and deterministic.
+Keep this split into reviewable slices instead of growing one giant CI
+change.
 
 ### Cross-binding interop
 
-Add at least one more pair beyond Python <-> Node. Ruby <-> Python is
-the likely next pair because both have compact setup and direct access
-to the same `.db` file.
+- Add at least one more pair beyond Python <-> Node and Ruby <->
+  Python. Go <-> Python is the likely next pair because both can share
+  a plain `.db` file through the extension.
+- Add a tiny matrix that proves a job enqueued in one binding can be
+  claimed and acked in another.
+- Keep slow or expensive combinations out of default CI unless they
+  catch real bugs.
 
-### Windows follow-ups
+### Stress and soak
 
-Tracked by issue #11:
+- Add higher-pressure multi-writer / multi-reader tests.
+- Add many-subscriber listener churn coverage beyond the focused
+  regression tests.
+- Add a manual or scheduled soak workflow that watches FD, thread, and
+  memory growth over time.
 
-- Re-enable Windows for `rust-extension` after the loadable-extension
-  FFI panic is understood.
-- Re-enable Windows for Python after the watcher/database close path
-  stops tempdir cleanup from hitting locked files.
-- Re-enable Windows for Node after the same close-path fix and after
-  `cross_lang.js` stops hard-coding Unix venv paths.
+### Compatibility surface
 
-## Phase Ballmer — .NET C# Binding
-
-> After: Phase Submodule · Before: Phase Wake Parity
-
-Track issue #28 by adding an idiomatic .NET binding as a thin wrapper
-around the SQLite loadable extension. The intent is to let LLM-assisted
-porting do most of the mechanical work from the existing Go, Ruby,
-Node, and Rust binding patterns, while keeping human review focused on
-native packaging, cancellation semantics, and cross-platform behavior.
-
-### Shape
-
-- Keep `packages/honker-dotnet` in-tree with the other maintained
-  bindings, and publish the package from that directory.
-- Choose and lock the managed SQLite provider early, including its
-  native-library loading story and supported runtime matrix.
-- Target modern .NET first, using `Microsoft.Data.Sqlite` as the default
-  managed SQLite layer.
-- Load `honker-extension` on each opened connection and call
-  `honker_bootstrap()` during `Honker.Database.Open(...)`.
-- Package native `honker-extension` binaries under NuGet
-  `runtimes/<rid>/native/` paths, with explicit resolver tests for
-  Linux, macOS, and Windows, including a deliberate Windows SQLite
-  compatibility story.
-- Prefer typed wrappers over a Rust/C ABI: `Database`, `Transaction`,
-  `Queue`, `Job`, `Stream`, `Scheduler`, `Lock`, and result helpers all
-  call `SELECT honker_*(...)`.
-
-### First parity slice
-
-- Queue enqueue / claim / ack / retry / fail / heartbeat.
-- `IAsyncEnumerable<Job>` claim loop with `CancellationToken`.
-- Deadline-aware worker sleep using `honker_queue_next_claim_at(queue)`.
-- Deterministic cleanup for cancelled claim loops and watcher-backed
-  waits so abandoned subscriptions do not leak.
-- Scheduler add / remove / tick / soonest / run.
-- Canonical `schedule` naming with `cron` kept as a compatibility alias.
-- `@every <n><unit>`, 6-field cron, and delayed `run_at` tests matching
-  the shipped parity bar from PR #29.
-
-### Follow-up parity
-
-- Durable streams with per-consumer offsets.
-- Ephemeral listen / notify once a clean update-event bridge or
-  pluggable watcher backend story exists.
-- Rate limits, locks, task results, and batch helpers.
-- EF Core recipe showing how to load the extension on an application
-  connection and enqueue inside an existing transaction.
-
-### Non-goals
-
-- Do not reimplement Honker queue or scheduler logic in C#.
-- Do not make .NET the source of truth for schema or SQL behavior.
-- Do not block the first package on full EF Core integration, AOT,
-  Unity, Xamarin, or mobile support.
-- Do not promise every binding surface in the first release; mark any
-  missing wrappers clearly and keep raw SQL access available.
-
-### Verification
-
-- .NET unit tests cover the same six must-pass queue cases as the other
-  bindings.
-- Cross-process delayed `run_at` and reclaim-deadline tests prove the
-  async worker does not wait for a fallback poll.
-- Cancellation and disposal tests prove abandoned claim loops or other
-  watcher-backed waits release subscriptions cleanly.
-- Scheduler tests prove `@every 1s`, 6-field cron, `schedule`, and
-  legacy `cron` alias behavior.
-- Cross-language interop test proves Python writes can be claimed by C#
-  and C# writes can be claimed by Python.
-- CI builds and tests on Linux, macOS, and Windows for the supported RIDs
-  included in the NuGet package.
+- Add a SQLite version matrix where it matters. Default CI mostly proves
+  the versions on GitHub runners.
+- Add coverage reporting if it starts guiding useful decisions.
+- Add follow-up watcher timing tests if Windows still shows
+  platform-specific drift.
 
 ## Completed — Time-trigger scheduler and wake parity
 
@@ -200,6 +126,7 @@ Shipped in PR #29, with follow-up release prep in PR #33.
   watcher to sleep efficiently.
 - Do not block 1.0 on bindings that are explicitly marked poll-based or
   partial, as long as the docs and tests say so.
+
 
 ## Phase Echo — Experimental Watcher Backends Across All Bindings
 
@@ -516,18 +443,23 @@ This phase decides when to flip the default and ship them in wheels.
 - Release notes call out the experimental status, link the contract,
   link the roadmap.
 
-## Phase Cadence — Time-Based Watcher Ticks
+## Release Automation
 
-> After: Phase Wake Parity · Before: 1.0 release prep
 
-The update watcher currently performs the file-identity dead-man check
-every N poll-loop iterations. On Windows, 1 ms sleeps round up toward
-the system timer granularity, so tick-count timing drifts.
+This is not 1.0 prep. The goal is simpler: make normal releases boring.
 
-Switch identity checks to `Instant`-based timing so the check cadence
-is time-based on every platform.
+- One tag should drive extension artifacts and package publishes.
+- Build and attach loadable extension binaries for supported platforms.
+- Publish Python wheels with maturin for the supported Python/platform
+  matrix.
+- Publish npm/Bun packages with native artifacts where needed.
+- Publish crates for `honker-core`, `honker-extension`, and
+  `honker-rs`.
+- Publish NuGet, Ruby, and other maintained binding packages from the
+  in-tree `packages/` directories.
+- Keep release notes tied to `CHANGELOG.md`.
 
-## 1.0 Release Prep
+## Later 1.0 Prep
 
 - Maturin wheels: Python 3.11 / 3.12 / 3.13 across Linux, macOS, and
   Windows where supported.

@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------
 // Watcher backend configuration
@@ -626,7 +626,7 @@ pub(crate) fn poll_data_version(conn: &Connection) -> Result<u32, String> {
 ///    integer to last seen value. Notify on change. (~3.5 µs/call.)
 /// 2. **Error recovery (every 1 ms on failure):** If the query fails,
 ///    reconnect the SQLite connection and force one wake.
-/// 3. **Identity check (every 100 ms):** `stat(db_path)` to compare
+/// 3. **Identity check (about every 100 ms):** `stat(db_path)` to compare
 ///    `(dev, ino)`. If the file was replaced, panic with a clear
 ///    message — continuing would silently watch stale data.
 pub(crate) fn run_poll_loop<F>(db_path: PathBuf, on_change: F, stop: Arc<AtomicBool>)
@@ -654,7 +654,11 @@ where
             (0, 0)
         }
     };
-    let mut tick: u64 = 0;
+    // Time-tracked identity check (instead of tick counting). Windows'
+    // 1 ms sleep can round up to ~15 ms, so 100 ticks could mean
+    // 1.5 s instead of 100 ms. Instant-based timing is platform-
+    // consistent. Constant defined alongside UpdateWatcher above.
+    let mut next_identity_check = Instant::now() + UPDATE_WATCHER_IDENTITY_INTERVAL;
 
     while !stop.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(1));
@@ -702,8 +706,9 @@ where
         // way; the dead-man's switch is effectively a
         // no-op on Windows. Identity check still runs,
         // it just rarely sees a difference.
-        tick += 1;
-        if tick % 100 == 0 {
+        let now = Instant::now();
+        if now >= next_identity_check {
+            next_identity_check = now + UPDATE_WATCHER_IDENTITY_INTERVAL;
             match stat_identity(&db_path) {
                 Ok(current) => {
                     if current != initial_identity {
@@ -738,6 +743,8 @@ pub struct UpdateWatcher {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
+
+const UPDATE_WATCHER_IDENTITY_INTERVAL: Duration = Duration::from_millis(100);
 
 impl UpdateWatcher {
     /// Spawn a watcher thread on `db_path` using the default polling
@@ -1401,12 +1408,9 @@ mod tests {
 
         let watcher = UpdateWatcher::spawn(tmp.clone(), || {});
 
-        // The watcher's identity check fires every 100 ticks and each
-        // tick is `sleep(1ms)` — but Windows' default timer
-        // granularity rounds 1 ms sleeps up to ~15 ms, so 100 ticks
-        // there is ~1.5 s rather than ~100 ms. Wait 2 s on each side
-        // so the test is reliable across platforms.
-        std::thread::sleep(Duration::from_millis(2000));
+        // Give the watcher thread time to open and capture the initial
+        // file identity before we replace the file.
+        std::thread::sleep(Duration::from_millis(200));
 
         // Replace the file. Atomic-rename instead of delete+create so
         // it works even when SQLite has the destination open
@@ -1421,8 +1425,9 @@ mod tests {
         }
         std::fs::rename(&tmp2, &tmp).unwrap();
 
-        // Wait for the next identity-check tick to fire and panic.
-        std::thread::sleep(Duration::from_millis(2000));
+        // Wait for the next time-based identity check to fire and
+        // panic.
+        std::thread::sleep(Duration::from_millis(500));
 
         // Stop and join. Should be Err because the thread panicked.
         let result = watcher.join();
