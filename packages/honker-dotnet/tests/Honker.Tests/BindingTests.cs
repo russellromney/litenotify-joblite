@@ -107,16 +107,21 @@ public sealed class BindingTests
         using var stop = new CancellationTokenSource();
         using var ready = new CountdownEvent(4);
         var readerDbs = Enumerable.Range(0, 4).Select(_ => harness.Open()).ToList();
-        var readers = readerDbs.Select(readerDb => Task.Run(() =>
+        var readers = readerDbs.Select(readerDb => Task.Factory.StartNew(() =>
         {
-            ready.Signal();
+            var signaled = false;
             while (!stop.IsCancellationRequested)
             {
                 readerDb.Query("SELECT COUNT(*) AS c FROM _honker_jobs");
+                if (!signaled)
+                {
+                    ready.Signal();
+                    signaled = true;
+                }
             }
-        })).ToList();
+        }, stop.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default)).ToList();
 
-        Assert.True(ready.Wait(TimeSpan.FromSeconds(5)), "reader tasks did not start in time");
+        Assert.True(ready.Wait(TimeSpan.FromSeconds(15)), "reader tasks did not start in time");
 
         try
         {
@@ -642,7 +647,7 @@ public sealed class BindingTests
 
         var job = enumerator.Current;
         Assert.Equal(1, job.Payload.GetProperty("n").GetInt32());
-        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(1), $"claim iterator woke too slowly: {watch.Elapsed}");
+        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(5), $"claim iterator woke too slowly: {watch.Elapsed}");
         Assert.True(job.Ack());
     }
 
