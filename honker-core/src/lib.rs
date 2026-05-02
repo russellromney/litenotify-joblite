@@ -807,9 +807,232 @@ impl Drop for SharedUpdateWatcher {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
 
     fn mem() -> Connection {
         Connection::open_in_memory().unwrap()
+    }
+
+    fn temp_db(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "honker-{name}-{}-{:?}.db",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(format!("{}-wal", p.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", p.display()));
+        p
+    }
+
+    fn open_core_test_conn(path: &Path) -> Connection {
+        let conn = open_conn(path.to_str().unwrap(), true).unwrap();
+        attach_honker_functions(&conn).unwrap();
+        conn.query_row("SELECT honker_bootstrap()", [], |_| Ok(()))
+            .unwrap();
+        conn
+    }
+
+    #[test]
+    fn core_sql_functions_survive_concurrent_queue_stream_notify_pressure() {
+        let path = temp_db("core-pressure");
+        let producer_count = 4usize;
+        let jobs_per_producer = 75usize;
+        let worker_count = 6usize;
+        let total_jobs = producer_count * jobs_per_producer;
+
+        {
+            let conn = open_core_test_conn(&path);
+            let mode: String = conn
+                .pragma_query_value(None, "journal_mode", |r| r.get(0))
+                .unwrap();
+            assert_eq!(mode.to_ascii_uppercase(), "WAL");
+        }
+
+        let start = Arc::new(Barrier::new(producer_count + worker_count));
+        let producers_done = Arc::new(AtomicUsize::new(0));
+        let processed = Arc::new(Mutex::new(Vec::<(i64, String)>::new()));
+        let mut handles = Vec::new();
+
+        for producer in 0..producer_count {
+            let path = path.clone();
+            let start = start.clone();
+            let producers_done = producers_done.clone();
+            handles.push(std::thread::spawn(move || {
+                let conn = open_core_test_conn(&path);
+                start.wait();
+                for seq in 0..jobs_per_producer {
+                    let key = format!("p{producer}-{seq:03}");
+                    let payload = format!(r#"{{"producer":{producer},"seq":{seq},"key":"{key}"}}"#);
+                    conn.query_row(
+                        "SELECT honker_enqueue('pressure', ?1, NULL, NULL, ?2, 3, NULL)",
+                        rusqlite::params![payload, (seq % 7) as i64],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap();
+                    conn.query_row(
+                        "SELECT honker_stream_publish('pressure-events', ?1, ?2)",
+                        rusqlite::params![key, payload],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap();
+                    conn.query_row(
+                        "SELECT notify('pressure-note', ?1)",
+                        rusqlite::params![format!(r#"{{"key":"{key}"}}"#)],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap();
+                    if seq % 11 == 0 {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                producers_done.fetch_add(1, Ordering::Release);
+            }));
+        }
+
+        for worker in 0..worker_count {
+            let path = path.clone();
+            let start = start.clone();
+            let producers_done = producers_done.clone();
+            let processed = processed.clone();
+            handles.push(std::thread::spawn(move || {
+                let conn = open_core_test_conn(&path);
+                start.wait();
+                let worker_id = format!("core-worker-{worker}");
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let mut idle_since: Option<Instant> = None;
+                loop {
+                    assert!(Instant::now() < deadline, "{worker_id} timed out");
+                    let rows_json: String = conn
+                        .query_row(
+                            "SELECT honker_claim_batch('pressure', ?1, 7, 30)",
+                            rusqlite::params![worker_id],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT
+                               json_extract(value, '$.id'),
+                               json_extract(json_extract(value, '$.payload'), '$.key')
+                             FROM json_each(?1)",
+                        )
+                        .unwrap();
+                    let claimed = stmt
+                        .query_map(rusqlite::params![rows_json], |r| {
+                            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                        })
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap();
+
+                    if claimed.is_empty() {
+                        if producers_done.load(Ordering::Acquire) == producer_count {
+                            match idle_since {
+                                Some(t) if t.elapsed() >= Duration::from_millis(500) => break,
+                                Some(_) => {}
+                                None => idle_since = Some(Instant::now()),
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+
+                    idle_since = None;
+                    let ids_json = format!(
+                        "[{}]",
+                        claimed
+                            .iter()
+                            .map(|(id, _)| id.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                    let acked: i64 = conn
+                        .query_row(
+                            "SELECT honker_ack_batch(?1, ?2)",
+                            rusqlite::params![ids_json, worker_id],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(acked as usize, claimed.len());
+                    processed.lock().extend(claimed);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }));
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let processed = processed.lock();
+        assert_eq!(processed.len(), total_jobs);
+        let unique_ids: HashSet<i64> = processed.iter().map(|(id, _)| *id).collect();
+        assert_eq!(unique_ids.len(), total_jobs, "job id claimed twice");
+        let unique_keys: HashSet<String> = processed.iter().map(|(_, k)| k.clone()).collect();
+        assert_eq!(unique_keys.len(), total_jobs, "logical key claimed twice");
+        for producer in 0..producer_count {
+            for seq in 0..jobs_per_producer {
+                assert!(
+                    unique_keys.contains(&format!("p{producer}-{seq:03}")),
+                    "missing key p{producer}-{seq:03}"
+                );
+            }
+        }
+        drop(processed);
+
+        let conn = open_core_test_conn(&path);
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _honker_live WHERE queue='pressure'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let dead: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _honker_dead WHERE queue='pressure'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let stream_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _honker_stream WHERE topic='pressure-events'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let notes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _honker_notifications WHERE channel='pressure-note'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let enqueue_wakes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _honker_notifications WHERE channel='honker:pressure'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(live, 0);
+        assert_eq!(dead, 0);
+        assert_eq!(stream_rows as usize, total_jobs);
+        assert_eq!(notes as usize, total_jobs);
+        assert_eq!(enqueue_wakes as usize, total_jobs);
+        assert_eq!(integrity, "ok");
+
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
     #[test]
@@ -882,10 +1105,7 @@ mod tests {
 
     #[test]
     fn readers_close_returns_closed_err() {
-        let tmp = std::env::temp_dir().join(format!(
-            "honker-readers-close-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("honker-readers-close-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         // Create the file so open_conn succeeds.
         Connection::open(&tmp)

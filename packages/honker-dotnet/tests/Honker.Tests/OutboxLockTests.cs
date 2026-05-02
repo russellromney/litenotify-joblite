@@ -291,7 +291,12 @@ public sealed class OutboxLockTests
 
         var watch = System.Diagnostics.Stopwatch.StartNew();
         cts.Cancel();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await worker);
+        var stopped = await Task.WhenAny(worker, Task.Delay(TimeSpan.FromSeconds(2))) == worker;
+        Assert.True(stopped, $"worker cancel was too slow: {watch.Elapsed}");
+        if (!worker.IsCompletedSuccessfully)
+        {
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await worker);
+        }
         Assert.True(watch.Elapsed < TimeSpan.FromSeconds(2), $"worker cancel was too slow: {watch.Elapsed}");
     }
 

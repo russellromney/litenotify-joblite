@@ -204,7 +204,10 @@ fn next_or_first(set: &BTreeSet<u32>, current: u32) -> (u32, bool) {
     }
 }
 
-fn cron_next_after_naive(sched: &CronSchedule, from: NaiveDateTime) -> Result<NaiveDateTime, String> {
+fn cron_next_after_naive(
+    sched: &CronSchedule,
+    from: NaiveDateTime,
+) -> Result<NaiveDateTime, String> {
     let mut cand = from + Duration::seconds(1);
     let cap_year = cand.year() + 100;
 
@@ -212,7 +215,11 @@ fn cron_next_after_naive(sched: &CronSchedule, from: NaiveDateTime) -> Result<Na
         let month = cand.month();
         if !sched.months.contains(&month) {
             let (next_month, wrapped) = next_or_first(&sched.months, month);
-            let year = if wrapped { cand.year() + 1 } else { cand.year() };
+            let year = if wrapped {
+                cand.year() + 1
+            } else {
+                cand.year()
+            };
             cand = make_dt(year, next_month, 1, 0, 0, 0);
             continue;
         }
@@ -249,7 +256,14 @@ fn cron_next_after_naive(sched: &CronSchedule, from: NaiveDateTime) -> Result<Na
                     0,
                 );
             } else {
-                cand = make_dt(cand.year(), cand.month(), cand.day(), cand.hour(), next_minute, 0);
+                cand = make_dt(
+                    cand.year(),
+                    cand.month(),
+                    cand.day(),
+                    cand.hour(),
+                    next_minute,
+                    0,
+                );
             }
             continue;
         }
@@ -258,8 +272,14 @@ fn cron_next_after_naive(sched: &CronSchedule, from: NaiveDateTime) -> Result<Na
         if !sched.seconds.contains(&second) {
             let (next_second, wrapped) = next_or_first(&sched.seconds, second);
             if wrapped {
-                cand = make_dt(cand.year(), cand.month(), cand.day(), cand.hour(), cand.minute(), 0)
-                    + Duration::minutes(1);
+                cand = make_dt(
+                    cand.year(),
+                    cand.month(),
+                    cand.day(),
+                    cand.hour(),
+                    cand.minute(),
+                    0,
+                ) + Duration::minutes(1);
                 cand = make_dt(
                     cand.year(),
                     cand.month(),
