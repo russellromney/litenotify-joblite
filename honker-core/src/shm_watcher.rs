@@ -36,7 +36,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const WALINDEX_MAX_VERSION: u32 = 3_007_000;
 const ICHANGE_OFFSET: usize = 8;
@@ -46,8 +46,10 @@ const ICHANGE_OFFSET: usize = 8;
 /// for latency nobody can perceive.
 const POLL_INTERVAL_MS: u64 = 1;
 /// Cadence for the dead-man's switch (db / -shm replacement detection).
-/// Same as the polling backend.
-const IDENTITY_CHECK_TICKS: u64 = 100;
+/// Same wall-clock interval as the polling and kernel backends. Tracked
+/// via Instant — tick counting drifts on Windows where 1 ms sleeps round
+/// up to ~15 ms.
+const IDENTITY_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 pub(crate) fn run_shm_fast_path_loop<F>(db_path: PathBuf, on_change: F, stop: Arc<AtomicBool>)
 where
@@ -105,7 +107,7 @@ where
             (0, 0)
         }
     };
-    let mut tick: u64 = 0;
+    let mut next_identity_check = Instant::now() + IDENTITY_CHECK_INTERVAL;
 
     while !stop.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
@@ -114,8 +116,9 @@ where
             last = current;
             on_change();
         }
-        tick += 1;
-        if tick % IDENTITY_CHECK_TICKS == 0 {
+        let now = Instant::now();
+        if now >= next_identity_check {
+            next_identity_check = now + IDENTITY_CHECK_INTERVAL;
             // Either stat error or successful inode-unchanged result
             // returns false; only an actual replacement panics. If
             // either stat errored, fire a conservative on_change so

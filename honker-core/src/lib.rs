@@ -2680,11 +2680,12 @@ while True:
         // Windows' inability to rename over a SQLite-held file.
         std::fs::File::create(&tmp).unwrap();
 
-        // For the SHM backend, also write a fake -shm with a valid
-        // 12-byte WAL index header so the mmap probe succeeds.
+        // For the SHM backend, also write a fake -shm. macOS mmap can
+        // be finicky about tiny files; write at least a page (4 KiB)
+        // with the valid WAL index header up front.
         if matches!(backend, WatcherBackend::ShmFastPath) {
             let shm_path = std::path::PathBuf::from(format!("{}-shm", tmp.display()));
-            let mut buf = [0u8; 12];
+            let mut buf = [0u8; 4096];
             buf[0..4].copy_from_slice(&3_007_000u32.to_ne_bytes()); // WALINDEX_MAX_VERSION
             // iChange (offset 8) starts at 0; doesn't matter for this test.
             let mut f = std::fs::File::create(&shm_path).unwrap();
@@ -2696,7 +2697,9 @@ while True:
             || {},
             WatcherConfig { backend },
         );
-        std::thread::sleep(Duration::from_millis(150));
+        // Generous initial wait so the watcher has snapshotted the
+        // initial inode under CI scheduling pressure.
+        std::thread::sleep(Duration::from_millis(300));
 
         // Replace the db file with a different inode. Atomic rename
         // works on every platform when no SQLite handle is held open.
@@ -2711,8 +2714,9 @@ while True:
         let _ = std::fs::remove_file(&other);
         std::fs::File::create(&other).unwrap();
         std::fs::rename(&other, &tmp).unwrap();
-        // Wait long enough for the dead-man's switch to fire.
-        std::thread::sleep(Duration::from_millis(500));
+        // Wait long enough for the dead-man's switch to fire on a
+        // slow CI runner. Identity check is 100 ms; give it 10 cycles.
+        std::thread::sleep(Duration::from_millis(1000));
 
         let result = watcher.join();
         let _ = std::fs::remove_file(&tmp);
