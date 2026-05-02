@@ -8,7 +8,7 @@
 //! update watcher thread — lives in [`honker_core`] and is
 //! shared with the other bindings (cdylib extension, napi-rs Node).
 
-use honker_core::{Readers, SharedUpdateWatcher, Writer, open_conn};
+use honker_core::{Readers, SharedUpdateWatcher, WatcherConfig, Writer, open_conn};
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
@@ -20,6 +20,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 fn core_err<E: std::fmt::Display>(e: E) -> PyErr {
     PyRuntimeError::new_err(e.to_string())
+}
+
+fn parse_watcher_backend(backend: Option<String>) -> PyResult<WatcherConfig> {
+    honker_core::WatcherBackend::parse(backend.as_deref())
+        .map(|backend| WatcherConfig { backend })
+        .map_err(|other| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown watcher_backend {other:?}; valid: None, 'polling', 'kernel', 'shm'"
+            ))
+        })
 }
 
 // ---------------------------------------------------------------------
@@ -145,13 +155,21 @@ struct Database {
     /// Lazy-initialized shared update watcher. One PRAGMA-poll thread per
     /// Database regardless of how many listeners subscribe.
     shared_watcher: Mutex<Option<Arc<SharedUpdateWatcher>>>,
+    /// Watcher backend chosen at `open()` time. Stored so the lazy
+    /// `update_events()` initialization picks up the right backend.
+    watcher_config: WatcherConfig,
 }
 
 #[pymethods]
 impl Database {
     #[new]
-    #[pyo3(signature = (path, max_readers=8))]
-    fn new(path: String, max_readers: usize) -> PyResult<Self> {
+    #[pyo3(signature = (path, max_readers=8, watcher_backend=None))]
+    fn new(
+        path: String,
+        max_readers: usize,
+        watcher_backend: Option<String>,
+    ) -> PyResult<Self> {
+        let watcher_config = parse_watcher_backend(watcher_backend)?;
         // Writer conn registers the notify() SQL function + ensures
         // _honker_notifications exists. Readers just SELECT.
         let writer_conn = open_conn(&path, true).map_err(core_err)?;
@@ -160,11 +178,21 @@ impl Database {
         // its own transactions — same implementations the loadable
         // extension registers, no `.dylib` load needed at runtime.
         honker_core::attach_honker_functions(&writer_conn).map_err(core_err)?;
+        // Probe the chosen backend now (after the writer connection has
+        // created -wal / -shm in WAL mode). Failures raise from open()
+        // so a backend that can't run never silently produces no wakes.
+        let db_path: std::path::PathBuf = path.into();
+        if let Err(reason) = watcher_config.backend.probe(&db_path) {
+            return Err(PyRuntimeError::new_err(format!(
+                "watcher_backend probe failed: {reason}"
+            )));
+        }
         Ok(Self {
             writer: Arc::new(Writer::new(writer_conn)),
-            readers: Arc::new(Readers::new(path.clone(), max_readers)),
-            db_path: path.into(),
+            readers: Arc::new(Readers::new(db_path.to_string_lossy().into_owned(), max_readers)),
+            db_path,
             shared_watcher: Mutex::new(None),
+            watcher_config,
         })
     }
 
@@ -188,7 +216,10 @@ impl Database {
             if let Some(existing) = guard.as_ref() {
                 existing.clone()
             } else {
-                let w = Arc::new(SharedUpdateWatcher::new(self.db_path.clone()));
+                let w = Arc::new(SharedUpdateWatcher::new_with_config(
+                    self.db_path.clone(),
+                    self.watcher_config.clone(),
+                ));
                 *guard = Some(w.clone());
                 w
             }
@@ -483,41 +514,23 @@ struct UpdateEvents {
 
 impl Drop for UpdateEvents {
     fn drop(&mut self) {
-        // Order matters here:
-        //   1. Set shutdown FIRST so even an in-flight tick the bridge
-        //      thread is about to recv() doesn't race a Python::attach
-        //      after we start tearing down.
-        //   2. Unsubscribe so any blocked rx.recv() returns Err
-        //      immediately (sender dropped).
-        //   3. Synchronously join the bridge thread so it's
-        //      definitively gone before this Drop returns.
-        //
-        // Without (3), the bridge thread can keep running after the
-        // Python interpreter finalizes — see #16. Watcher poll thread
-        // (in honker-core) is already joined synchronously by
-        // SharedUpdateWatcher::close(), but the bridge thread is the
-        // one that calls back into Python and the one that panicked.
+        // Order: set shutdown → unsubscribe → join bridge.
+        //   1. shutdown first so an in-flight tick already past recv()
+        //      returns before calling back into a tearing-down Python.
+        //   2. unsubscribe drops the sender so blocked recv() wakes Err.
+        //   3. join makes sure the bridge is gone before Drop returns
+        //      (without it, bridge can outlive Python and panic — #16).
         self.shutdown.store(true, Ordering::Release);
         self.shared.unsubscribe(self.sub_id);
 
         let handle = self.inner.lock().bridge_handle.take();
         if let Some(handle) = handle {
-            // CPython's deallocator calls Drop with the GIL held. The
-            // bridge thread, if mid-`Python::attach`, is itself
-            // blocked acquiring the GIL we hold — so a naive `join()`
-            // would deadlock. Release the GIL via `py.detach` while
-            // we wait so the bridge thread can finish its in-flight
-            // attach, observe the cleared sender, and exit.
-            //
-            // `Python::attach` (0.28's rename of `with_gil`) is
-            // reentrant: a no-op acquisition if we already hold it
-            // (the typical pyclass-Drop case). `attach`-then-`detach`
-            // works whether or not we entered with the GIL.
-            //
-            // If the interpreter is being finalized (rare; normally
-            // pyclass dealloc runs before Py_FinalizeEx), `attach`
-            // could fail. Guard with catch_unwind so a panic from
-            // PyO3 internals doesn't propagate through Drop.
+            // CPython holds the GIL during Drop. If the bridge is mid-
+            // Python::attach it's blocked on the GIL we hold → deadlock.
+            // detach (release GIL) while we join so the bridge can
+            // finish its attach, see the cleared sender, and exit.
+            // catch_unwind because Python::attach panics during interp
+            // finalization, which can race pyclass dealloc.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 Python::attach(|py| {
                     py.detach(|| {
@@ -549,20 +562,11 @@ impl UpdateEvents {
         let handle = std::thread::Builder::new()
             .name("honker-update-bridge".into())
             .spawn(move || {
-                // Blocks on the subscriber channel. Exits when:
-                //   * the shared watcher's sender list prunes this
-                //     subscriber (Drop -> unsubscribe -> sender dropped
-                //     -> recv() returns Err), OR
-                //   * the shutdown flag is set (Drop sets it before
-                //     unsubscribing). The check sits BETWEEN recv() and
-                //     `Python::attach` so a tick that landed before
-                //     shutdown was set doesn't trigger a Python call
-                //     after the interpreter is mid-teardown.
-                //
-                // Without the shutdown check + the synchronous join in
-                // Drop, the bridge thread could outlive the Python
-                // interpreter and panic on the next attach (#16 in the
-                // honker repo).
+                // Blocks on the subscriber channel. Exits when the
+                // sender drops (recv Err) or shutdown is set. The
+                // shutdown check between recv() and Python::attach
+                // prevents calling into a tearing-down interpreter
+                // for a tick that landed pre-shutdown.
                 while rx.recv().is_ok() {
                     if shutdown.load(Ordering::Acquire) {
                         return;
@@ -574,6 +578,30 @@ impl UpdateEvents {
                         };
                         let _ = loop_py.call_method1(py, "call_soon_threadsafe", (put, py.None()));
                     });
+                }
+                // recv Err with shutdown unset → dead-man's switch
+                // fired. Push an exception sentinel so __anext__
+                // raises instead of hanging on an empty queue.
+                if !shutdown.load(Ordering::Acquire) {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        Python::attach(|py| {
+                            let exc = PyRuntimeError::new_err(
+                                "honker: update watcher died (database \
+                                 file likely replaced; recreate \
+                                 honker.open() to recover)",
+                            );
+                            let exc_obj: Py<PyAny> = exc.into_value(py).into();
+                            let put = match queue_py_for_thread.getattr(py, "put_nowait") {
+                                Ok(v) => v,
+                                Err(_) => return,
+                            };
+                            let _ = loop_py.call_method1(
+                                py,
+                                "call_soon_threadsafe",
+                                (put, exc_obj),
+                            );
+                        });
+                    }));
                 }
             })
             .map_err(core_err)?;
@@ -593,7 +621,12 @@ impl UpdateEvents {
 
     fn __anext__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let queue = self.ensure_started(py)?;
-        queue.bind(py).call_method0("get")
+        // queue.get() returns a coroutine; we need a wrapper that
+        // awaits it then raises if the value is the death sentinel
+        // (a BaseException instance) rather than yielding None.
+        let inner = queue.bind(py).call_method0("get")?;
+        let helper = py.import("honker._honker")?.getattr("_raise_if_dead")?;
+        helper.call1((inner,))
     }
 
     /// Path this watcher is monitoring. Useful in tests / debugging.
@@ -608,9 +641,13 @@ impl UpdateEvents {
 // ---------------------------------------------------------------------
 
 #[pyfunction]
-#[pyo3(signature = (path, max_readers=8))]
-fn open(path: String, max_readers: usize) -> PyResult<Database> {
-    Database::new(path, max_readers)
+#[pyo3(signature = (path, max_readers=8, watcher_backend=None))]
+fn open(
+    path: String,
+    max_readers: usize,
+    watcher_backend: Option<String>,
+) -> PyResult<Database> {
+    Database::new(path, max_readers, watcher_backend)
 }
 
 /// Compute the next unix timestamp strictly after `from_unix` that

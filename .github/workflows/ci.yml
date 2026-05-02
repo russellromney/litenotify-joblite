@@ -48,6 +48,27 @@ jobs:
           else
             cargo test -p honker-core --lib
           fi
+      # Experimental wake backends — see Phase Lighthouse in ROADMAP.md.
+      # These features are NOT compiled into published wheels yet, but
+      # we test them in CI on every platform so we know what's actually
+      # broken before users do. Failures here block Phase Lighthouse,
+      # not the wheel-building jobs below.
+      - name: Run honker-core tests (experimental wake backends, debug)
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cargo test -p honker-core --lib --features bundled-sqlite,kernel-watcher,shm-fast-path
+          else
+            cargo test -p honker-core --lib --features kernel-watcher,shm-fast-path
+          fi
+      - name: Run honker-core tests (experimental wake backends, release)
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cargo test -p honker-core --release --lib --features bundled-sqlite,kernel-watcher,shm-fast-path
+          else
+            cargo test -p honker-core --release --lib --features kernel-watcher,shm-fast-path
+          fi
       - name: Build loadable extension
         run: cargo build --release -p honker-extension
       - name: Sanity-load via Python sqlite3
@@ -220,7 +241,10 @@ jobs:
 
   node:
     name: node · honker-node
-    timeout-minutes: 5
+    # 8 min instead of 5: Windows runners spend 4+ min on the build /
+    # Test (basic — node only) step and the additional cache-cleanup
+    # at the end was tipping over the 5 min limit.
+    timeout-minutes: 8
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

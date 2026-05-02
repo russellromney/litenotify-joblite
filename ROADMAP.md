@@ -127,7 +127,158 @@ Shipped in PR #29, with follow-up release prep in PR #33.
 - Do not block 1.0 on bindings that are explicitly marked poll-based or
   partial, as long as the docs and tests say so.
 
+
+## Phase Echo — Experimental Watcher Backends Across All Bindings
+
+> After: Phase Wake Parity · Before: 1.0 release prep
+
+The experimental `kernel` and `shm` watcher backends ship in
+`honker-core` and are wired through Python and Node only. Bring the
+remaining bindings to parity so users can opt in from any language.
+
+### Scope
+
+For each of `honker-bun`, `honker-go`, `honker-rs`, `honker-ruby`,
+`honker-cpp`, `honker-ex`:
+
+- Add Cargo features `kernel-watcher` and `shm-fast-path` that forward
+  to `honker-core/<feature>` (where the binding has a Cargo.toml).
+- Accept a `watcher_backend` (or language-idiomatic equivalent) string
+  parameter on the binding's `open()`.
+- Parse via `honker_core::WatcherBackend::parse` so the accepted
+  aliases (`"polling"` / `"poll"`, `"kernel"` / `"kernel-watcher"`,
+  `"shm"` / `"shm-fast-path"`) stay in lockstep with Python/Node.
+- Call `WatcherBackend::probe(&db_path)` at `open()` time and surface
+  failures as the language's idiomatic error type. **No silent
+  fallback.**
+- Pass the `WatcherConfig` through to `SharedUpdateWatcher::new_with_config`.
+
+### Tests per binding
+
+- Direct API test: `open(backend=...)` for each backend; one returns
+  the polling default, kernel/shm raise iff the feature isn't
+  compiled into that binding's build.
+- Cross-process listener: writer subprocess + parent listener under
+  each backend. Every commit must surface to the listener.
+- Cross-process queue worker: 1×1, 1×N (workers), N×1 (writers)
+  topologies × each backend. Mirrors the existing
+  `tests/test_watcher_backends_queue_e2e.py` and
+  `packages/honker-node/test/watcher_backends_queue_e2e.js`.
+
+### Non-goals
+
+- Don't add new wire formats or per-binding watcher logic. All
+  backends live in `honker-core`; bindings only thread the param.
+- Don't auto-detect / silently substitute backends — the experimental
+  contract is "opt in, fail loud, restart".
+- Don't backport to bindings without an `update_events()` equivalent
+  (some have polling-only consumer APIs); document those as
+  polling-only and skip.
+
+### Verification
+
+- Per binding: tests above pass on Linux and macOS in CI.
+- Windows is opt-in; document expected behavior per binding.
+- All tests in `tests/test_watcher_backends.py`,
+  `tests/test_watcher_backends_e2e.py`, and
+  `tests/test_watcher_backends_queue_e2e.py` continue to pass for
+  Python; equivalents continue to pass for Node.
+
+## Phase Atlas — Map Experimental Backend Edge-Case Behavior
+
+> After: Phase Echo · Before: 1.0 release prep
+
+Experimental backends ship with "spurious wakes possible, missed
+wakes possible" plus a dead-man's switch. That covers the headline
+contract but leaves a long tail where the three backends behave
+differently. Users opting in deserve tests that pin down exactly
+what they get. This phase characterizes — does not fix.
+
+### Acceptance: a Rust test per (backend, scenario), behavior matrix in README + module docs
+
+- [ ] Rollback (`BEGIN IMMEDIATE; INSERT; ROLLBACK`)
+- [ ] `wal_checkpoint(TRUNCATE)` wake count
+- [ ] External non-SQLite writes (`dd`, `truncate`)
+- [ ] Multiple databases in same directory (kernel cross-pollination)
+- [ ] VACUUM (all three should panic via dead-man's switch with the
+      same message)
+- [ ] Mid-flight `journal_mode` change (shm should panic; others keep working)
+- [ ] System suspend/hibernate (document; CI can't test)
+- [ ] Symlinked db path
+- [ ] `fork()` without exec (document non-support)
+- [ ] NFS / SMB / FUSE — `probe()` should refuse the shm fast path
+- [ ] Crash recovery: SIGKILL the writer, reopen, prove wakes resume
+- [ ] Litestream-style restore — `update_events()` should `Err`
+      (Disconnected) within ~200 ms of replacement; document the
+      "recreate after restore" pattern in `docs/litestream.md`
+
+### Non-goals
+
+- Don't *fix* the differences. The contract says experimental.
+- Don't add backend-specific de-duplication to mask rollback wakes.
+- Don't suppress the VACUUM panic.
+
+## Phase Boundary — Wake-Source Isolation And Independence
+
+> After: Phase Atlas · Before: 1.0 release prep
+
+Honker has multiple wake sources (DB-update via `SharedUpdateWatcher`,
+deadline wake from #29, fallback poll, push signals on `notify`
+rows). Each consumer listens on a union. Today they appear independent
+by inspection but nothing proves it. This phase pins down isolation:
+disabling any one source must leave the others carrying the load,
+and no commit + deadline collision should double-fire.
+
+### Acceptance: per-isolation tests, plus `docs/wake-topology.md`
+
+- [ ] DB-update only (no deadlines, no fallback firing)
+- [ ] Deadline only (`SharedUpdateWatcher` mocked to never fire)
+- [ ] Fallback-poll only (both above mocked off)
+- [ ] Push-signal `db.listen(channel)` independent of deadlines
+- [ ] No double-fire when a commit lands exactly at a deadline
+- [ ] No starvation: flood of DB-update wakes still lets deadline
+      wakes fire and vice versa
+- [ ] Cross-process repro: writer + worker subprocess, worker with
+      each source disabled in turn
+
+### Non-goals
+
+- Don't unify sources. Independence is the feature.
+- Don't add source priority. Every source fires; consumers re-query
+  on wake; everything is idempotent.
+
+## Phase Lighthouse — Ship Experimental Wake Backends In Published Wheels
+
+> After: Phase Atlas · Before: 1.0 release prep
+
+PR #30 shipped the experimental backends in source, gated by Cargo
+features. Published wheels still build polling-only. This phase
+decides when to enable the features in wheel builds. Polling stays
+the default either way; "available in wheels" is the only flip.
+
+### Prerequisites (all must hold before flipping)
+
+- [ ] CI builds and tests `--features kernel-watcher,shm-fast-path`
+      on Linux + macOS + Windows (Rust + Python + Node e2e)
+- [ ] Phase Atlas characterization tests green everywhere — at
+      minimum: rollback, multi-db-same-dir, VACUUM, NFS refusal
+- [ ] Real-world dogfooding (days, not minutes) with each backend
+      selected — catches OS quirks under load and resource leaks
+
+### Scope when prereqs met
+
+- [ ] Wheel CI passes the features on platforms that earned it
+- [ ] README drops the "source-only" notice
+- [ ] Optional `*-rc` channel for early adopters before flipping
+
+### Non-goals
+
+- Don't change the default backend. Polling stays.
+- Don't ship a feature that fails any platform's CI. If one OS
+  earns it and another doesn't, ship neither.
+
 ## Release Automation
+
 
 This is not 1.0 prep. The goal is simpler: make normal releases boring.
 

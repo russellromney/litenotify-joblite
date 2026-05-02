@@ -11,6 +11,14 @@ edition = "2024"
 name = "honker_node"
 crate-type = ["cdylib"]
 
+[features]
+# Forward to honker-core. Enable at build time with
+# `npm run build -- --features kernel-watcher`. Wheels built without
+# these features silently fall back to polling when a JS caller passes
+# `watcherBackend: "kernel"` or `"shm"`.
+kernel-watcher = ["honker-core/kernel-watcher"]
+shm-fast-path = ["honker-core/shm-fast-path"]
+
 [dependencies]
 # Relative path works when this crate sits at packages/honker-node
 # inside the main honker repo (whether directly or as a submodule).

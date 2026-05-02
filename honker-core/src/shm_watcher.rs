@@ -1,0 +1,182 @@
+//! Optional mmap `-shm` fast path (feature = `shm-fast-path`).
+//!
+//! **Experimental.** Weaker correctness contract than the polling
+//! backend, in exchange for sub-millisecond wake latency.
+//!
+//! # Contract
+//!
+//! `on_change()` fires when the `iChange` counter at byte offset 8 of
+//! the WAL index header (`-shm` file) advances. **There is no `PRAGMA
+//! data_version` verification, no safety-net poll, no inode re-mmap.**
+//! This means:
+//!
+//! - **WAL mode required.** No `-shm` exists in DELETE/TRUNCATE/
+//!   PERSIST modes. If the file isn't present at startup the backend
+//!   logs to stderr and exits — no wakes ever fire.
+//!
+//! - **Trusts the on-disk shm layout.** Reads `iChange` at a fixed
+//!   offset and assumes it tracks `PRAGMA data_version`. Verified by
+//!   the equivalence test (`shm_fast_path_equivalence_with_pragma_baseline`)
+//!   on every supported SQLite version. If a future SQLite version
+//!   changes the layout, this breaks silently.
+//!
+//! - **WAL reset / db replacement: panic.** If `-shm` or the db file
+//!   is deleted and recreated mid-flight (cross-process close+reopen,
+//!   atomic rename, litestream restore), the watcher panics with a
+//!   "Restart required" message. Same dead-man's-switch shape as the
+//!   polling backend — louder failure than silent missed wakes.
+//!
+//! Tests assert that wakes fire with sub-millisecond latency in WAL
+//! mode. If a test fails, the backend is broken — not "fall back to
+//! polling and pretend it worked".
+
+use crate::stat_identity;
+use memmap2::Mmap;
+use std::fs::File;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+const WALINDEX_MAX_VERSION: u32 = 3_007_000;
+const ICHANGE_OFFSET: usize = 8;
+/// Same cadence as the polling backend. Shm reads are nearly free; the
+/// win over polling is "PRAGMA → memory load" (~3.5 µs → ns), not
+/// "1 ms → 100 µs". Going faster would just burn extra sleep syscalls
+/// for latency nobody can perceive.
+const POLL_INTERVAL_MS: u64 = 1;
+/// Cadence for the dead-man's switch (db / -shm replacement detection).
+/// Same wall-clock interval as the polling and kernel backends. Tracked
+/// via Instant — tick counting drifts on Windows where 1 ms sleeps round
+/// up to ~15 ms.
+const IDENTITY_CHECK_INTERVAL: Duration = Duration::from_millis(100);
+
+pub(crate) fn run_shm_fast_path_loop<F>(
+    db_path: PathBuf,
+    on_change: F,
+    stop: Arc<AtomicBool>,
+    ready: std::sync::mpsc::SyncSender<()>,
+) where
+    F: Fn() + Send + 'static,
+{
+    if cfg!(target_endian = "big") {
+        eprintln!("honker: shm-fast-path requires little-endian platform. Backend disabled.");
+        return;
+    }
+    let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+    // Open + mmap. SAFETY: read-only; SQLite owns the write lock.
+    let f = match File::open(&shm_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("honker: shm-fast-path disabled: -shm unavailable ({e}). Needs WAL + open conn.");
+            return;
+        }
+    };
+    let mmap = match unsafe { Mmap::map(&f) } {
+        Ok(m) if m.len() >= 12 => m,
+        _ => {
+            eprintln!("honker: shm-fast-path disabled: mmap failed or -shm too small.");
+            return;
+        }
+    };
+    // Sanity: WAL index version we know how to read. A future SQLite
+    // that bumps this fails the check instead of reading garbage.
+    let iversion = u32::from_ne_bytes(mmap[0..4].try_into().unwrap());
+    if iversion != WALINDEX_MAX_VERSION {
+        eprintln!(
+            "honker: shm-fast-path disabled: WAL index version {iversion} != {WALINDEX_MAX_VERSION}."
+        );
+        return;
+    }
+
+    let read_ichange = || u32::from_ne_bytes(mmap[ICHANGE_OFFSET..ICHANGE_OFFSET + 4].try_into().unwrap());
+    let mut last = read_ichange();
+
+    // Dead-man's switch: snapshot db + -shm inodes; panic on change.
+    // Without this the mmap silently sits on a dead -shm inode.
+    let initial_db_id = match stat_identity(&db_path) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("honker: failed to stat database for identity check: {e}");
+            (0, 0)
+        }
+    };
+    let initial_shm_id = match stat_identity(&shm_path) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("honker: failed to stat -shm for identity check: {e}");
+            (0, 0)
+        }
+    };
+    let mut next_identity_check = Instant::now() + IDENTITY_CHECK_INTERVAL;
+    // Baseline captured; signal the spawner that it's safe to return.
+    let _ = ready.send(());
+    drop(ready);
+
+    while !stop.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        let current = read_ichange();
+        if current != last {
+            last = current;
+            on_change();
+        }
+        let now = Instant::now();
+        if now >= next_identity_check {
+            next_identity_check = now + IDENTITY_CHECK_INTERVAL;
+            // check_identity panics on actual replacement; returns true
+            // on stat error so we fire a conservative wake.
+            let any_err = check_identity(&db_path, initial_db_id, "database file")
+                | check_identity(&shm_path, initial_shm_id, "-shm file");
+            if any_err {
+                on_change();
+            }
+        }
+    }
+}
+
+/// Panics if `path` has been replaced since startup (db file: parity
+/// with polling; -shm: a recreated -shm leaves our mmap on a dead
+/// inode). Returns `true` on stat error → caller fires conservative wake.
+fn check_identity(path: &std::path::Path, initial: (u64, u64), label: &str) -> bool {
+    match stat_identity(path) {
+        Ok(current) => {
+            if current != initial {
+                panic!(
+                    "honker: {label} replaced: \
+                     expected (dev={}, ino={}), found (dev={}, ino={}) at {:?}. \
+                     The watcher cannot recover; \
+                     close the Database and reopen with honker.open().",
+                    initial.0, initial.1, current.0, current.1, path
+                );
+            }
+            false
+        }
+        Err(e) => {
+            eprintln!("honker: stat identity check failed for {label}: {e}");
+            true
+        }
+    }
+}
+
+/// Probe at `honker.open()` so a misconfigured backend errors
+/// immediately instead of silently producing no wakes.
+pub(crate) fn probe(db_path: &std::path::Path) -> Result<(), String> {
+    if cfg!(target_endian = "big") {
+        return Err("shm-fast-path requires little-endian platform".into());
+    }
+    let shm = format!("{}-shm", db_path.display());
+    let f = File::open(&shm).map_err(|e| {
+        format!("-shm unavailable ({e}). WAL mode + open connection required.")
+    })?;
+    let m = unsafe { Mmap::map(&f) }.map_err(|e| format!("mmap failed: {e}"))?;
+    if m.len() < 12 {
+        return Err("-shm too small".into());
+    }
+    let iv = u32::from_ne_bytes(m[0..4].try_into().unwrap());
+    if iv != WALINDEX_MAX_VERSION {
+        return Err(format!(
+            "WAL index version {iv} != {WALINDEX_MAX_VERSION} (unsupported SQLite layout)"
+        ));
+    }
+    Ok(())
+}

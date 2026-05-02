@@ -252,6 +252,14 @@ Idle cost is a single `PRAGMA data_version` query per millisecond per database. 
 
 `SharedUpdateWatcher` (in `honker-core`) owns the poll thread and fans out to N subscribers via bounded `SyncSender<()>` channels keyed by subscriber id. Each `db.update_events()` call registers a subscriber and returns a handle whose `Drop` auto-unsubscribes, so a dropped listener causes the bridge thread's `rx.recv() -> Err` and exits cleanly.
 
+### Wake backend (advanced)
+
+Polling is the default. It's the only backend shipped in published wheels. Two opt-in alternatives exist behind Cargo features for source builds: kernel filesystem events, and an mmap read of SQLite's WAL index. Both can give lower idle CPU or faster wakes, but they can also miss wakes or fire wakes you didn't ask for. All three watch for the database file being swapped under them; if that happens they shut down loudly — every subscriber sees an error from `update_events()` instead of hanging.
+
+One thing changed for everyone, no opt-in needed: the polling backend now keeps its connection through transient `SQLITE_BUSY` / `SQLITE_LOCKED` errors during commits. Before, it would drop and reconnect, which could miss wakes on non-WAL journal modes (DELETE / TRUNCATE / PERSIST). Now it just retries the next tick.
+
+Full reference — when to pick which, source-build flags, recovery patterns, what we haven't tested yet — at [docs › Watcher backends](https://honker.dev/reference/watcher-backends/).
+
 ### Queue schema
 
 - `_honker_live`: pending + processing rows

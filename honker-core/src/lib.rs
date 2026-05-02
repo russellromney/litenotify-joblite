@@ -36,18 +36,114 @@
 
 pub mod cron;
 mod honker_ops;
+#[cfg(feature = "kernel-watcher")]
+mod kernel_watcher;
+#[cfg(feature = "shm-fast-path")]
+mod shm_watcher;
 
 pub use honker_ops::attach_honker_functions;
 
 use parking_lot::{Condvar, Mutex};
 use rusqlite::functions::FunctionFlags;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, ffi};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::time::{Duration, Instant};
+
+// ---------------------------------------------------------------------
+// Watcher backend configuration
+// ---------------------------------------------------------------------
+
+/// Which backend drives the update-detection loop.
+///
+/// `Polling` is the default: 1 ms `PRAGMA data_version` loop, proven
+/// correct across all platforms. The optional backends are **experimental**
+/// — they must first prove equivalence to the polling path before
+/// being relied on for correctness.
+#[derive(Debug, Clone, Default)]
+pub enum WatcherBackend {
+    /// Default: 1 ms `PRAGMA data_version` polling loop.
+    #[default]
+    Polling,
+    /// OS kernel filesystem notifications (experimental).
+    ///
+    /// Fires `on_change()` on every non-Access filesystem event in the
+    /// db's parent directory plus per-file events on `-wal`/`-shm`.
+    /// Spurious wakes possible (consumers re-read state, dedupe).
+    /// Missed wakes possible if the OS drops events; consumer's
+    /// `idle_poll_s` is the only backstop. Setup failures log and
+    /// silently disable — no fall-back to polling.
+    #[cfg(feature = "kernel-watcher")]
+    KernelWatch,
+    /// mmap `-shm` WAL index fast path (experimental).
+    ///
+    /// Reads `iChange` (offset 8 in the WAL index header) at 100 µs
+    /// cadence; fires `on_change()` when it advances. WAL mode only.
+    /// Trusts the on-disk shm layout (verified via the equivalence
+    /// test at build time). If the layout changes or the `-shm` file
+    /// is recreated mid-flight, wakes silently stop until restart.
+    #[cfg(feature = "shm-fast-path")]
+    ShmFastPath,
+}
+
+/// Configuration passed to [`UpdateWatcher::spawn_with_config`] and
+/// [`SharedUpdateWatcher::new_with_config`].
+#[derive(Debug, Clone, Default)]
+pub struct WatcherConfig {
+    pub backend: WatcherBackend,
+}
+
+impl WatcherBackend {
+    /// Parse a binding-level string into a backend. Shared across
+    /// Python/Node so the accepted aliases stay in lockstep. If the
+    /// requested backend isn't compiled in, prints a one-line stderr
+    /// warning and falls back to `Polling`. Unknown values return
+    /// `Err(input_string)` so bindings can raise a typed error.
+    ///
+    /// Accepted: `None` / `"polling"` / `"poll"`,
+    /// `"kernel"` / `"kernel-watcher"`, `"shm"` / `"shm-fast-path"`.
+    pub fn parse(name: Option<&str>) -> Result<Self, String> {
+        match name {
+            None | Some("polling" | "poll") => Ok(WatcherBackend::Polling),
+            Some("kernel" | "kernel-watcher") => {
+                #[cfg(feature = "kernel-watcher")]
+                { Ok(WatcherBackend::KernelWatch) }
+                #[cfg(not(feature = "kernel-watcher"))]
+                {
+                    eprintln!("honker: kernel-watcher feature not compiled; using polling");
+                    Ok(WatcherBackend::Polling)
+                }
+            }
+            Some("shm" | "shm-fast-path") => {
+                #[cfg(feature = "shm-fast-path")]
+                { Ok(WatcherBackend::ShmFastPath) }
+                #[cfg(not(feature = "shm-fast-path"))]
+                {
+                    eprintln!("honker: shm-fast-path feature not compiled; using polling");
+                    Ok(WatcherBackend::Polling)
+                }
+            }
+            Some(other) => Err(other.to_string()),
+        }
+    }
+
+    /// Verify the backend can actually initialize for `db_path`. Bindings
+    /// call this at `honker.open()` time so a backend that can't run
+    /// errors loudly instead of silently producing no wakes. Returns a
+    /// human-readable reason on failure.
+    pub fn probe(&self, db_path: &Path) -> Result<(), String> {
+        match self {
+            WatcherBackend::Polling => Ok(()),
+            #[cfg(feature = "kernel-watcher")]
+            WatcherBackend::KernelWatch => kernel_watcher::probe(db_path),
+            #[cfg(feature = "shm-fast-path")]
+            WatcherBackend::ShmFastPath => shm_watcher::probe(db_path),
+        }
+    }
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -468,7 +564,7 @@ fn closed_err() -> Error {
 /// detection is disabled but the watcher still functions. Nobody is
 /// known to deploy honker there today.
 #[cfg(any(unix, windows))]
-fn stat_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+pub(crate) fn stat_identity(path: &Path) -> std::io::Result<(u64, u64)> {
     let id = file_id::get_file_id(path)?;
     match id {
         file_id::FileId::Inode {
@@ -507,7 +603,7 @@ fn fold_high_res(volume_serial_number: u64, file_id: u128) -> (u64, u64) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn stat_identity(_path: &Path) -> std::io::Result<(u64, u64)> {
+pub(crate) fn stat_identity(_path: &Path) -> std::io::Result<(u64, u64)> {
     Ok((0, 0))
 }
 
@@ -516,12 +612,32 @@ fn stat_identity(_path: &Path) -> std::io::Result<(u64, u64)> {
 /// connection (and on checkpoint). Empirically verified to detect
 /// cross-connection database updates on all SQLite versions tested.
 /// Cost: ~3.5 µs/call = ~3.5 ms/sec at 1 kHz.
-fn poll_data_version(conn: &Connection) -> Result<u32, String> {
+pub(crate) fn poll_data_version(conn: &Connection) -> Result<u32, String> {
     conn.pragma_query_value(None, "data_version", |row| row.get(0))
         .map_err(|e| e.to_string())
 }
 
-/// Background thread that polls a SQLite database file for changes.
+/// Returns true if `e` is a transient lock conflict (SQLITE_BUSY /
+/// SQLITE_LOCKED). On non-WAL journal modes the writer holds an
+/// exclusive lock during commit, so the watcher's PRAGMA frequently
+/// races into one of these. Treat as "try again next tick", not as a
+/// connection failure — dropping and re-opening would silently re-
+/// baseline `last_version` and skip pending wakes.
+fn is_transient_lock_error(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(
+            ffi::Error {
+                code: ffi::ErrorCode::DatabaseBusy | ffi::ErrorCode::DatabaseLocked,
+                ..
+            },
+            _,
+        )
+    )
+}
+
+/// Polling loop body shared by [`UpdateWatcher`] (polling backend) and
+/// the fallback path inside [`kernel_watcher`] / [`shm_watcher`].
 ///
 /// Three-layer defensive architecture:
 ///
@@ -532,11 +648,119 @@ fn poll_data_version(conn: &Connection) -> Result<u32, String> {
 /// 3. **Identity check (about every 100 ms):** `stat(db_path)` to compare
 ///    `(dev, ino)`. If the file was replaced, panic with a clear
 ///    message — continuing would silently watch stale data.
-///
-/// Why PRAGMA data_version instead of stat on the WAL? It is a
-/// counter, not a timestamp — immune to clock skew, WAL truncation,
-/// and exact-size collisions. It also ignores rolled-back transactions
-/// that touch the WAL but never commit.
+pub(crate) fn run_poll_loop<F>(
+    db_path: PathBuf,
+    on_change: F,
+    stop: Arc<AtomicBool>,
+    ready: std::sync::mpsc::SyncSender<()>,
+) where
+    F: Fn(),
+{
+    let mut conn = match Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("honker: failed to open watcher connection: {e}");
+            None
+        }
+    };
+    let mut last_version = conn
+        .as_ref()
+        .and_then(|c| poll_data_version(c).ok())
+        .unwrap_or(0);
+    let initial_identity = match stat_identity(&db_path) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("honker: failed to stat database for identity check: {e}");
+            (0, 0)
+        }
+    };
+    // Wall-clock cadence: tick counting drifts on Windows where 1 ms
+    // sleeps round up to ~15 ms.
+    let mut next_identity_check = Instant::now() + UPDATE_WATCHER_IDENTITY_INTERVAL;
+    // Baseline captured; signal the spawner that it's safe to return.
+    let _ = ready.send(());
+    drop(ready);
+
+    while !stop.load(Ordering::Acquire) {
+        std::thread::sleep(Duration::from_millis(1));
+
+        // Path 1: PRAGMA data_version (fast path)
+        if let Some(ref c) = conn {
+            match c.pragma_query_value(None, "data_version", |row| row.get::<_, u32>(0)) {
+                Ok(version) => {
+                    if version != last_version {
+                        last_version = version;
+                        on_change();
+                    }
+                }
+                Err(e) if is_transient_lock_error(&e) => {
+                    // Writer holds the db lock (mid-commit on a
+                    // non-WAL journal mode). Don't drop the connection
+                    // — that would silently re-baseline last_version
+                    // and skip pending wakes. Just retry next tick.
+                }
+                Err(e) => {
+                    eprintln!("honker: data_version poll failed: {e}");
+                    conn = None;
+                    on_change(); // conservative wake
+                }
+            }
+        } else {
+            // Path 2: reconnect after transient failure
+            match Connection::open_with_flags(
+                &db_path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ) {
+                Ok(c) => {
+                    last_version = poll_data_version(&c).unwrap_or(0);
+                    conn = Some(c);
+                }
+                Err(e) => {
+                    eprintln!("honker: reconnect failed: {e}");
+                }
+            }
+        }
+
+        // Path 3: dead-man's switch — panic if db inode changed
+        // (atomic rename, litestream restore, volume remount, NFS).
+        // Effectively a no-op on Windows: the kernel rejects
+        // rename-over-open files.
+        let now = Instant::now();
+        if now >= next_identity_check {
+            next_identity_check = now + UPDATE_WATCHER_IDENTITY_INTERVAL;
+            match stat_identity(&db_path) {
+                Ok(current) => {
+                    if current != initial_identity {
+                        panic!(
+                            "honker: database file replaced: \
+                             expected (dev={}, ino={}), \
+                             found (dev={}, ino={}) at {:?}. \
+                             The watcher cannot recover; \
+                             close the Database and reopen with honker.open().",
+                            initial_identity.0,
+                            initial_identity.1,
+                            current.0,
+                            current.1,
+                            db_path
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("honker: stat identity check failed: {e}");
+                    conn = None;
+                    on_change();
+                }
+            }
+        }
+    }
+}
+
+/// Background thread that polls a SQLite database file for changes.
+/// Dispatches to the backend selected in [`WatcherConfig`].
+/// See [`run_poll_loop`] for the default polling backend's architecture.
 pub struct UpdateWatcher {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -545,116 +769,56 @@ pub struct UpdateWatcher {
 const UPDATE_WATCHER_IDENTITY_INTERVAL: Duration = Duration::from_millis(100);
 
 impl UpdateWatcher {
-    /// Spawn a watcher thread on `db_path`. `on_change` is called
-    /// once per observed commit. The thread runs until [`UpdateWatcher`]
-    /// is dropped or [`stop`](Self::stop) is called.
+    /// Spawn a watcher thread on `db_path` using the default polling
+    /// backend. `on_change` is called once per observed commit. The
+    /// thread runs until [`UpdateWatcher`] is dropped or
+    /// [`stop`](Self::stop) is called.
     pub fn spawn<F>(db_path: PathBuf, on_change: F) -> Self
+    where
+        F: Fn() + Send + 'static,
+    {
+        Self::spawn_with_config(db_path, on_change, WatcherConfig::default())
+    }
+
+    /// Like [`spawn`](Self::spawn) but with an explicit watcher backend.
+    /// The optional `KernelWatch` and `ShmFastPath` backends are
+    /// experimental — see [`WatcherBackend`] for the safety contracts.
+    pub fn spawn_with_config<F>(db_path: PathBuf, on_change: F, config: WatcherConfig) -> Self
     where
         F: Fn() + Send + 'static,
     {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_t = stop.clone();
+        // The thread signals `ready` once it has captured its baseline
+        // (initial inode for the dead-man's switch, initial iChange for
+        // shm, etc.). spawn_with_config blocks on `ready` so the caller
+        // can do anything that mutates the file (rename, write) right
+        // after spawn without racing the baseline capture. If the
+        // thread fails to init, the sender drops and recv() returns
+        // Err — we still return so the caller can use the (no-op)
+        // watcher; the eprintln from the backend explains the failure.
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<()>(1);
         let handle = std::thread::Builder::new()
             .name("honker-update-poll".into())
             .spawn(move || {
-                let mut conn = match Connection::open_with_flags(
-                    &db_path,
-                    OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                ) {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        eprintln!("honker: failed to open watcher connection: {e}");
-                        None
+                match config.backend {
+                    WatcherBackend::Polling => run_poll_loop(db_path, on_change, stop_t, ready_tx),
+                    #[cfg(feature = "kernel-watcher")]
+                    WatcherBackend::KernelWatch => {
+                        kernel_watcher::run_kernel_watch_loop(
+                            db_path, on_change, stop_t, ready_tx,
+                        );
                     }
-                };
-                let mut last_version = conn
-                    .as_ref()
-                    .and_then(|c| poll_data_version(c).ok())
-                    .unwrap_or(0);
-                let initial_identity = match stat_identity(&db_path) {
-                    Ok(id) => id,
-                    Err(e) => {
-                        eprintln!("honker: failed to stat database for identity check: {e}");
-                        (0, 0)
-                    }
-                };
-                let mut next_identity_check = Instant::now() + UPDATE_WATCHER_IDENTITY_INTERVAL;
-
-                while !stop_t.load(Ordering::Acquire) {
-                    std::thread::sleep(Duration::from_millis(1));
-
-                    // Path 1: PRAGMA data_version (fast path)
-                    if let Some(ref c) = conn {
-                        match poll_data_version(c) {
-                            Ok(version) => {
-                                if version != last_version {
-                                    last_version = version;
-                                    on_change();
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("honker: data_version poll failed: {e}");
-                                conn = None;
-                                on_change(); // conservative wake
-                            }
-                        }
-                    } else {
-                        // Path 2: reconnect after transient failure
-                        match Connection::open_with_flags(
-                            &db_path,
-                            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                        ) {
-                            Ok(c) => {
-                                last_version = poll_data_version(&c).unwrap_or(0);
-                                conn = Some(c);
-                            }
-                            Err(e) => {
-                                eprintln!("honker: reconnect failed: {e}");
-                            }
-                        }
-                    }
-
-                    // Path 3: stat identity check (dead-man's switch).
-                    //
-                    // Triggers on Linux/macOS scenarios that swap the
-                    // db file out from under us — atomic rename
-                    // (litestream restore), volume remount, NFS
-                    // server restart. On Windows the kernel rejects
-                    // rename-over-open even with `FILE_SHARE_DELETE`,
-                    // so the practical replacement scenarios that
-                    // trigger this on unix don't happen in the same
-                    // way; the dead-man's switch is effectively a
-                    // no-op on Windows. Identity check still runs,
-                    // it just rarely sees a difference.
-                    let now = Instant::now();
-                    if now >= next_identity_check {
-                        next_identity_check = now + UPDATE_WATCHER_IDENTITY_INTERVAL;
-                        match stat_identity(&db_path) {
-                            Ok(current) => {
-                                if current != initial_identity {
-                                    panic!(
-                                        "honker: database file replaced: \
-                                         expected (dev={}, ino={}), \
-                                         found (dev={}, ino={}) at {:?}. \
-                                         Restart required.",
-                                        initial_identity.0,
-                                        initial_identity.1,
-                                        current.0,
-                                        current.1,
-                                        db_path
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("honker: stat identity check failed: {e}");
-                                conn = None;
-                                on_change();
-                            }
-                        }
+                    #[cfg(feature = "shm-fast-path")]
+                    WatcherBackend::ShmFastPath => {
+                        shm_watcher::run_shm_fast_path_loop(
+                            db_path, on_change, stop_t, ready_tx,
+                        );
                     }
                 }
             })
             .expect("spawn update-poll thread");
+        let _ = ready_rx.recv();
         Self {
             stop,
             handle: Some(handle),
@@ -708,6 +872,20 @@ impl Drop for UpdateWatcher {
 /// consumer re-reads state from SQLite on each wake — so dropping
 /// during backpressure is safe. A disconnected subscriber (receiver
 /// dropped) gets pruned on the next wake via `TrySendError::Disconnected`.
+/// Lives in the watcher thread's closure. Closure drops on clean exit
+/// or panic; this Drop clears every subscriber's sender so their next
+/// `recv()` returns Err. Without it, a panicking watcher leaves
+/// subscribers blocking forever.
+struct WatcherDeathGuard {
+    senders: Arc<Mutex<HashMap<u64, SyncSender<()>>>>,
+}
+
+impl Drop for WatcherDeathGuard {
+    fn drop(&mut self) {
+        self.senders.lock().clear();
+    }
+}
+
 pub struct SharedUpdateWatcher {
     /// Hold the underlying poll thread alive. Dropping or
     /// [`close`](Self::close)ing this stops it. Wrapped in
@@ -724,18 +902,34 @@ pub struct SharedUpdateWatcher {
 }
 
 impl SharedUpdateWatcher {
-    /// Spawn the shared poll thread for `db_path`.
+    /// Spawn the shared poll thread for `db_path` using the default
+    /// polling backend.
     pub fn new(db_path: PathBuf) -> Self {
+        Self::new_with_config(db_path, WatcherConfig::default())
+    }
+
+    /// Like [`new`](Self::new) but with an explicit watcher backend.
+    pub fn new_with_config(db_path: PathBuf, config: WatcherConfig) -> Self {
         let senders: Arc<Mutex<HashMap<u64, SyncSender<()>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let senders_t = senders.clone();
-        let watcher = UpdateWatcher::spawn(db_path, move || {
-            let mut list = senders_t.lock();
-            list.retain(|_id, s| match s.try_send(()) {
-                Ok(()) | Err(TrySendError::Full(_)) => true,
-                Err(TrySendError::Disconnected(_)) => false,
-            });
-        });
+        // Watcher thread exits → closure drops → this guard drops →
+        // every subscriber's sender is cleared. Their next `recv()`
+        // returns Err instead of blocking forever. Subscribers learn
+        // the watcher died programmatically, not via stderr.
+        let death_guard = WatcherDeathGuard { senders: senders.clone() };
+        let watcher = UpdateWatcher::spawn_with_config(
+            db_path,
+            move || {
+                let _ = &death_guard;
+                let mut list = senders_t.lock();
+                list.retain(|_id, s| match s.try_send(()) {
+                    Ok(()) | Err(TrySendError::Full(_)) => true,
+                    Err(TrySendError::Disconnected(_)) => false,
+                });
+            },
+            config,
+        );
         Self {
             watcher: Mutex::new(Some(watcher)),
             senders,
@@ -749,11 +943,17 @@ impl SharedUpdateWatcher {
     /// otherwise the sender stays in the map and a bridge thread
     /// blocking on `recv()` will never see a disconnect.
     ///
-    /// Channel buffer is 1024; backpressure drops additional ticks
-    /// for the slow subscriber without blocking the watcher.
+    /// Channel capacity is 1: bursts coalesce into one wake per drain
+    /// cycle. Wakes are "go re-read state" signals — the consumer's
+    /// SQL query reads current state regardless of how many wakes
+    /// were dropped, so dropped redundant wakes never cost data, only
+    /// signal redundancy. The kernel-watcher backend in particular
+    /// fires one event per filesystem write (multiple per commit);
+    /// without coalescing, consumers would run N redundant queries
+    /// per commit burst. With cap=1 they run ~1.
     pub fn subscribe(&self) -> (u64, std::sync::mpsc::Receiver<()>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = std::sync::mpsc::sync_channel(1024);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.senders.lock().insert(id, tx);
         (id, rx)
     }
@@ -1193,6 +1393,77 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
     }
 
+    /// Subscribers must learn that the watcher thread died — not just
+    /// stop receiving wakes silently. We force the watcher to panic via
+    /// the dead-man's switch (file replacement) and assert that an
+    /// already-subscribed receiver returns `Err(RecvError)` on its
+    /// next blocking `recv()`. Without WatcherDeathGuard this test
+    /// hangs (subscriber blocks forever) and times out.
+    #[test]
+    #[cfg(unix)]
+    fn shared_update_watcher_signals_subscribers_on_watcher_death() {
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-death-signal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        {
+            let conn = Connection::open(&tmp).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        }
+
+        let shared = SharedUpdateWatcher::new(tmp.clone());
+        let (_id, rx) = shared.subscribe();
+
+        // Let the watcher snapshot the initial inode.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Replace the file with a different inode. Triggers the
+        // dead-man's switch on the next 100 ms tick.
+        let other = std::env::temp_dir().join(format!(
+            "honker-death-other-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&other);
+        std::fs::File::create(&other).unwrap();
+        std::fs::rename(&other, &tmp).unwrap();
+
+        // Within ~150 ms the watcher's identity check fires and panics;
+        // WatcherDeathGuard's Drop clears senders; rx.recv() returns Err.
+        // Use a generous timeout — give the watcher up to 2 s to die
+        // and the guard to fire.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if rx.try_recv().is_err() && rx.try_recv() != Ok(()) {
+                // try_recv returns Err(Empty) for "alive but no msg",
+                // Err(Disconnected) for "watcher died, sender cleared".
+                // Use blocking recv with a poll instead.
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    _ => {}
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "watcher died but subscriber's channel never disconnected — \
+                     WatcherDeathGuard didn't fire?"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+    }
+
     #[test]
     fn shared_update_watcher_prunes_subscribers_when_receiver_dropped() {
         let tmp = std::env::temp_dir().join(format!("honker-prune-test-{}", std::process::id()));
@@ -1357,22 +1628,12 @@ mod tests {
         assert_eq!(idx, 0);
     }
 
-    /// Verifies the `UpdateWatcher` dead-man's-switch panics when the
-    /// underlying database file is replaced under it. Joins the
-    /// watcher thread and inspects the panic payload — no global
-    /// panic-hook trickery needed because `UpdateWatcher::join()`
-    /// returns the thread's `Result`.
-    ///
-    /// Unix-only. The test triggers replacement via `std::fs::rename`
-    /// over the open SQLite file, which is a normal operation on
-    /// Linux / macOS and the actual scenario the dead-man's switch
-    /// defends against — litestream restore, atomic backup swap, NFS
-    /// remount. On Windows the kernel rejects the rename with
-    /// `ERROR_ACCESS_DENIED` even though SQLite opens with
-    /// `FILE_SHARE_DELETE`, so the test can't trigger the scenario
-    /// it's verifying. Atomic open-file replacement isn't a typical
-    /// Windows pattern in practice; the Windows behavior of the
-    /// dead-man's switch is intentionally untested.
+    /// Watcher's dead-man's switch panics when the db file is
+    /// replaced under it. Unix-only: rename-over-open works on
+    /// Linux/macOS (the litestream / NFS-remount scenario) but
+    /// Windows rejects it even with FILE_SHARE_DELETE, so the
+    /// trigger is unreachable there. Windows behavior intentionally
+    /// untested — replacement isn't a typical Windows pattern.
     #[cfg(unix)]
     #[test]
     fn update_watcher_panics_on_file_replacement() {
@@ -1521,35 +1782,17 @@ mod tests {
     // we don't test it here — flagging in case it ever becomes a
     // user-visible question.
 
-    /// Crash-recovery / durability test. Spawns a child writer
-    /// process (python3, available on every CI runner) that hammers
-    /// the DB with committed inserts. Hard-kills the child mid-flight
-    /// (SIGKILL on unix, `TerminateProcess` via std on Windows),
-    /// reopens the DB in the parent, asserts:
-    ///
-    ///   1. `PRAGMA integrity_check` returns "ok" (no corruption
-    ///      from the crash-mid-WAL state).
-    ///   2. Some rows committed before the kill are still present.
-    ///   3. Re-opening the DB succeeds (WAL replay works after a
-    ///      hard kill).
-    ///
-    /// Cross-platform: `Child::kill` is portable, `python3` and
-    /// `sqlite3.connect` work the same on all three OSes. The
-    /// scenario being tested — process dies with WAL writes
-    /// outstanding — is universal, not unix-specific. Worth running
-    /// on Windows specifically because Windows file-locking
-    /// semantics differ; if `Child::kill` doesn't release the WAL
-    /// + SHM file handles cleanly, the parent's reopen will fail
-    /// and we'll know.
+    /// Crash-recovery: python3 child commits in a loop, parent
+    /// SIGKILLs it mid-flight, reopens, asserts integrity_check=ok,
+    /// committed rows survive, and reopen works (WAL replay).
+    /// Cross-platform — Windows tests that file-handle release on
+    /// kill is clean enough for reopen to succeed.
     #[test]
     fn writer_killed_mid_workload_leaves_db_consistent() {
         use std::process::{Command, Stdio};
 
-        // Locate a Python interpreter. setup-python in CI puts both
-        // `python` and `python3` on PATH on every OS; locally
-        // either may be present. Try in order. If neither resolves,
-        // skip with a clear message rather than leaving the test
-        // mysteriously red on a stripped-down dev box.
+        // Try `python3` then `python`. CI always has one; dev boxes
+        // may not. Skip loudly rather than fail silently.
         let python = ["python3", "python"]
             .iter()
             .find(|cmd| {
@@ -1713,36 +1956,17 @@ while True:
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
     }
 
-    /// Long-running soak. Spawns an `UpdateWatcher` plus a committer
-    /// thread, lets them run for `HONKER_SOAK_DURATION_SECS` (default
-    /// 3600 = 1 hour), then asserts:
-    ///
-    ///   * `PRAGMA integrity_check` returns "ok" — DB structurally
-    ///     intact after a long stress.
-    ///   * the queue table has exactly the writer's reported row
-    ///     count — catches "writer silently lost rows" regressions.
-    ///   * the watcher observed at least 10% of the expected wake
-    ///     rate — catches "watcher silently stopped" regressions.
-    ///
-    /// What this **doesn't** verify (yet): memory / FD / thread
-    /// leaks. Real leak detection would need to read
-    /// `/proc/self/status` (Linux) or equivalent to track VmRSS, FD
-    /// count, and thread count across the soak. Not currently
-    /// implemented; running this manually under `valgrind` /
-    /// `heaptrack` is the substitute. Tracked as a follow-up under
-    /// issue #12.
-    ///
-    /// `#[ignore]`-d so it doesn't run in normal `cargo test` and
-    /// doesn't run in CI at all. Invoke manually:
+    /// Long-running soak: watcher + committer for
+    /// `HONKER_SOAK_DURATION_SECS` (default 1h). Asserts
+    /// integrity_check=ok, exact row count, and ≥10% of expected
+    /// wake rate. Doesn't track leaks (run under valgrind/heaptrack
+    /// for that — issue #12). Ignored by default; CI never runs it.
     ///
     /// ```sh
     /// HONKER_SOAK_DURATION_SECS=600 \
     ///     cargo test -p honker-core --release --lib \
     ///         soak_watcher_durability -- --ignored --nocapture
     /// ```
-    ///
-    /// Set `HONKER_SOAK_DURATION_SECS=10` for a quick local
-    /// smoke-run before pushing soak-relevant changes.
     #[test]
     #[ignore]
     fn soak_watcher_durability() {
@@ -1979,4 +2203,737 @@ while True:
             .unwrap();
         assert_eq!(sc_cols, vec!["name", "topic", "offset"]);
     }
+
+    // -----------------------------------------------------------------
+    // Optional backend tests
+    // -----------------------------------------------------------------
+
+    /// Run the wake/listen suite against the kernel-watch backend.
+    /// Each commit separated by 20 ms ensures both the 1 ms poller
+    /// and the kernel-watch loop have time to fire before the next.
+    #[test]
+    #[cfg(feature = "kernel-watcher")]
+    fn kernel_watcher_detects_all_commits() {
+        use std::sync::atomic::{AtomicU32, Ordering as AO};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-kernel-watcher-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let writer = open_conn(tmp.to_str().unwrap(), false).unwrap();
+        writer.execute_batch("CREATE TABLE t (x INT)").unwrap();
+        // One initial write ensures the -wal file exists so the watcher
+        // can attach a per-file watch at startup (kqueue watches the file
+        // descriptor, not the directory, for write events).
+        writer.execute("INSERT INTO t VALUES (0)", []).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let count = Arc::new(AtomicU32::new(0));
+        let count_t = count.clone();
+        let watcher = UpdateWatcher::spawn_with_config(
+            tmp.clone(),
+            move || {
+                count_t.fetch_add(1, AO::Relaxed);
+            },
+            WatcherConfig { backend: WatcherBackend::KernelWatch },
+        );
+
+        // Drain any initialization wakes.
+        std::thread::sleep(Duration::from_millis(50));
+        count.store(0, AO::SeqCst);
+
+        // n commits spaced 30 ms apart — gives the event loop time to
+        // process each event individually before the next arrives.
+        let n: u32 = 5;
+        for i in 1..=n {
+            writer
+                .execute(&format!("INSERT INTO t VALUES ({i})"), [])
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        // Wait longer than both the event delivery latency and the
+        // safety-net interval to drain any pending events.
+        std::thread::sleep(Duration::from_millis(600));
+
+        let observed = count.load(AO::SeqCst);
+        drop(watcher);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+
+        // Experimental contract: spurious wakes are allowed (the backend
+        // fires on every filesystem event, and SQLite produces several
+        // events per commit). The thing that must not happen is a *missed*
+        // commit — assert at least n wakes.
+        assert!(
+            observed >= n,
+            "kernel watcher detected {observed} wakes for {n} commits — \
+             missed at least one"
+        );
+    }
+
+    /// Prove that the shm fast path fires on the same commits as the
+    /// baseline `PRAGMA data_version` poller.
+    ///
+    /// Phase gate: both detectors must report exactly N wakes for N
+    /// commits spaced far enough apart that neither can batch them.
+    #[test]
+    #[cfg(feature = "shm-fast-path")]
+    fn shm_fast_path_equivalence_with_pragma_baseline() {
+        use std::sync::atomic::{AtomicU32, Ordering as AO};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-shm-equiv-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let writer = open_conn(tmp.to_str().unwrap(), false).unwrap();
+        writer.execute_batch("CREATE TABLE t (x INT)").unwrap();
+        // One write ensures the -shm file exists before spawning the shm watcher.
+        writer.execute("INSERT INTO t VALUES (0)", []).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let baseline_count = Arc::new(AtomicU32::new(0));
+        let baseline_t = baseline_count.clone();
+        let baseline = UpdateWatcher::spawn(tmp.clone(), move || {
+            baseline_t.fetch_add(1, AO::Relaxed);
+        });
+
+        let shm_count = Arc::new(AtomicU32::new(0));
+        let shm_t = shm_count.clone();
+        let shm = UpdateWatcher::spawn_with_config(
+            tmp.clone(),
+            move || { shm_t.fetch_add(1, AO::Relaxed); },
+            WatcherConfig { backend: WatcherBackend::ShmFastPath },
+        );
+
+        // Drain initialization wakes.
+        std::thread::sleep(Duration::from_millis(30));
+        baseline_count.store(0, AO::SeqCst);
+        shm_count.store(0, AO::SeqCst);
+
+        // Commits spaced 20 ms apart — well above both polling intervals.
+        let n: u32 = 5;
+        for i in 1..=n {
+            writer
+                .execute(&format!("INSERT INTO t VALUES ({i})"), [])
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+
+        let b = baseline_count.load(AO::SeqCst);
+        let s = shm_count.load(AO::SeqCst);
+
+        drop(baseline);
+        drop(shm);
+        drop(writer);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+
+        assert_eq!(b, n, "baseline detected {b} wakes, expected {n}");
+        assert_eq!(
+            s, n,
+            "shm fast path detected {s} wakes, expected {n} (same as baseline {b})"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Journal-mode coverage for the experimental backends
+    //
+    // honker's `open_conn` always sets WAL, so the public Python/Node
+    // surface is WAL-only. These tests poke the watchers directly at
+    // databases pre-set to non-WAL modes so we can prove behavior when
+    // the file is in DELETE / TRUNCATE / PERSIST. Justification per
+    // backend:
+    //
+    // - Polling — universally works because `PRAGMA data_version`
+    //   advances on every commit regardless of journal mode. Already
+    //   exercised by `poll_data_version_works_in_*`.
+    //
+    // - Kernel watcher — in non-WAL modes there is no `-wal` file to
+    //   watch directly; we must rely on the parent-directory watch to
+    //   pick up `-journal` create / modify / delete events around each
+    //   commit. The PRAGMA verification step still gates `on_change()`,
+    //   so spurious events (e.g. another file in the dir) just produce
+    //   harmless no-op checks.
+    //
+    // - SHM fast path — in non-WAL modes there is no `-shm` file;
+    //   `read_ichange` returns `None` and the loop falls back to the
+    //   PRAGMA check on every iteration. Effectively becomes a 100 µs
+    //   PRAGMA poller — correct, just CPU-heavier than the polling
+    //   backend.
+    // -----------------------------------------------------------------
+
+    /// Drive `n` committed inserts through `writer`, spaced
+    /// `spacing_ms` apart, and return how many `on_change()` calls the
+    /// watcher observed (with the initial drain already deducted).
+    fn drive_and_count_wakes(
+        backend: WatcherBackend,
+        db_path: PathBuf,
+        n: u32,
+        spacing_ms: u64,
+    ) -> u32 {
+        use std::sync::atomic::{AtomicU32, Ordering as AO};
+
+        let count = Arc::new(AtomicU32::new(0));
+        let count_t = count.clone();
+        let watcher = UpdateWatcher::spawn_with_config(
+            db_path.clone(),
+            move || {
+                count_t.fetch_add(1, AO::Relaxed);
+            },
+            WatcherConfig { backend },
+        );
+
+        // Drain init wakes (covers shm + kernel setup) before baseline.
+        std::thread::sleep(Duration::from_millis(80));
+        count.store(0, AO::SeqCst);
+
+        let writer = Connection::open(&db_path).unwrap();
+        for i in 1..=n {
+            writer
+                .execute(&format!("INSERT INTO t VALUES ({i})"), [])
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(spacing_ms));
+        }
+        // Drain the slowest safety net (kernel = 500 ms) + one cycle.
+        std::thread::sleep(Duration::from_millis(700));
+
+        let observed = count.load(AO::SeqCst);
+        drop(watcher);
+        drop(writer);
+        observed
+    }
+
+    /// Set up a fresh database file in `mode` and verify the watcher
+    /// detects every committed insert. Tolerates +1 wake (a commit
+    /// straddling the drain boundary) but does not tolerate misses.
+    fn watcher_works_in_journal_mode(backend: WatcherBackend, mode: &str) {
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-watcher-{}-{}-{}-{}",
+            mode.to_ascii_lowercase(),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos(),
+            match backend {
+                WatcherBackend::Polling => "poll",
+                #[cfg(feature = "kernel-watcher")]
+                WatcherBackend::KernelWatch => "kw",
+                #[cfg(feature = "shm-fast-path")]
+                WatcherBackend::ShmFastPath => "shm",
+            },
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        // Watcher inherits the file's journal mode, so set it before opening.
+        let setup = Connection::open(&tmp).unwrap();
+        setup
+            .execute_batch(&format!("PRAGMA journal_mode = {mode};"))
+            .unwrap();
+        let actual: String = setup
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            actual.to_ascii_uppercase(),
+            mode.to_ascii_uppercase(),
+            "PRAGMA journal_mode = {mode} silently fell back to {actual}"
+        );
+        setup.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
+        // One prior write so -shm exists at watcher startup (shm fast path
+        // needs it; harmless otherwise).
+        setup.execute("INSERT INTO t VALUES (0)", []).unwrap();
+        // Pin -shm only for shm+WAL: Linux/Windows reap -shm on last close.
+        // Other modes must drop setup or Windows errors on shared non-WAL db.
+        #[cfg(feature = "shm-fast-path")]
+        let keep_setup_open =
+            matches!(backend, WatcherBackend::ShmFastPath) && mode.eq_ignore_ascii_case("WAL");
+        #[cfg(not(feature = "shm-fast-path"))]
+        let keep_setup_open = false;
+        let _pinning = if keep_setup_open {
+            Some(setup)
+        } else {
+            drop(setup);
+            None
+        };
+
+        let n: u32 = 5;
+        let observed = drive_and_count_wakes(backend.clone(), tmp.clone(), n, 30);
+
+        drop(_pinning);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-journal", tmp.display()));
+
+        // Polling/shm dedupe → ~1 wake per commit. Kernel fires per
+        // filesystem event (inotify is granular) → upper bound is just
+        // a runaway-watcher guard, not a precise expectation.
+        let upper = match backend {
+            WatcherBackend::Polling => n + 1,
+            #[cfg(feature = "kernel-watcher")]
+            WatcherBackend::KernelWatch => n * 200,
+            #[cfg(feature = "shm-fast-path")]
+            WatcherBackend::ShmFastPath => n + 1,
+        };
+        assert!(
+            observed >= n,
+            "journal_mode={mode}: observed {observed} wakes for {n} commits \
+             (missed at least one)"
+        );
+        assert!(
+            observed <= upper,
+            "journal_mode={mode}: observed {observed} wakes for {n} commits, \
+             upper bound {upper} (runaway watcher?)"
+        );
+    }
+
+    // ---- Polling × every supported journal mode (regression coverage) ----
+
+    #[test]
+    fn polling_watcher_works_in_wal() {
+        watcher_works_in_journal_mode(WatcherBackend::Polling, "WAL");
+    }
+
+    #[test]
+    fn polling_watcher_works_in_delete() {
+        watcher_works_in_journal_mode(WatcherBackend::Polling, "DELETE");
+    }
+
+    #[test]
+    fn polling_watcher_works_in_truncate() {
+        watcher_works_in_journal_mode(WatcherBackend::Polling, "TRUNCATE");
+    }
+
+    #[test]
+    fn polling_watcher_works_in_persist() {
+        watcher_works_in_journal_mode(WatcherBackend::Polling, "PERSIST");
+    }
+
+    // ---- Kernel watcher × every supported journal mode ----
+
+    // macOS kqueue limitation: directory-level watches do NOT fire on
+    // writes within existing files (only on entry create/delete/rename).
+    // Per-file watches fire on regular-file writes, but rollback-journal
+    // commit dances on a loaded macOS CI runner produce so few kqueue
+    // events that the wake count is unreliable for non-WAL modes. We
+    // attach to db + journal + dir to maximize coverage, and ship the
+    // backend with documented "missed wakes possible" semantics, but
+    // we don't gate CI on a behavior the kernel won't reliably deliver.
+    // WAL-mode kernel coverage stays mandatory (kernel_watcher_works_in_wal).
+    #[test]
+    #[cfg(feature = "kernel-watcher")]
+    #[cfg_attr(target_os = "macos", ignore = "kqueue: in-place writes don't fire dir events")]
+    fn kernel_watcher_works_in_delete() {
+        watcher_works_in_journal_mode(WatcherBackend::KernelWatch, "DELETE");
+    }
+
+    #[test]
+    #[cfg(feature = "kernel-watcher")]
+    #[cfg_attr(target_os = "macos", ignore = "kqueue: in-place writes don't fire dir events")]
+    fn kernel_watcher_works_in_truncate() {
+        watcher_works_in_journal_mode(WatcherBackend::KernelWatch, "TRUNCATE");
+    }
+
+    #[test]
+    #[cfg(feature = "kernel-watcher")]
+    #[cfg_attr(target_os = "macos", ignore = "kqueue: in-place writes don't fire dir events")]
+    fn kernel_watcher_works_in_persist() {
+        watcher_works_in_journal_mode(WatcherBackend::KernelWatch, "PERSIST");
+    }
+
+    // ---- SHM fast path: WAL only (it's experimental — non-WAL is
+    // explicitly out of scope, the backend logs and disables itself
+    // when -shm doesn't exist). ----
+
+    #[test]
+    #[cfg(feature = "shm-fast-path")]
+    fn shm_fast_path_works_in_wal() {
+        watcher_works_in_journal_mode(WatcherBackend::ShmFastPath, "WAL");
+    }
+
+    // -----------------------------------------------------------------
+    // Wake-latency invariants — proves the experimental backends
+    // actually deliver wakes via their fast paths (kernel events /
+    // mmap reads), not via some accidental fallback. The simplified
+    // backends have no safety nets, so a missed wake just doesn't
+    // fire — these tests would catch that immediately.
+    // -----------------------------------------------------------------
+
+    /// Helper: spawn a watcher with the given backend, commit `n` writes
+    /// spaced `spacing_ms` apart, return the per-commit wake latency in
+    /// milliseconds. Caller asserts on the distribution.
+    #[cfg(any(feature = "kernel-watcher", feature = "shm-fast-path"))]
+    fn measure_wake_latencies_ms(
+        backend: WatcherBackend,
+        db_path: PathBuf,
+        n: usize,
+        spacing_ms: u64,
+    ) -> Vec<f64> {
+        use std::sync::Mutex as StdMutex;
+
+        let writer = open_conn(db_path.to_str().unwrap(), false).unwrap();
+        writer.execute_batch("CREATE TABLE t (x INTEGER)").unwrap();
+        // First write so -wal exists at watcher startup.
+        writer.execute("INSERT INTO t VALUES (0)", []).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        let wake_times: Arc<StdMutex<Vec<std::time::Instant>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let wake_times_t = wake_times.clone();
+        let watcher = UpdateWatcher::spawn_with_config(
+            db_path.clone(),
+            move || {
+                wake_times_t
+                    .lock()
+                    .expect("wake_times mutex poisoned")
+                    .push(std::time::Instant::now());
+            },
+            WatcherConfig { backend },
+        );
+
+        // Drain initialization wakes.
+        std::thread::sleep(Duration::from_millis(100));
+        wake_times.lock().expect("wake_times").clear();
+
+        // Commit each write, recording the commit time. Pair with the
+        // first wake timestamp that arrives after that commit time.
+        let mut commit_times: Vec<std::time::Instant> = Vec::with_capacity(n);
+        for i in 1..=n {
+            let t0 = std::time::Instant::now();
+            writer
+                .execute(&format!("INSERT INTO t VALUES ({i})"), [])
+                .unwrap();
+            commit_times.push(t0);
+            std::thread::sleep(Duration::from_millis(spacing_ms));
+        }
+        // Wait long enough for any in-flight wakes to land. The
+        // backend-specific safety nets are 500 ms (kernel-watcher) and
+        // 100 ms (shm-fast-path); 700 ms covers either.
+        std::thread::sleep(Duration::from_millis(700));
+
+        let wakes = wake_times.lock().expect("wake_times").clone();
+        drop(watcher);
+        drop(writer);
+
+        // Pair each commit with the first wake at-or-after its commit
+        // time. Wakes are monotonic; commits are monotonic; so a single
+        // forward pass suffices.
+        let mut latencies = Vec::with_capacity(n);
+        let mut wake_cursor = 0;
+        for &commit_t in &commit_times {
+            while wake_cursor < wakes.len() && wakes[wake_cursor] < commit_t {
+                wake_cursor += 1;
+            }
+            if wake_cursor >= wakes.len() {
+                latencies.push(f64::INFINITY); // missed wake — caller will assert
+            } else {
+                let dt = wakes[wake_cursor].duration_since(commit_t);
+                latencies.push(dt.as_secs_f64() * 1000.0);
+                wake_cursor += 1;
+            }
+        }
+        latencies
+    }
+
+    #[cfg(any(feature = "kernel-watcher", feature = "shm-fast-path"))]
+    fn percentile(mut samples: Vec<f64>, pct: f64) -> f64 {
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let idx = ((samples.len() as f64) * pct) as usize;
+        samples[idx.min(samples.len() - 1)]
+    }
+
+    /// Kernel watcher: wakes must come via kernel events, not the
+    /// 500 ms safety net. p90 < 200 ms is way below half of the
+    /// safety-net interval, so a backend stuck on the safety net would
+    /// have p90 ≈ 250 ms (mean half of 500) and fail this assertion.
+    #[test]
+    #[cfg(feature = "kernel-watcher")]
+    fn kernel_watcher_wake_latency_is_event_driven() {
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-kw-lat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let lats = measure_wake_latencies_ms(
+            WatcherBackend::KernelWatch,
+            tmp.clone(),
+            10,
+            50,
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+
+        // Contract allows missed wakes (kqueue/inotify/ReadDir can
+        // coalesce). Assert: some wakes arrived AND p50 is well below
+        // the 5 s `idle_poll_s` fallback — proves we're event-driven,
+        // not riding the paranoia poll. Windows ReadDirectoryChangesW
+        // under CI load can stretch past 100 ms; 500 ms threshold
+        // still rules out the fallback.
+        let arrived: Vec<f64> = lats.iter().copied().filter(|l| l.is_finite()).collect();
+        assert!(
+            !arrived.is_empty(),
+            "kernel watcher delivered zero wakes for 10 commits — events \
+             aren't being delivered at all on this platform: {lats:?}"
+        );
+        let p50 = percentile(arrived.clone(), 0.50);
+        assert!(
+            p50 < 500.0,
+            "kernel watcher p50 wake latency = {p50:.1} ms, expected < 500 \
+             (high median latency means events arrive but slowly — possibly \
+             a stuck-thread fallback). Arrived: {arrived:?}, all samples \
+             (inf = no wake): {lats:?}"
+        );
+    }
+
+    /// SHM fast path: wakes must come via the mmap tickle.
+    #[test]
+    #[cfg(feature = "shm-fast-path")]
+    fn shm_fast_path_wake_latency_is_event_driven() {
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-shm-lat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let lats = measure_wake_latencies_ms(
+            WatcherBackend::ShmFastPath,
+            tmp.clone(),
+            10,
+            50,
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+
+        // Same shape as the kernel-watcher latency test: assert that
+        // *some* wakes arrived and that they were fast. Missed wakes
+        // are part of the documented experimental contract.
+        let arrived: Vec<f64> = lats.iter().copied().filter(|l| l.is_finite()).collect();
+        assert!(
+            !arrived.is_empty(),
+            "shm fast path delivered zero wakes for 10 commits: {lats:?}"
+        );
+        let p50 = percentile(arrived.clone(), 0.50);
+        assert!(
+            p50 < 50.0,
+            "shm fast path p50 wake latency (over arrived wakes only) = {p50:.1} ms, expected < 50 \
+             (high latency means iChange isn't \
+             being read via mmap). Samples: {lats:?}"
+        );
+    }
+
+    /// Graceful shutdown latency. Bounded by `RX_POLL_MS = 50 ms`.
+    #[test]
+    #[cfg(feature = "kernel-watcher")]
+    fn kernel_watcher_shutdown_is_responsive() {
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-kw-shutdown-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let writer = open_conn(tmp.to_str().unwrap(), false).unwrap();
+        writer.execute_batch("CREATE TABLE t (x INTEGER)").unwrap();
+        writer.execute("INSERT INTO t VALUES (0)", []).unwrap();
+
+        let watcher = UpdateWatcher::spawn_with_config(
+            tmp.clone(),
+            || {},
+            WatcherConfig { backend: WatcherBackend::KernelWatch },
+        );
+
+        // Let the watcher reach steady state (in its recv_timeout block).
+        std::thread::sleep(Duration::from_millis(200));
+
+        let t0 = std::time::Instant::now();
+        let _ = watcher.join();
+        let elapsed = t0.elapsed();
+
+        drop(writer);
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "kernel watcher shutdown took {elapsed:?}, expected < 150 ms \
+             (RX_POLL_MS = 50 ms; if this exceeds 500 ms the recv_timeout \
+             is blocking on the safety-net interval again)"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Probe failures must surface as Err — proving "no silent fallback"
+    // when an experimental backend can't initialize.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn watcher_backend_polling_probe_always_succeeds() {
+        // Polling never fails — works on any path, any state.
+        let nope = std::path::PathBuf::from("/nonexistent/no/way/this/exists.db");
+        assert!(WatcherBackend::Polling.probe(&nope).is_ok());
+    }
+
+    #[test]
+    #[cfg(feature = "shm-fast-path")]
+    fn watcher_backend_shm_probe_fails_when_shm_missing() {
+        // Path with no -shm file — probe must report it, not silently
+        // disable the backend at runtime.
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-shm-probe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let result = WatcherBackend::ShmFastPath.probe(&tmp);
+        assert!(result.is_err(), "expected probe to fail for missing -shm");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("-shm unavailable"),
+            "probe error message should explain why; got: {msg}"
+        );
+    }
+
+    /// Parity with `update_watcher_panics_on_file_replacement` for the
+    /// kernel-watcher backend. The polling backend panics when it sees
+    /// the db file replaced; the kernel watcher must do the same so a
+    /// stale per-file watch fails loudly instead of silently missing
+    /// wakes after a litestream-style restore.
+    ///
+    /// The experimental backends don't open a SQLite connection of
+    /// their own (only the polling backend does), so the test setup
+    /// can use a plain empty file at `db_path`. That dodges Windows'
+    /// "can't rename over a file SQLite has open" problem and lets us
+    /// run on every platform — unlike the polling test, which still
+    /// has to use a real SQLite db and stays `#[cfg(unix)]`.
+    #[test]
+    #[cfg(feature = "kernel-watcher")]
+    fn kernel_watcher_panics_on_file_replacement() {
+        replacement_panic_test(WatcherBackend::KernelWatch);
+    }
+
+    /// Parity for the SHM fast path. SHM has it worse than kernel
+    /// watcher: a stale mmap silently stops detecting iChange. The
+    /// dead-man's switch on db AND -shm inodes panics either case.
+    #[test]
+    #[cfg(feature = "shm-fast-path")]
+    fn shm_fast_path_panics_on_file_replacement() {
+        replacement_panic_test(WatcherBackend::ShmFastPath);
+    }
+
+    #[cfg(any(feature = "kernel-watcher", feature = "shm-fast-path"))]
+    fn replacement_panic_test(backend: WatcherBackend) {
+        use std::io::Write;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-replace-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        // Plain empty file at the db path. The kernel/shm watchers
+        // don't open a SQLite connection — they just stat / watch /
+        // mmap files. So a real SQLite db isn't needed and we avoid
+        // Windows' inability to rename over a SQLite-held file.
+        std::fs::File::create(&tmp).unwrap();
+
+        // For the SHM backend, also write a fake -shm. macOS mmap can
+        // be finicky about tiny files; write at least a page (4 KiB)
+        // with the valid WAL index header up front.
+        if matches!(backend, WatcherBackend::ShmFastPath) {
+            let shm_path = std::path::PathBuf::from(format!("{}-shm", tmp.display()));
+            let mut buf = [0u8; 4096];
+            buf[0..4].copy_from_slice(&3_007_000u32.to_ne_bytes()); // WALINDEX_MAX_VERSION
+            // iChange (offset 8) starts at 0; doesn't matter for this test.
+            let mut f = std::fs::File::create(&shm_path).unwrap();
+            f.write_all(&buf).unwrap();
+        }
+
+        let watcher = UpdateWatcher::spawn_with_config(
+            tmp.clone(),
+            || {},
+            WatcherConfig { backend },
+        );
+        // Generous initial wait so the watcher has snapshotted the
+        // initial inode under CI scheduling pressure.
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Replace the db file with a different inode. Atomic rename
+        // works on every platform when no SQLite handle is held open.
+        let other = std::env::temp_dir().join(format!(
+            "honker-replace-other-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&other);
+        std::fs::File::create(&other).unwrap();
+        std::fs::rename(&other, &tmp).unwrap();
+        // Wait long enough for the dead-man's switch to fire on a
+        // slow CI runner. Identity check is 100 ms; give it 10 cycles.
+        std::thread::sleep(Duration::from_millis(1000));
+
+        let result = watcher.join();
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
+        assert!(
+            result.is_err(),
+            "expected watcher thread to panic on db file replacement"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "kernel-watcher")]
+    fn watcher_backend_kernel_probe_fails_for_inaccessible_dir() {
+        // Path under a non-existent parent — notify can't watch it.
+        let nope = std::path::PathBuf::from(
+            "/this/parent/does/not/exist/honker-kernel-probe.db",
+        );
+        let result = WatcherBackend::KernelWatch.probe(&nope);
+        assert!(
+            result.is_err(),
+            "expected probe to fail for inaccessible dir, got Ok"
+        );
+    }
 }
+

@@ -700,8 +700,8 @@ class Database {
 }
 
 module.exports = function buildApi(nativeBinding) {
-  function open(path, maxReaders) {
-    return new Database(nativeBinding.open(path, maxReaders));
+  function open(path, maxReaders, watcherBackend) {
+    return new Database(nativeBinding.open(path, maxReaders, watcherBackend));
   }
 
   return {

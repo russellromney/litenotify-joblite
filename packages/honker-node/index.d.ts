@@ -65,4 +65,16 @@ export declare class UpdateEvents {
   close(): void
 }
 
-export declare function open(path: string, maxReaders?: number | undefined | null): Database
+/**
+ * Open a Honker database at `path`.
+ *
+ * `watcherBackend` selects the update-detection strategy:
+ * - omitted / `"polling"` — default 1 ms PRAGMA polling
+ * - `"kernel"` — kernel filesystem notifications (experimental)
+ * - `"shm"` — mmap `-shm` fast path (experimental)
+ *
+ * Experimental backends require the corresponding Cargo feature; if a
+ * build doesn't include them, requesting one logs a warning and falls
+ * back to polling.
+ */
+export declare function open(path: string, maxReaders?: number | undefined | null, watcherBackend?: string | undefined | null): Database

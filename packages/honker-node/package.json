@@ -31,7 +31,7 @@
   "scripts": {
     "build": "napi build --platform --release",
     "build:debug": "napi build --platform",
-    "test": "node --test test/basic.js test/parity.test.js test/cross_lang_python_to_node.js test/cross_lang_node_to_python.js test/cross_lang_supporting.js"
+    "test": "node --test test/basic.js test/parity.test.js test/cross_lang_python_to_node.js test/cross_lang_node_to_python.js test/cross_lang_supporting.js test/watcher_backends.js test/watcher_backends_e2e.js"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.0.0"

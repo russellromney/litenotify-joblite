@@ -7,9 +7,20 @@ from collections import deque
 from typing import Any, AsyncIterator, Callable, Optional
 
 
-def _core_open(path, max_readers):
+def _core_open(path, max_readers, watcher_backend=None):
     from honker._honker_native import open as _open
-    return _open(path, max_readers=max_readers)
+    return _open(path, max_readers=max_readers, watcher_backend=watcher_backend)
+
+
+async def _raise_if_dead(awaitable):
+    """Awaits the underlying queue coroutine. If the watcher pushed a
+    BaseException sentinel (dead-man's switch fired — db file replaced
+    or watcher panic), re-raise it; otherwise return the value (None
+    on a normal commit tick)."""
+    value = await awaitable
+    if isinstance(value, BaseException):
+        raise value
+    return value
 
 
 class Notification:
@@ -1162,8 +1173,26 @@ class Database:
         )
 
 
-def open(path: str, max_readers: int = 8) -> Database:
-    return Database(_core_open(path, max_readers=max_readers))
+def open(
+    path: str,
+    max_readers: int = 8,
+    watcher_backend: Optional[str] = None,
+) -> Database:
+    """Open a Honker database at `path`.
+
+    `watcher_backend` selects the update-detection strategy:
+      * `None` (default) — 1 ms `PRAGMA data_version` polling
+      * `"kernel"` — kernel filesystem notifications (experimental,
+        requires the `kernel-watcher` Cargo feature)
+      * `"shm"` — mmap `-shm` fast path (experimental, requires the
+        `shm-fast-path` Cargo feature)
+
+    Wheels not built with the experimental features silently fall back
+    to polling when one is requested.
+    """
+    return Database(_core_open(
+        path, max_readers=max_readers, watcher_backend=watcher_backend
+    ))
 
 
 class _WorkerQueueIter:

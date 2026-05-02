@@ -27,7 +27,7 @@
 //! update watcher all come from the shared `honker-core` rlib so the
 //! PyO3, SQLite-extension, and Node bindings can't drift apart.
 
-use honker_core::{Readers, SharedUpdateWatcher, Writer, open_conn};
+use honker_core::{Readers, SharedUpdateWatcher, WatcherConfig, Writer, open_conn};
 use napi::Result;
 use napi_derive::napi;
 use parking_lot::Mutex;
@@ -39,6 +39,16 @@ use std::sync::Arc;
 
 fn napi_err(e: impl std::fmt::Display) -> napi::Error {
     napi::Error::new(napi::Status::GenericFailure, e.to_string())
+}
+
+fn parse_watcher_backend(backend: Option<String>) -> Result<WatcherConfig> {
+    honker_core::WatcherBackend::parse(backend.as_deref())
+        .map(|backend| WatcherConfig { backend })
+        .map_err(|other| {
+            napi_err(format!(
+                "unknown watcherBackend {other:?}; valid: null, 'polling', 'kernel', 'shm'"
+            ))
+        })
 }
 
 // ---------- JSON <-> SQL param conversion ----------
@@ -118,6 +128,9 @@ pub struct Database {
     /// Database regardless of how many `updateEvents()` subscribers. See
     /// honker-core::SharedUpdateWatcher.
     shared_watcher: Arc<Mutex<Option<Arc<SharedUpdateWatcher>>>>,
+    /// Watcher backend chosen at `open()` time. Stored so the lazy
+    /// `updateEvents()` initialization picks up the right backend.
+    watcher_config: WatcherConfig,
 }
 
 #[napi]
@@ -171,7 +184,10 @@ impl Database {
             if let Some(existing) = guard.as_ref() {
                 existing.clone()
             } else {
-                let w = Arc::new(SharedUpdateWatcher::new(self.db_path.clone()));
+                let w = Arc::new(SharedUpdateWatcher::new_with_config(
+                    self.db_path.clone(),
+                    self.watcher_config.clone(),
+                ));
                 *guard = Some(w.clone());
                 w
             }
@@ -416,9 +432,24 @@ impl UpdateEvents {
 
 // ---------- module entry ----------
 
+/// Open a Honker database at `path`.
+///
+/// `watcherBackend` selects the update-detection strategy:
+/// - omitted / `"polling"` — default 1 ms PRAGMA polling
+/// - `"kernel"` — kernel filesystem notifications (experimental)
+/// - `"shm"` — mmap `-shm` fast path (experimental)
+///
+/// Experimental backends require the corresponding Cargo feature; if a
+/// build doesn't include them, requesting one logs a warning and falls
+/// back to polling.
 #[napi]
-pub fn open(path: String, max_readers: Option<u32>) -> Result<Database> {
+pub fn open(
+    path: String,
+    max_readers: Option<u32>,
+    watcher_backend: Option<String>,
+) -> Result<Database> {
     let max_readers = max_readers.unwrap_or(8).max(1) as usize;
+    let watcher_config = parse_watcher_backend(watcher_backend)?;
     let writer_conn = open_conn(&path, true).map_err(napi_err)?;
     // Register every honker_* SQL scalar on the writer connection so
     // Node callers get the full queue / scheduler / stream surface
@@ -426,10 +457,20 @@ pub fn open(path: String, max_readers: Option<u32>) -> Result<Database> {
     // Matches the Python binding's open() — parity across languages.
     honker_core::attach_honker_functions(&writer_conn).map_err(napi_err)?;
     honker_core::bootstrap_honker_schema(&writer_conn).map_err(napi_err)?;
+    // Probe the chosen backend now (after the writer connection has
+    // created -wal / -shm in WAL mode). Failures throw from open() so a
+    // backend that can't run never silently produces no wakes.
+    let db_path: PathBuf = path.into();
+    if let Err(reason) = watcher_config.backend.probe(&db_path) {
+        return Err(napi_err(format!(
+            "watcherBackend probe failed: {reason}"
+        )));
+    }
     Ok(Database {
         writer: Arc::new(Writer::new(writer_conn)),
-        readers: Arc::new(Readers::new(path.clone(), max_readers)),
-        db_path: path.into(),
+        readers: Arc::new(Readers::new(db_path.to_string_lossy().into_owned(), max_readers)),
+        db_path,
         shared_watcher: Arc::new(Mutex::new(None)),
+        watcher_config,
     })
 }
