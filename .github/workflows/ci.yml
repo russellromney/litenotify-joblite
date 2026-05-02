@@ -381,6 +381,8 @@ jobs:
           mix test
       - name: Run Ruby ↔ Python interop
         shell: bash
+        env:
+          HONKER_REQUIRE_INTEROP: "1"
         run: |
           . .venv/bin/activate
           python -m pytest tests/test_ruby_python_interop.py -q --tb=short

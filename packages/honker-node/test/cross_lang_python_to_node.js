@@ -6,7 +6,12 @@ const fs = require('node:fs');
 
 const honker = require('..');
 const { createTempDb } = require('./helpers');
-const { PACKAGES, spawnPython, stopChild } = require('./cross_lang_shared');
+const {
+  PACKAGES,
+  spawnPython,
+  stopChild,
+  waitForExit,
+} = require('./cross_lang_shared');
 
 async function waitForGone(dir, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
@@ -65,7 +70,7 @@ with db.transaction() as tx:
       }
     }
 
-    await new Promise((resolve) => proc.on('exit', resolve));
+    await waitForExit(proc);
     assert.deepEqual(received, [1, 2, 3]);
   } finally {
     ev?.close();
@@ -84,11 +89,11 @@ test(
       honker.open.bind(honker),
     );
     let db;
-      let ev;
-      let proc;
-      let cleaned = false;
-      try {
-        db = open(dbPath);
+    let ev;
+    let proc;
+    let cleaned = false;
+    try {
+      db = open(dbPath);
       ev = db.updateEvents();
       let lastSeen = 0;
       const initial = db.query(
@@ -122,7 +127,7 @@ with db.transaction() as tx:
       ev = null;
       db.close();
       db = null;
-      await new Promise((resolve) => proc.on('exit', resolve));
+      await waitForExit(proc);
       const removedNow = cleanup();
       cleaned = true;
       const gone = removedNow || (await waitForGone(dir));

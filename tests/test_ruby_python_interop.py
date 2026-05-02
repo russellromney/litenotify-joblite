@@ -54,14 +54,18 @@ EXT_PATH = _extension_path()
 RUBY_CMD = _ruby_command()
 
 
-pytestmark = pytest.mark.skipif(
-    EXT_PATH is None or not _ruby_ready(RUBY_CMD),
-    reason=(
+def _require_ruby_interop():
+    reason = (
         "Ruby binding unavailable, or honker-extension missing; run "
         "`cargo build -p honker-extension --release` and "
         "`bundle install` in packages/honker-ruby"
-    ),
-)
+    )
+    ready = EXT_PATH is not None and _ruby_ready(RUBY_CMD)
+    if ready:
+        return
+    if os.environ.get("HONKER_REQUIRE_INTEROP") == "1":
+        pytest.fail(reason)
+    pytest.skip(reason)
 
 
 def _run_ruby(script, db_path):
@@ -81,6 +85,7 @@ def _run_ruby(script, db_path):
 
 
 def test_ruby_and_python_share_queue_stream_and_notification_tables(tmp_path):
+    _require_ruby_interop()
     db_path = tmp_path / "ruby-python.db"
 
     _run_ruby(
