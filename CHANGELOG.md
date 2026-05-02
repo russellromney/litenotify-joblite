@@ -1,5 +1,29 @@
 # CHANGELOG
 
+## Unreleased — in-tree bindings and .NET
+
+- Moved maintained bindings into the main Honker repo as normal
+  `packages/` directories. `site/` remains the only submodule.
+- Added the official .NET / C# binding under `packages/honker-dotnet`
+  with Linux, macOS, and Windows CI plus NuGet packaging smoke tests.
+- Root CI now owns the maintained binding checks, including Python,
+  Node, .NET, Rust core/extension, aggregate Linux binding smoke, and
+  Ruby <-> Python interop.
+- Pruned third-party C++ source blobs from the repo. The C++ binding now
+  uses package-manager SQLite and `nlohmann-json` dependencies instead
+  of vendored SQLite / JSON headers.
+- Updated the roadmap so release automation is tracked separately from
+  later 1.0 work.
+
+## Unreleased — time-based watcher identity checks
+
+- Switched `UpdateWatcher` file-identity checks from loop-count timing
+  to `Instant`-based timing.
+- This keeps the dead-man replacement check near its intended cadence
+  on platforms where short sleeps round up, especially Windows.
+- Tightened the file-replacement regression test now that it no longer
+  needs multi-second sleeps to cover timer granularity.
+
 ## Unreleased — time-trigger scheduler and wake parity
 
 Moved the completed Phase Timekeeper / time-trigger scheduler work out
