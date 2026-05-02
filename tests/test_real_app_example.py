@@ -23,3 +23,4 @@ async def test_real_app_example_proves_request_worker_stream_notify_scheduler(db
     assert proof.stream_event == {"order_id": 1, "kind": "created"}
     assert proof.notification == {"order_id": 1, "kind": "created"}
     assert proof.scheduler_payload == {"task": "prune_notifications"}
+    assert proof.worker_wake_ms < 5000.0
