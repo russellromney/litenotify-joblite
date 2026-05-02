@@ -28,6 +28,11 @@
   and `updateEvents().next() rejects when watcher dies` (Node), each
   parameterized over polling/kernel/shm. Skipped on Windows because
   the kernel rejects rename-over-open even with `FILE_SHARE_DELETE`.
+- Polling soak: 600 s run on macOS / Apple Silicon under sustained
+  ~75 commits/sec. Writer committed 45,269 rows; watcher observed
+  45,354 wakes (every commit, plus ~85 init/spurious); `PRAGMA
+  integrity_check = ok`. No drift, no leaks observed during the run.
+  Kernel and shm have no soak data yet — covered by Phase Atlas.
 
 ## Unreleased — in-tree bindings and .NET
 
