@@ -673,10 +673,8 @@ where
             (0, 0)
         }
     };
-    // Time-tracked identity check (instead of tick counting). Windows'
-    // 1 ms sleep can round up to ~15 ms, so 100 ticks could mean
-    // 1.5 s instead of 100 ms. Instant-based timing is platform-
-    // consistent. Constant defined alongside UpdateWatcher above.
+    // Wall-clock cadence: tick counting drifts on Windows where 1 ms
+    // sleeps round up to ~15 ms.
     let mut next_identity_check = Instant::now() + UPDATE_WATCHER_IDENTITY_INTERVAL;
 
     while !stop.load(Ordering::Acquire) {
@@ -719,18 +717,10 @@ where
             }
         }
 
-        // Path 3: stat identity check (dead-man's switch).
-        //
-        // Triggers on Linux/macOS scenarios that swap the
-        // db file out from under us — atomic rename
-        // (litestream restore), volume remount, NFS
-        // server restart. On Windows the kernel rejects
-        // rename-over-open even with `FILE_SHARE_DELETE`,
-        // so the practical replacement scenarios that
-        // trigger this on unix don't happen in the same
-        // way; the dead-man's switch is effectively a
-        // no-op on Windows. Identity check still runs,
-        // it just rarely sees a difference.
+        // Path 3: dead-man's switch — panic if db inode changed
+        // (atomic rename, litestream restore, volume remount, NFS).
+        // Effectively a no-op on Windows: the kernel rejects
+        // rename-over-open files.
         let now = Instant::now();
         if now >= next_identity_check {
             next_identity_check = now + UPDATE_WATCHER_IDENTITY_INTERVAL;
@@ -2219,14 +2209,10 @@ while True:
             WatcherConfig { backend },
         );
 
-        // Drain initialization wakes. The interval needs to cover the
-        // shm-fast-path's first PRAGMA fallback round and the kernel
-        // watcher's setup before we lock in the baseline.
+        // Drain init wakes (covers shm + kernel setup) before baseline.
         std::thread::sleep(Duration::from_millis(80));
         count.store(0, AO::SeqCst);
 
-        // Use a fresh writer connection — the watcher's reader connection
-        // already inherits the on-disk journal mode of the file.
         let writer = Connection::open(&db_path).unwrap();
         for i in 1..=n {
             writer
@@ -2234,9 +2220,7 @@ while True:
                 .unwrap();
             std::thread::sleep(Duration::from_millis(spacing_ms));
         }
-        // Wait long enough to drain the slowest backend's safety net
-        // (kernel watcher = 500 ms) plus one extra cycle for any
-        // delayed event delivery.
+        // Drain the slowest safety net (kernel = 500 ms) + one cycle.
         std::thread::sleep(Duration::from_millis(700));
 
         let observed = count.load(AO::SeqCst);
@@ -2257,8 +2241,6 @@ while True:
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .subsec_nanos(),
-            // Distinguish backends so two parameterized tests in the
-            // same process can't collide on the temp path.
             match backend {
                 WatcherBackend::Polling => "poll",
                 #[cfg(feature = "kernel-watcher")]
@@ -2269,8 +2251,7 @@ while True:
         ));
         let _ = std::fs::remove_file(&tmp);
 
-        // Establish the journal mode on the file before the watcher opens
-        // its read-only connection (which inherits the file's mode).
+        // Watcher inherits the file's journal mode, so set it before opening.
         let setup = Connection::open(&tmp).unwrap();
         setup
             .execute_batch(&format!("PRAGMA journal_mode = {mode};"))
@@ -2284,19 +2265,11 @@ while True:
             "PRAGMA journal_mode = {mode} silently fell back to {actual}"
         );
         setup.execute("CREATE TABLE t (x INTEGER)", []).unwrap();
-        // For the SHM fast path: even in WAL we want one prior write so
-        // the -shm exists at watcher startup. In non-WAL modes this is a
-        // no-op for the shm path (no file ever exists), but it does
-        // ensure the directory has at least one prior journal life-cycle
-        // so the kernel watcher's directory watch is attached cleanly.
+        // One prior write so -shm exists at watcher startup (shm fast path
+        // needs it; harmless otherwise).
         setup.execute("INSERT INTO t VALUES (0)", []).unwrap();
-        // Whether to keep the setup connection open across
-        // drive_and_count_wakes:
-        //   - shm + WAL: yes — the shm backend needs -shm to exist at
-        //     startup, and Linux/Windows clean it up on
-        //     last-connection-close (macOS often doesn't).
-        //   - everything else: no — Windows hits "disk I/O error"
-        //     when two connections share a non-WAL db.
+        // Pin -shm only for shm+WAL: Linux/Windows reap -shm on last close.
+        // Other modes must drop setup or Windows errors on shared non-WAL db.
         #[cfg(feature = "shm-fast-path")]
         let keep_setup_open =
             matches!(backend, WatcherBackend::ShmFastPath) && mode.eq_ignore_ascii_case("WAL");
@@ -2318,15 +2291,9 @@ while True:
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-journal", tmp.display()));
 
-        // Backend-specific upper bounds. The polling backend dedupes on
-        // data_version, so it produces ~1 wake per commit. The
-        // experimental kernel backend fires on every filesystem event;
-        // Linux inotify is granular (header write + data write + fsync
-        // each fire separately, plus -shm updates), so up to ~100 per
-        // commit is normal. Spurious wakes are a documented part of
-        // the experimental contract — consumers re-read state and
-        // dedupe. We keep an upper bound at all only to catch a truly
-        // runaway watcher (infinite loop, unbounded retry, etc.).
+        // Polling/shm dedupe → ~1 wake per commit. Kernel fires per
+        // filesystem event (inotify is granular) → upper bound is just
+        // a runaway-watcher guard, not a precise expectation.
         let upper = match backend {
             WatcherBackend::Polling => n + 1,
             #[cfg(feature = "kernel-watcher")]

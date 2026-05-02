@@ -57,22 +57,12 @@ where
         }
     };
 
-    // Attach watches at startup. We watch:
-    //   - the db file itself — fires on in-place writes in every
-    //     journal mode (non-WAL especially needs this; macOS kqueue
-    //     on a parent dir does NOT fire on writes inside existing
-    //     entries, only on entry create/delete/rename, so PERSIST/
-    //     TRUNCATE produce zero dir events)
-    //   - the parent directory — catches journal/wal/shm create+
-    //     delete around commits in DELETE mode and any other entry
-    //     churn
-    //   - -wal/-shm/-journal directly if they exist — fires on writes
-    //     within these sidecar files
-    //
-    // No re-attach logic if files come and go mid-flight. That's the
-    // experimental tradeoff — if a sidecar is unlinked and recreated,
-    // the per-file watch goes stale and the consumer's `idle_poll_s`
-    // backstop catches up. Restart the process to recover the fast path.
+    // Attach watches: db file (catches in-place writes, the only signal
+    // for non-WAL on macOS kqueue), parent dir (catches journal/wal/shm
+    // create+delete in DELETE mode), and -wal/-shm/-journal directly
+    // when present. No re-attach if files churn mid-flight — the
+    // per-file watch goes stale and the consumer's `idle_poll_s`
+    // backstop covers it. Experimental: restart to recover.
     let watch_dir = db_path
         .parent()
         .unwrap_or(std::path::Path::new("."))
@@ -92,12 +82,9 @@ where
         return;
     }
 
-    // Dead-man's switch: same as the polling backend. Snapshot the db
-    // file's inode at startup; if it changes mid-flight (atomic
-    // rename, litestream restore, NFS remount), panic with a clear
-    // message. The watcher's per-file -wal/-shm watches would be on
-    // the old inode and silently miss writes to the new one — louder
-    // failure is better than silent miss.
+    // Dead-man's switch: snapshot db inode; panic if it changes
+    // (atomic rename, litestream restore, NFS remount). Per-file
+    // watches would silently sit on the dead inode otherwise.
     let initial_id = match stat_identity(&db_path) {
         Ok(id) => id,
         Err(e) => {
@@ -129,12 +116,7 @@ where
 }
 
 /// Panics if the db file at `db_path` has been replaced since startup.
-/// Same shape, same message, and same stat-error behavior as the
-/// polling backend's check (`run_poll_loop`) so failures look
-/// identical regardless of which backend the user picked.
-///
-/// Returns `true` if the caller should fire a conservative `on_change`
-/// (matches polling's "stat error → wake consumer to re-check" path).
+/// Returns `true` on stat error so caller can fire a conservative wake.
 fn check_db_identity(db_path: &std::path::Path, initial: (u64, u64)) -> bool {
     match stat_identity(db_path) {
         Ok(current) => {
@@ -156,9 +138,8 @@ fn check_db_identity(db_path: &std::path::Path, initial: (u64, u64)) -> bool {
     }
 }
 
-/// Verify the kernel watcher can run for this `db_path`. Called from
-/// `WatcherBackend::probe` at `honker.open()` time so a misconfigured
-/// backend errors immediately rather than silently producing no wakes.
+/// Probe at `honker.open()` so a misconfigured backend errors
+/// immediately instead of silently producing no wakes.
 pub(crate) fn probe(db_path: &std::path::Path) -> Result<(), String> {
     let (tx, _rx) = mpsc::channel::<notify::Result<notify::Event>>();
     let mut w = notify::recommended_watcher(tx)

@@ -88,11 +88,8 @@ where
     let read_ichange = || u32::from_ne_bytes(mmap[ICHANGE_OFFSET..ICHANGE_OFFSET + 4].try_into().unwrap());
     let mut last = read_ichange();
 
-    // Dead-man's switch: snapshot db and -shm inodes at startup; if
-    // either changes mid-flight, panic. Both go stale silently
-    // otherwise — the mmap stays on the old -shm inode and iChange
-    // never advances again. Same cadence as the polling backend so
-    // file-replacement detection latency doesn't depend on backend.
+    // Dead-man's switch: snapshot db + -shm inodes; panic on change.
+    // Without this the mmap silently sits on a dead -shm inode.
     let initial_db_id = match stat_identity(&db_path) {
         Ok(id) => id,
         Err(e) => {
@@ -119,10 +116,8 @@ where
         let now = Instant::now();
         if now >= next_identity_check {
             next_identity_check = now + IDENTITY_CHECK_INTERVAL;
-            // Either stat error or successful inode-unchanged result
-            // returns false; only an actual replacement panics. If
-            // either stat errored, fire a conservative on_change so
-            // the consumer re-checks state — matches polling.
+            // check_identity panics on actual replacement; returns true
+            // on stat error so we fire a conservative wake.
             let any_err = check_identity(&db_path, initial_db_id, "database file")
                 | check_identity(&shm_path, initial_shm_id, "-shm file");
             if any_err {
@@ -132,13 +127,9 @@ where
     }
 }
 
-/// Panics if the file at `path` has been replaced since startup. Used
-/// for both the db file (parity with polling backend's dead-man's
-/// switch) and the -shm file (specific failure mode for this backend
-/// — a recreated -shm leaves our mmap on a deleted inode).
-///
-/// Returns `true` on stat error so the caller can fire a conservative
-/// `on_change` (matches polling's "stat error → wake to re-check" path).
+/// Panics if `path` has been replaced since startup (db file: parity
+/// with polling; -shm: a recreated -shm leaves our mmap on a dead
+/// inode). Returns `true` on stat error → caller fires conservative wake.
 fn check_identity(path: &std::path::Path, initial: (u64, u64), label: &str) -> bool {
     match stat_identity(path) {
         Ok(current) => {
@@ -160,9 +151,8 @@ fn check_identity(path: &std::path::Path, initial: (u64, u64), label: &str) -> b
     }
 }
 
-/// Verify the shm fast path can run for this `db_path`. Called from
-/// `WatcherBackend::probe` at `honker.open()` time so a misconfigured
-/// backend errors immediately rather than silently producing no wakes.
+/// Probe at `honker.open()` so a misconfigured backend errors
+/// immediately instead of silently producing no wakes.
 pub(crate) fn probe(db_path: &std::path::Path) -> Result<(), String> {
     if cfg!(target_endian = "big") {
         return Err("shm-fast-path requires little-endian platform".into());
