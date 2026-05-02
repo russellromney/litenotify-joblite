@@ -271,6 +271,10 @@ If the requested backend can't initialize (e.g., shm needs WAL + open conn; kern
 
 All three backends share the same dead-man's switch: `stat(db_path)` every 100 ms, panic on inode change (atomic rename, litestream restore, NFS remount). The shm backend additionally panics on `-shm` inode change. Failure is loud — never silent missed wakes after replacement.
 
+When the watcher thread panics, every active subscriber's wake channel goes `Disconnected`, so consumers learn about it programmatically (via `Err` from `update_events()`) — not only as an `eprintln` in stderr. After a panic, recovery is "close the Database and reopen with `honker.open(...)`."
+
+Note for litestream / restore-style workflows: a successful restore that atomically replaces the db file looks identical to file replacement and will trigger the panic. This is the same behavior the polling backend has had — recover by recreating your `Database` instance after restore. Detect via the `Disconnected` signal on `update_events()`.
+
 **To build with the features (source builds only):**
 
 ```bash

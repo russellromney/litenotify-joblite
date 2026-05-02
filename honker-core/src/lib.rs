@@ -711,7 +711,8 @@ where
                             "honker: database file replaced: \
                              expected (dev={}, ino={}), \
                              found (dev={}, ino={}) at {:?}. \
-                             Restart required.",
+                             The watcher cannot recover; \
+                             close the Database and reopen with honker.open().",
                             initial_identity.0,
                             initial_identity.1,
                             current.0,
@@ -828,6 +829,22 @@ impl Drop for UpdateWatcher {
 /// consumer re-reads state from SQLite on each wake — so dropping
 /// during backpressure is safe. A disconnected subscriber (receiver
 /// dropped) gets pruned on the next wake via `TrySendError::Disconnected`.
+/// Captured by the watcher thread's closure. When the closure is
+/// dropped (clean exit OR panic), this guard's Drop fires and clears
+/// every subscriber's sender, forcing their next `recv()` to return
+/// `Err(RecvError)`. That's how subscribers learn the watcher died —
+/// without this, a panicking watcher would leave subscribers blocking
+/// forever and the panic would only show up as an eprintln in stderr.
+struct WatcherDeathGuard {
+    senders: Arc<Mutex<HashMap<u64, SyncSender<()>>>>,
+}
+
+impl Drop for WatcherDeathGuard {
+    fn drop(&mut self) {
+        self.senders.lock().clear();
+    }
+}
+
 pub struct SharedUpdateWatcher {
     /// Hold the underlying poll thread alive. Dropping or
     /// [`close`](Self::close)ing this stops it. Wrapped in
@@ -855,9 +872,18 @@ impl SharedUpdateWatcher {
         let senders: Arc<Mutex<HashMap<u64, SyncSender<()>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let senders_t = senders.clone();
+        // Captured by the watcher closure: when the watcher thread
+        // exits (clean stop OR panic from the dead-man's switch), the
+        // closure is dropped, this guard's Drop fires, and we clear
+        // every subscriber's sender. Subscribers' next `recv()` then
+        // returns `Err(RecvError)` instead of blocking forever — they
+        // get a programmatic signal that the watcher died, not just an
+        // eprintln in stderr they may never see.
+        let death_guard = WatcherDeathGuard { senders: senders.clone() };
         let watcher = UpdateWatcher::spawn_with_config(
             db_path,
             move || {
+                let _ = &death_guard;
                 let mut list = senders_t.lock();
                 list.retain(|_id, s| match s.try_send(()) {
                     Ok(()) | Err(TrySendError::Full(_)) => true,
@@ -1107,6 +1133,77 @@ mod tests {
         assert!(rx.recv().is_err());
 
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Subscribers must learn that the watcher thread died — not just
+    /// stop receiving wakes silently. We force the watcher to panic via
+    /// the dead-man's switch (file replacement) and assert that an
+    /// already-subscribed receiver returns `Err(RecvError)` on its
+    /// next blocking `recv()`. Without WatcherDeathGuard this test
+    /// hangs (subscriber blocks forever) and times out.
+    #[test]
+    #[cfg(unix)]
+    fn shared_update_watcher_signals_subscribers_on_watcher_death() {
+        let tmp = std::env::temp_dir().join(format!(
+            "honker-death-signal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        {
+            let conn = Connection::open(&tmp).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        }
+
+        let shared = SharedUpdateWatcher::new(tmp.clone());
+        let (_id, rx) = shared.subscribe();
+
+        // Let the watcher snapshot the initial inode.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Replace the file with a different inode. Triggers the
+        // dead-man's switch on the next 100 ms tick.
+        let other = std::env::temp_dir().join(format!(
+            "honker-death-other-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_file(&other);
+        std::fs::File::create(&other).unwrap();
+        std::fs::rename(&other, &tmp).unwrap();
+
+        // Within ~150 ms the watcher's identity check fires and panics;
+        // WatcherDeathGuard's Drop clears senders; rx.recv() returns Err.
+        // Use a generous timeout — give the watcher up to 2 s to die
+        // and the guard to fire.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if rx.try_recv().is_err() && rx.try_recv() != Ok(()) {
+                // try_recv returns Err(Empty) for "alive but no msg",
+                // Err(Disconnected) for "watcher died, sender cleared".
+                // Use blocking recv with a poll instead.
+                match rx.recv_timeout(Duration::from_millis(100)) {
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    _ => {}
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "watcher died but subscriber's channel never disconnected — \
+                     WatcherDeathGuard didn't fire?"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
     }
 
     #[test]
@@ -2538,13 +2635,14 @@ while True:
     /// stale per-file watch fails loudly instead of silently missing
     /// wakes after a litestream-style restore.
     ///
-    /// Unix-only for the same reason the polling test is — Windows
-    /// can't atomic-rename over a file SQLite still has open ("Access
-    /// is denied"), so we can't construct the test setup. The
-    /// dead-man's switch is platform-agnostic in the production code;
-    /// the verification here is unix-shaped.
+    /// The experimental backends don't open a SQLite connection of
+    /// their own (only the polling backend does), so the test setup
+    /// can use a plain empty file at `db_path`. That dodges Windows'
+    /// "can't rename over a file SQLite has open" problem and lets us
+    /// run on every platform — unlike the polling test, which still
+    /// has to use a real SQLite db and stays `#[cfg(unix)]`.
     #[test]
-    #[cfg(all(unix, feature = "kernel-watcher"))]
+    #[cfg(feature = "kernel-watcher")]
     fn kernel_watcher_panics_on_file_replacement() {
         replacement_panic_test(WatcherBackend::KernelWatch);
     }
@@ -2552,15 +2650,16 @@ while True:
     /// Parity for the SHM fast path. SHM has it worse than kernel
     /// watcher: a stale mmap silently stops detecting iChange. The
     /// dead-man's switch on db AND -shm inodes panics either case.
-    /// Unix-only — see `kernel_watcher_panics_on_file_replacement`.
     #[test]
-    #[cfg(all(unix, feature = "shm-fast-path"))]
+    #[cfg(feature = "shm-fast-path")]
     fn shm_fast_path_panics_on_file_replacement() {
         replacement_panic_test(WatcherBackend::ShmFastPath);
     }
 
-    #[cfg(all(unix, any(feature = "kernel-watcher", feature = "shm-fast-path")))]
+    #[cfg(any(feature = "kernel-watcher", feature = "shm-fast-path"))]
     fn replacement_panic_test(backend: WatcherBackend) {
+        use std::io::Write;
+
         let tmp = std::env::temp_dir().join(format!(
             "honker-replace-{}-{}",
             std::process::id(),
@@ -2570,24 +2669,32 @@ while True:
                 .subsec_nanos()
         ));
         let _ = std::fs::remove_file(&tmp);
-        // Keep an open conn so -shm exists at watcher startup. Force a
-        // write so SQLite materializes -wal and -shm — `open_conn`
-        // alone is enough for -wal but the shm fast path needs -shm to
-        // be present and large enough to mmap.
-        let writer = open_conn(tmp.to_str().unwrap(), false).unwrap();
-        writer.execute_batch("CREATE TABLE _ (x INT); INSERT INTO _ VALUES (1);")
-            .unwrap();
+        // Plain empty file at the db path. The kernel/shm watchers
+        // don't open a SQLite connection — they just stat / watch /
+        // mmap files. So a real SQLite db isn't needed and we avoid
+        // Windows' inability to rename over a SQLite-held file.
+        std::fs::File::create(&tmp).unwrap();
+
+        // For the SHM backend, also write a fake -shm with a valid
+        // 12-byte WAL index header so the mmap probe succeeds.
+        if matches!(backend, WatcherBackend::ShmFastPath) {
+            let shm_path = std::path::PathBuf::from(format!("{}-shm", tmp.display()));
+            let mut buf = [0u8; 12];
+            buf[0..4].copy_from_slice(&3_007_000u32.to_ne_bytes()); // WALINDEX_MAX_VERSION
+            // iChange (offset 8) starts at 0; doesn't matter for this test.
+            let mut f = std::fs::File::create(&shm_path).unwrap();
+            f.write_all(&buf).unwrap();
+        }
+
         let watcher = UpdateWatcher::spawn_with_config(
             tmp.clone(),
             || {},
             WatcherConfig { backend },
         );
-        // Let the watcher snapshot the initial inode.
         std::thread::sleep(Duration::from_millis(150));
 
-        // Replace the db file with a different inode. SQLite-blind,
-        // mimics what an atomic rename / litestream restore looks like
-        // at the FS level.
+        // Replace the db file with a different inode. Atomic rename
+        // works on every platform when no SQLite handle is held open.
         let other = std::env::temp_dir().join(format!(
             "honker-replace-other-{}-{}",
             std::process::id(),
@@ -2603,7 +2710,6 @@ while True:
         std::thread::sleep(Duration::from_millis(500));
 
         let result = watcher.join();
-        drop(writer);
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));

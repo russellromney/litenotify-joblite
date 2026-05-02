@@ -336,6 +336,18 @@ observed behavior. Document the results in
     after the dead-man's switch panic, the watcher needs restart;
     test that restarting recovers cleanly.
 
+12. **Litestream-style restore** — a successful litestream restore
+    atomically replaces the db file. All three backends panic via the
+    dead-man's switch (same path as VACUUM #5). Verify:
+    - Subscribers' `update_events()` returns `Err` (Disconnected)
+      within ≤ 200 ms of the replacement, via WatcherDeathGuard.
+    - After the consumer recreates `Database`, wakes resume normally.
+    - Document the "recreate after restore" recovery pattern in
+      `docs/litestream.md` (new) so users know what to expect.
+    Optional follow-up: a "tolerate file replacement" config flag that
+    re-attaches watches/mmaps instead of panicking. Out of scope for
+    Atlas; track separately if there's actual demand.
+
 ### Non-goals
 
 - Don't *fix* the differences. The contract says "experimental";

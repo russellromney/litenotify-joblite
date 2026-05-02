@@ -135,7 +135,8 @@ fn check_db_identity(db_path: &std::path::Path, initial: (u64, u64)) -> bool {
                 panic!(
                     "honker: database file replaced: \
                      expected (dev={}, ino={}), found (dev={}, ino={}) at {:?}. \
-                     Restart required.",
+                     The watcher cannot recover; \
+                     close the Database and reopen with honker.open().",
                     initial.0, initial.1, current.0, current.1, db_path
                 );
             }
