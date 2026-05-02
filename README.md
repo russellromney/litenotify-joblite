@@ -222,7 +222,7 @@ The explicit goal is to do `NOTIFY`/`LISTEN` semantics without application-level
 
 ### WAL is the recommended default
 
-The language bindings default to `journal_mode = WAL` because it gives concurrent readers with one writer and efficient fsync batching (`wal_autocheckpoint = 10000`). Other modes (DELETE, TRUNCATE, MEMORY) still work. The wake path is `PRAGMA data_version`, which increments on every commit in every journal mode and is visible across processes. What you lose in non-WAL modes is WAL's concurrent-read-while-writing property; correctness and cross-process wake do not depend on WAL.
+The language bindings default to `journal_mode = WAL` because it gives concurrent readers with one writer and efficient fsync batching (`wal_autocheckpoint = 10000`). Other journal modes (DELETE, TRUNCATE, MEMORY) still work. The wake path is `PRAGMA data_version`, which increments on every commit in every journal mode and is visible across processes. What you lose in non-WAL modes is WAL's concurrent-read-while-writing property; correctness and cross-process wake do not depend on WAL.
 
 - One `.db` is the entire system (plus `.db-wal` / `.db-shm` sidecars if you've opted into WAL). You get every benefit of SQLite (embedded, local, durable, snapshot-able) that your app already uses.
 - Claim is one `UPDATE … RETURNING` via a partial index; ack is one `DELETE`. One writer at a time no matter the journal mode; concurrent readers come with WAL.
@@ -231,6 +231,12 @@ The language bindings default to `journal_mode = WAL` because it gives concurren
 - Transactions are cheap, so jobs, events, and notifications are rows in the caller's open `with db.transaction()` block in an "outbox"-type pattern.
 - We use `PRAGMA data_version` instead of `stat(2)` on the WAL file or kernel watchers (`FSEvents`/`inotify`/`kqueue`). `data_version` is a monotonic counter incremented by SQLite on every commit by any connection: it handles WAL truncation, clock skew, and rolled-back transactions correctly. Kernel watchers drop same-process writes on macOS, and `stat(2)` on `(size, mtime)` misses commits when the WAL is truncated then grows back to the same size. `PRAGMA data_version` works identically on Linux/macOS/Windows at ~1 ms granularity for negligible CPU. Cost: ~3.5 µs per query, ~3.5 ms/sec total at 1 kHz.
 - Single machine, single writer. SQLite's locking is designed for a single host. Two servers writing one `.db` over NFS will corrupt it. Shard by file, or switch to Postgres.
+
+### In-memory databases are not supported
+
+Honker does not support SQLite in-memory database filenames such as `:memory:`, `file::memory:?cache=shared`, or `file:<name>?mode=memory&cache=shared`. Bare `:memory:` creates a separate database per connection, which would split Honker's writer, readers, and update watcher across different databases. SQLite's shared-memory URI forms can share state across multiple connections, but only inside one process, so they do not exercise Honker's cross-process worker/listener contract.
+
+For tests and feature environments, use a temporary file-backed `.db`. It is still cheap and disposable, but it preserves the same SQLite locking, wake, crash/reopen, and multi-process semantics that Honker relies on in production.
 
 ## Architecture
 
