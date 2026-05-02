@@ -254,11 +254,11 @@ Idle cost is a single `PRAGMA data_version` query per millisecond per database. 
 
 ### Wake backend (advanced)
 
-Polling is the default and only backend in published wheels. Two experimental alternatives — kernel filesystem events and an mmap'd WAL-index fast path — exist behind opt-in Cargo features for source builds. Both have weaker correctness contracts (spurious or missed wakes possible) in exchange for lower idle CPU / lower wake latency. All three backends share the same dead-man's-switch contract: file replacement panics the watcher and surfaces to subscribers as a programmatic error, not a silent hang.
+Polling is the default. It's the only backend shipped in published wheels. Two opt-in alternatives exist behind Cargo features for source builds: kernel filesystem events, and an mmap read of SQLite's WAL index. Both can give lower idle CPU or faster wakes, but they can also miss wakes or fire wakes you didn't ask for. All three watch for the database file being swapped under them; if that happens they shut down loudly — every subscriber sees an error from `update_events()` instead of hanging.
 
-Default-path users get one no-opt-in fix: the polling backend tolerates `SQLITE_BUSY` / `SQLITE_LOCKED` during concurrent commits without dropping the connection, so non-WAL journal modes get reliable wake delivery during writer-locked windows.
+One thing changed for everyone, no opt-in needed: the polling backend now keeps its connection through transient `SQLITE_BUSY` / `SQLITE_LOCKED` errors during commits. Before, it would drop and reconnect, which could miss wakes on non-WAL journal modes (DELETE / TRUNCATE / PERSIST). Now it just retries the next tick.
 
-For the full reference — selection, source-build flags, recovery patterns, what's not yet characterized — see [docs › Watcher backends](https://honker.dev/reference/watcher-backends/).
+Full reference — when to pick which, source-build flags, recovery patterns, what we haven't tested yet — at [docs › Watcher backends](https://honker.dev/reference/watcher-backends/).
 
 ### Queue schema
 
