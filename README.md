@@ -246,9 +246,11 @@ Idle cost is a single `PRAGMA data_version` query per millisecond per database. 
 
 `SharedUpdateWatcher` (in `honker-core`) owns the poll thread and fans out to N subscribers via bounded `SyncSender<()>` channels keyed by subscriber id. Each `db.update_events()` call registers a subscriber and returns a handle whose `Drop` auto-unsubscribes, so a dropped listener causes the bridge thread's `rx.recv() -> Err` and exits cleanly.
 
-### Experimental wake backends (opt-in)
+### Experimental wake backends (opt-in, source-only for now)
 
 Two opt-in alternatives to PRAGMA polling, behind Cargo features. Both have **weaker correctness contracts** than the default — they exist for users who care about lower idle CPU or want to test event-driven wake on their platform.
+
+> **Status: source-only.** These backends are **not** compiled into published wheels (`pip install honker`, `npm install @russellthehippo/honker-node`, etc.). To use them today, build from source with the appropriate Cargo feature. We'll ship them in published wheels after Linux + Windows CI validation, characterization tests for documented edge cases (Phase Atlas in `ROADMAP.md`), and some real-world dogfooding.
 
 ```python
 db = honker.open("app.db", watcher_backend="kernel")  # OS file notifications
@@ -269,7 +271,20 @@ If the requested backend can't initialize (e.g., shm needs WAL + open conn; kern
 
 All three backends share the same dead-man's switch: `stat(db_path)` every 100 ms, panic on inode change (atomic rename, litestream restore, NFS remount). The shm backend additionally panics on `-shm` inode change. Failure is loud — never silent missed wakes after replacement.
 
-Build wheels with `--features kernel-watcher,shm-fast-path` (or one) to include them. Without the features, `watcher_backend="kernel"` falls back to polling with a stderr warning.
+**To build with the features (source builds only):**
+
+```bash
+# Python
+maturin develop --release --features kernel-watcher,shm-fast-path
+
+# Node
+npm run build -- --features kernel-watcher,shm-fast-path
+
+# Rust crate consumers
+cargo add honker --features kernel-watcher,shm-fast-path
+```
+
+Wheels without the features fall back to polling with a stderr warning when `"kernel"` or `"shm"` is requested.
 
 ### Queue schema
 

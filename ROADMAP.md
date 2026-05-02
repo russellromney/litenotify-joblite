@@ -441,6 +441,68 @@ makes progress on a representative workload:
 - Don't add a "source priority" mechanism. Every source can fire;
   consumers always re-query state on wake; idempotent.
 
+## Phase Lighthouse — Ship Experimental Wake Backends In Published Wheels
+
+> After: Phase Atlas · Before: 1.0 release prep
+
+The experimental `kernel` and `shm` watcher backends shipped in source
+in PR #30, gated behind Cargo features. Published wheels (`pip install
+honker`, `npm install @russellthehippo/honker-node`, the future
+`crates.io` releases of `honker`) currently build **without** those
+features so users get the proven polling backend by default.
+
+This phase decides when to flip the default and ship them in wheels.
+
+### Prerequisites (must all hold before flipping)
+
+1. **Linux + Windows CI matrix builds and tests with both features
+   enabled.** Today CI only exercises the default polling path on
+   the experimental backends' code. Add jobs that:
+   - Build with `--features kernel-watcher,shm-fast-path` on Linux
+     (inotify) and Windows (ReadDirectoryChangesW).
+   - Run the full Rust test suite under both features on each OS.
+   - Run the cross-process Python and Node e2e suites with the
+     experimental backends selected at open() time.
+
+2. **Phase Atlas characterization tests pass on every CI platform.**
+   At minimum the highest-risk subset:
+   - Rollback handling (kernel may produce spurious wakes per OS)
+   - Multi-database in same dir (kernel cross-pollination)
+   - VACUUM (dead-man's switch panic message)
+   - NFS detection in `probe()` (refuse fast path on network FS)
+
+3. **Real-world dogfooding.** At least one extended workload (days,
+   not minutes) running with each backend selected. Catches things
+   tests can't: long-tail event delivery, OS quirks under load,
+   resource leaks.
+
+### Scope (when prereqs are met)
+
+- Update wheel-build CI jobs to pass `--features kernel-watcher,shm-fast-path`
+  on Linux and macOS (skip Windows if Windows CI shows specific issues
+  the moment it lights up).
+- Update README to drop the "source-only" notice; add a "use these only
+  if you have a specific reason" note alongside the comparison table.
+- Bump versions on the bindings to signal the new behavior.
+- Optional: a separate "experimental wheels" channel (e.g. a `*-rc`
+  suffix) for users who want the backends without committing to source
+  builds, before flipping defaults.
+
+### Non-goals
+
+- Don't make any experimental backend the new default. Polling stays
+  the default. The flip is "available in wheels" not "selected by
+  default".
+- Don't ship features that fail any platform's CI. If kqueue on
+  macOS works but inotify on Linux doesn't, ship neither in wheels
+  until both pass.
+
+### Verification
+
+- All prereqs above documented as passing in the PR that flips wheels.
+- Release notes call out the experimental status, link the contract,
+  link the roadmap.
+
 ## Phase Cadence — Time-Based Watcher Ticks
 
 > After: Phase Wake Parity · Before: 1.0 release prep
