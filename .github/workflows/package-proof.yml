@@ -1,0 +1,39 @@
+name: Proof · packaged installs
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Sunday morning UTC. This is release proof, not PR proof.
+    - cron: "17 8 * * 0"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  packaged-installs:
+    name: packaged installs · ubuntu
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "24"
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9  # v4
+        with:
+          dotnet-version: "10.0.x"
+      - uses: ruby/setup-ruby@c4e5b1316158f92e3d49443a9d58b31d25ac0f8f  # v1
+        with:
+          ruby-version: "3.4"
+      - name: Run packaged install proof
+        run: scripts/proof/package-install-smoke.sh

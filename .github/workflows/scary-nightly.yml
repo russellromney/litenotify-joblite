@@ -1,0 +1,85 @@
+name: Proof · scary nightly
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekday morning UTC. Not PR-default; this is bigger proof.
+    - cron: "23 7 * * 1-5"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  scary-python-core:
+    name: scary core · ubuntu
+    timeout-minutes: 35
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.14"
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6
+        with:
+          enable-cache: true
+      - name: Build Python binding
+        shell: bash
+        run: |
+          uv venv --python "3.14" .venv
+          . .venv/bin/activate
+          uv pip install pytest pytest-asyncio pytest-xdist maturin
+          cargo build --release -p honker-extension
+          cd packages/honker
+          maturin develop --release
+      - name: Cross-process and crash proofs
+        shell: bash
+        run: |
+          . .venv/bin/activate
+          python -m pytest -q -n 0 --tb=short \
+            tests/test_crash_recovery.py \
+            tests/test_cross_process_wake_latency.py \
+            tests/test_multiprocess.py \
+            tests/test_real_e2e_scenarios.py \
+            tests/test_resource_bounds.py \
+            tests/test_real_app_example.py
+      - name: Slow soak proofs
+        shell: bash
+        run: |
+          . .venv/bin/activate
+          python -m pytest -q -n 0 -o addopts="" -m slow tests/test_soak.py --tb=short
+      - name: Linux fault-injection proofs
+        shell: bash
+        run: |
+          . .venv/bin/activate
+          python -m pytest -q -n 0 -o addopts="" -m linux_only tests/test_fault_injection.py --tb=short
+
+  packaged-installs:
+    name: packaged installs · ubuntu
+    timeout-minutes: 25
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "24"
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9  # v4
+        with:
+          dotnet-version: "10.0.x"
+      - uses: ruby/setup-ruby@c4e5b1316158f92e3d49443a9d58b31d25ac0f8f  # v1
+        with:
+          ruby-version: "3.4"
+      - name: Run packaged install proof
+        run: scripts/proof/package-install-smoke.sh

@@ -6,6 +6,10 @@
 
 honker ships as a [Rust crate](https://crates.io/crates/honker) (`honker`, plus `honker-core`/`honker-extension`), a [SQLite loadable extension](#sqlite-extension-any-sqlite-39-client), and language packages: Python (`honker`), Node (`@russellthehippo/honker-node`), Bun (`@russellthehippo/honker-bun`), Ruby (`honker`), Go, Elixir, C++, and .NET / C#. The on-disk layout is defined once in Rust; every binding is a thin wrapper around the loadable extension.
 
+See [Binding support](BINDINGS.md) for the current truth table: which
+bindings have typed queue/stream/listen/scheduler APIs, which ones have
+packaged-install proof, and what CI actually proves.
+
 `honker` works by replacing application-level polling with a single-digit-µs `PRAGMA data_version` read on the database every 1ms, achieving push-like semantics and cross-process notifications with single-digit-millisecond delivery.
 
 > Experimental. API may change.

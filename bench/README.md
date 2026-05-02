@@ -57,6 +57,20 @@ Replay became a million-per-second after swapping `list.pop(0)` for
 `collections.deque.popleft()` on the 1000-row refresh buffer — the
 O(n) shift-everything was the bottleneck, not the SQL.
 
+### Wake / idle watcher
+
+```
+cross-process notify/listen wake:      p50 ~= 0.7ms on M-series
+PRAGMA data_version poll cost:         ~3.5us/poll
+idle watcher cost at 1kHz:             ~3.5ms CPU/sec per Database
+```
+
+The wake path is intentionally boring: one `PRAGMA data_version` read
+every 1ms per open `Database`, then fan-out to subscribers. 100
+listeners still means one poll thread. The faster shm reader benchmark
+exists, but the current CPU cost is low enough that correctness and
+portability win for now.
+
 ## Platform ceiling
 
 Raw Python `sqlite3` single-tx on the same WAL+`synchronous=NORMAL`
