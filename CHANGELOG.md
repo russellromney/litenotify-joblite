@@ -1,5 +1,34 @@
 # CHANGELOG
 
+## Unreleased — experimental watcher backends + polling reliability
+
+- New opt-in `watcher_backend` parameter on `honker.open()` (Python + Node)
+  and `WatcherConfig` (Rust). Defaults to polling. Two experimental
+  backends added behind Cargo features — `kernel-watcher` (notify-rs
+  filesystem events) and `shm-fast-path` (mmap'd `-shm` `iChange`
+  read). Source-only in published wheels; selecting them without the
+  feature compiled in falls back to polling with a stderr message.
+- Polling fix (everyone benefits, no opt-in): `SQLITE_BUSY` /
+  `SQLITE_LOCKED` from the watcher's `PRAGMA data_version` poll no
+  longer drops the connection. Previously busy → drop → reconnect →
+  silently re-baseline `last_version` → missed wakes on non-WAL
+  journal modes (DELETE/TRUNCATE/PERSIST). Now: skip the tick, retry
+  next pass.
+- Python binding now propagates watcher death. When the dead-man's
+  switch fires (file replaced, watcher panic), the bridge thread
+  pushes a `RuntimeError` sentinel into the consumer's asyncio queue
+  so `await update_events()` raises a clear error instead of hanging.
+  Node already propagated correctly; no change.
+- API hardening: `UpdateWatcher::spawn_with_config` now blocks until
+  the background thread has captured its baseline (initial inode for
+  polling/kernel, initial `iChange` for shm). Eliminates a race where
+  a caller could mutate the file immediately after `update_events()`
+  and the watcher would snapshot the post-mutation state as baseline.
+- Cross-binding e2e: `test_listener_raises_when_watcher_dies` (Python)
+  and `updateEvents().next() rejects when watcher dies` (Node), each
+  parameterized over polling/kernel/shm. Skipped on Windows because
+  the kernel rejects rename-over-open even with `FILE_SHARE_DELETE`.
+
 ## Unreleased — in-tree bindings and .NET
 
 - Moved maintained bindings into the main Honker repo as normal
