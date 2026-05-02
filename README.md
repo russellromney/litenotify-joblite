@@ -252,49 +252,13 @@ Idle cost is a single `PRAGMA data_version` query per millisecond per database. 
 
 `SharedUpdateWatcher` (in `honker-core`) owns the poll thread and fans out to N subscribers via bounded `SyncSender<()>` channels keyed by subscriber id. Each `db.update_events()` call registers a subscriber and returns a handle whose `Drop` auto-unsubscribes, so a dropped listener causes the bridge thread's `rx.recv() -> Err` and exits cleanly.
 
-### Experimental wake backends (opt-in, source-only for now)
+### Wake backend (advanced)
 
-Two opt-in alternatives to PRAGMA polling, behind Cargo features. Both have **weaker correctness contracts** than the default — they exist for users who care about lower idle CPU or want to test event-driven wake on their platform.
+Polling is the default and only backend in published wheels. Two experimental alternatives — kernel filesystem events and an mmap'd WAL-index fast path — exist behind opt-in Cargo features for source builds. Both have weaker correctness contracts (spurious or missed wakes possible) in exchange for lower idle CPU / lower wake latency. All three backends share the same dead-man's-switch contract: file replacement panics the watcher and surfaces to subscribers as a programmatic error, not a silent hang.
 
-> **Status: source-only.** These backends are **not** compiled into published wheels (`pip install honker`, `npm install @russellthehippo/honker-node`, etc.). To use them today, build from source with the appropriate Cargo feature. We'll ship them in published wheels after Linux + Windows CI validation, characterization tests for documented edge cases (Phase Atlas in `ROADMAP.md`), and some real-world dogfooding.
+Default-path users get one no-opt-in fix: the polling backend tolerates `SQLITE_BUSY` / `SQLITE_LOCKED` during concurrent commits without dropping the connection, so non-WAL journal modes get reliable wake delivery during writer-locked windows.
 
-```python
-db = honker.open("app.db", watcher_backend="kernel")  # OS file notifications
-db = honker.open("app.db", watcher_backend="shm")     # mmap WAL index, WAL only
-```
-
-```javascript
-const db = honker.open('app.db', undefined, 'kernel');
-```
-
-If the requested backend can't initialize (e.g., shm needs WAL + open conn; kernel needs the OS notify API), `honker.open()` raises immediately. No silent fallback.
-
-| backend | wake source | spurious wakes | missed wakes | journal mode |
-|---|---|---|---|---|
-| `polling` (default) | `PRAGMA data_version` every 1 ms | never | never | any |
-| `kernel` | `notify-rs` events on dir + `-wal`/`-shm` | possible | possible (if OS drops events) | any |
-| `shm` | mmap `iChange` in WAL index every 1 ms | never | never (mmap inode-change → panic) | WAL only |
-
-All three backends share the same dead-man's switch: `stat(db_path)` every 100 ms, panic on inode change (atomic rename, litestream restore, NFS remount). The shm backend additionally panics on `-shm` inode change. Failure is loud — never silent missed wakes after replacement.
-
-When the watcher thread panics, every active subscriber's wake channel goes `Disconnected`, so consumers learn about it programmatically (via `Err` from `update_events()`) — not only as an `eprintln` in stderr. After a panic, recovery is "close the Database and reopen with `honker.open(...)`."
-
-Note for litestream / restore-style workflows: a successful restore that atomically replaces the db file looks identical to file replacement and will trigger the panic. This is the same behavior the polling backend has had — recover by recreating your `Database` instance after restore. Detect via the `Disconnected` signal on `update_events()`.
-
-**To build with the features (source builds only):**
-
-```bash
-# Python
-maturin develop --release --features kernel-watcher,shm-fast-path
-
-# Node
-npm run build -- --features kernel-watcher,shm-fast-path
-
-# Rust crate consumers
-cargo add honker --features kernel-watcher,shm-fast-path
-```
-
-Wheels without the features fall back to polling with a stderr warning when `"kernel"` or `"shm"` is requested.
+For the full reference — selection, source-build flags, recovery patterns, what's not yet characterized — see [docs › Watcher backends](https://honker.dev/reference/watcher-backends/).
 
 ### Queue schema
 
