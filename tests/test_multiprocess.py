@@ -183,3 +183,178 @@ def test_live_enqueuer_while_worker_drains(tmp_path):
     combined = a + b
     assert sorted(combined) == list(range(60))
     assert set(a).isdisjoint(set(b))
+
+
+def _run_pressure_producer_script(
+    db_path: str,
+    producer_id: int,
+    count: int,
+) -> subprocess.CompletedProcess:
+    script = textwrap.dedent(
+        f"""
+        import json
+        import os
+        import sys
+        import time
+
+        sys.path.insert(0, {os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "packages")!r})
+        import honker
+
+        db = honker.open({db_path!r})
+        q = db.queue("pressure")
+        keys = []
+        for i in range({count}):
+            key = f"p{producer_id}-{{i:03d}}"
+            q.enqueue({{
+                "producer": {producer_id},
+                "seq": i,
+                "key": key,
+            }}, priority=i % 7)
+            keys.append(key)
+            if i % 11 == 0:
+                time.sleep(0.001)
+        print(json.dumps(keys))
+        """
+    )
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def _run_pressure_worker_script(
+    db_path: str,
+    worker_id: str,
+    idle_after_s: float = 1.0,
+) -> subprocess.CompletedProcess:
+    script = textwrap.dedent(
+        f"""
+        import json
+        import os
+        import sys
+        import time
+
+        sys.path.insert(0, {os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "packages")!r})
+        import honker
+
+        db = honker.open({db_path!r})
+        q = db.queue("pressure", visibility_timeout_s=30)
+        processed = []
+        idle_since = None
+        while True:
+            jobs = q.claim_batch({worker_id!r}, 7)
+            if jobs:
+                ids = []
+                for job in jobs:
+                    ids.append(job.id)
+                    processed.append({{
+                        "id": job.id,
+                        "key": job.payload["key"],
+                        "producer": job.payload["producer"],
+                        "seq": job.payload["seq"],
+                    }})
+                acked = q.ack_batch(ids, {worker_id!r})
+                if acked != len(ids):
+                    raise RuntimeError(f"acked {{acked}} of {{len(ids)}} jobs")
+                idle_since = None
+                # Small yield so the single SQLite writer lock rotates
+                # across workers instead of one process draining alone.
+                time.sleep(0.002)
+                continue
+
+            now = time.time()
+            if idle_since is None:
+                idle_since = now
+            elif now - idle_since >= {idle_after_s!r}:
+                break
+            time.sleep(0.01)
+
+        print(json.dumps(processed))
+        """
+    )
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+
+
+def test_many_processes_enqueue_claim_and_ack_exactly_once(tmp_path):
+    """Pressure proof for the queue claim path.
+
+    This is the real scary shape:
+
+    - several independent producer processes all write to one SQLite file
+    - several independent worker processes claim in batches
+    - every worker acks through the shared SQL function
+    - the parent proves every produced logical key was processed once
+
+    This catches bugs that single-process tests miss: writer-lock
+    serialization mistakes, claim UPDATE overlap, duplicate batch
+    returns, acking the wrong worker's claim, and dropped rows under
+    concurrent producer/consumer pressure.
+    """
+    db_path = str(tmp_path / "pressure.db")
+    producer_count = 4
+    jobs_per_producer = 75
+    worker_count = 6
+    total_jobs = producer_count * jobs_per_producer
+
+    import honker
+
+    # Bootstrap before subprocesses race to open the file.
+    db = honker.open(db_path)
+    del db
+
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=producer_count + worker_count
+    ) as ex:
+        producer_futs = [
+            ex.submit(_run_pressure_producer_script, db_path, p, jobs_per_producer)
+            for p in range(producer_count)
+        ]
+        # Start workers while producers are still writing, not after the
+        # queue is already full.
+        import time
+
+        time.sleep(0.03)
+        worker_futs = [
+            ex.submit(_run_pressure_worker_script, db_path, f"worker-{w}")
+            for w in range(worker_count)
+        ]
+        producer_results = [f.result() for f in producer_futs]
+        worker_results = [f.result() for f in worker_futs]
+
+    produced = []
+    for i, res in enumerate(producer_results):
+        assert res.returncode == 0, f"producer {i} failed: {res.stderr}"
+        produced.extend(json.loads(res.stdout.strip()))
+
+    processed = []
+    workers_that_helped = 0
+    for i, res in enumerate(worker_results):
+        assert res.returncode == 0, f"worker {i} failed: {res.stderr}"
+        rows = json.loads(res.stdout.strip())
+        if rows:
+            workers_that_helped += 1
+        processed.extend(rows)
+
+    produced_keys = sorted(produced)
+    processed_keys = sorted(row["key"] for row in processed)
+    assert len(produced_keys) == total_jobs
+    assert len(processed_keys) == total_jobs
+    assert processed_keys == produced_keys
+    assert len(set(processed_keys)) == total_jobs
+    assert len({row["id"] for row in processed}) == total_jobs
+    assert workers_that_helped >= 2
+
+    db = honker.open(db_path)
+    live = db.query("SELECT COUNT(*) AS c FROM _honker_live WHERE queue='pressure'")
+    dead = db.query("SELECT COUNT(*) AS c FROM _honker_dead WHERE queue='pressure'")
+    assert live[0]["c"] == 0
+    assert dead[0]["c"] == 0
