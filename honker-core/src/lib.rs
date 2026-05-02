@@ -2163,11 +2163,16 @@ while True:
         // ensure the directory has at least one prior journal life-cycle
         // so the kernel watcher's directory watch is attached cleanly.
         setup.execute("INSERT INTO t VALUES (0)", []).unwrap();
-        drop(setup);
+        // Hold the connection open across `drive_and_count_wakes` so
+        // SQLite doesn't clean up -wal/-shm on last-connection-close
+        // (Linux/inotify clears them; macOS often doesn't). The shm
+        // fast path needs -shm present at watcher startup.
+        let _pinning = setup;
 
         let n: u32 = 5;
         let observed = drive_and_count_wakes(backend.clone(), tmp.clone(), n, 30);
 
+        drop(_pinning);
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(format!("{}-wal", tmp.display()));
         let _ = std::fs::remove_file(format!("{}-shm", tmp.display()));
@@ -2175,15 +2180,17 @@ while True:
 
         // Backend-specific upper bounds. The polling backend dedupes on
         // data_version, so it produces ~1 wake per commit. The
-        // experimental kernel backend fires on every filesystem event
-        // and SQLite produces multiple events per commit (write to -wal,
-        // -shm, sometimes -journal); allow up to 50 wakes per commit.
-        // Spurious wakes are a documented part of the experimental
-        // contract — consumers re-read state and dedupe.
+        // experimental kernel backend fires on every filesystem event;
+        // Linux inotify is granular (header write + data write + fsync
+        // each fire separately, plus -shm updates), so up to ~100 per
+        // commit is normal. Spurious wakes are a documented part of
+        // the experimental contract — consumers re-read state and
+        // dedupe. We keep an upper bound at all only to catch a truly
+        // runaway watcher (infinite loop, unbounded retry, etc.).
         let upper = match backend {
             WatcherBackend::Polling => n + 1,
             #[cfg(feature = "kernel-watcher")]
-            WatcherBackend::KernelWatch => n * 50,
+            WatcherBackend::KernelWatch => n * 200,
             #[cfg(feature = "shm-fast-path")]
             WatcherBackend::ShmFastPath => n + 1,
         };
@@ -2514,8 +2521,14 @@ while True:
     /// the db file replaced; the kernel watcher must do the same so a
     /// stale per-file watch fails loudly instead of silently missing
     /// wakes after a litestream-style restore.
+    ///
+    /// Unix-only for the same reason the polling test is — Windows
+    /// can't atomic-rename over a file SQLite still has open ("Access
+    /// is denied"), so we can't construct the test setup. The
+    /// dead-man's switch is platform-agnostic in the production code;
+    /// the verification here is unix-shaped.
     #[test]
-    #[cfg(feature = "kernel-watcher")]
+    #[cfg(all(unix, feature = "kernel-watcher"))]
     fn kernel_watcher_panics_on_file_replacement() {
         replacement_panic_test(WatcherBackend::KernelWatch);
     }
@@ -2523,13 +2536,14 @@ while True:
     /// Parity for the SHM fast path. SHM has it worse than kernel
     /// watcher: a stale mmap silently stops detecting iChange. The
     /// dead-man's switch on db AND -shm inodes panics either case.
+    /// Unix-only — see `kernel_watcher_panics_on_file_replacement`.
     #[test]
-    #[cfg(feature = "shm-fast-path")]
+    #[cfg(all(unix, feature = "shm-fast-path"))]
     fn shm_fast_path_panics_on_file_replacement() {
         replacement_panic_test(WatcherBackend::ShmFastPath);
     }
 
-    #[cfg(any(feature = "kernel-watcher", feature = "shm-fast-path"))]
+    #[cfg(all(unix, any(feature = "kernel-watcher", feature = "shm-fast-path")))]
     fn replacement_panic_test(backend: WatcherBackend) {
         let tmp = std::env::temp_dir().join(format!(
             "honker-replace-{}-{}",
